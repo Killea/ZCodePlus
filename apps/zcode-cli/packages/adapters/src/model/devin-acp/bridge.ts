@@ -168,6 +168,8 @@ export class DevinAcpBridge {
   }): Promise<{ stopReason: string }> {
     // 同一 ACP session 上并发 prompt 会让 updateHandlers 互相覆盖、事件错归因；
     // ACP 语义上 session 也是串行会话。按 session 排队执行。
+    // 待验证：Devin 是否直接拒绝重叠 prompt——串行队列已避免该场景，
+    // 若服务端本就拒绝，此处排队只是冗余防御。
     const key = input.acpSessionId;
     const prev = this.promptQueues.get(key) ?? Promise.resolve();
     const run = prev.catch(() => undefined).then(() => this.runPromptOnce(input));
@@ -294,6 +296,9 @@ export class DevinAcpBridge {
     }
   }
 
+  // 未实现（spec 先行项）：session/load 恢复旧会话（当前一律 session/new，
+  // 恢复能力靠 ZCode 侧历史前缀）；minVersion 门槛（discovery 探测到版本
+  // 但未做最低版本校验）。两者暂不影响正确性，后续按 spec 补。
   private async createSession(): Promise<SessionRecord> {
     const transport = this.requireTransport();
     const result = await transport.request<{ sessionId?: string }>(

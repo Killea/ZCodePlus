@@ -38,6 +38,8 @@ export function DevinAcpAccessSection({
   onSaveAccess: (access: DevinAcpAccess) => void | Promise<void>;
 }) {
   const { intl } = useZCodeIntl();
+  // 已知限制：本地 useState 初始化后不跟随外部 access 变化（如另一窗口/进程
+  // 改了配置，本组件仍显示旧值）。低优先，待修。
   const [binaryPath, setBinaryPath] = useState(access.binaryPath ?? "");
   const [apiKey, setApiKey] = useState(access.apiKey ?? "");
   const [apiKeyVisible, setApiKeyVisible] = useState(false);

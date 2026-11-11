@@ -27,6 +27,8 @@ type RequestHandler = (
   params: unknown,
 ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>;
 
+// 注意：buffer 是 string，此处上限按字符数而非字节数计（多字节字符下
+// 实际字节可能数倍于此）；仅作失控防护，够用暂不精确化。
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const JSONRPC_VERSION = "2.0";
 const METHOD_NOT_FOUND = -32601;

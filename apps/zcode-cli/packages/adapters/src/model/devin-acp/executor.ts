@@ -220,6 +220,8 @@ export class DevinModelExecutor implements ModelExecutor {
         }
         // sidecar 的文本即结果本体（摘要/标题），[devin tool]/[plan] 标记
         // 混进去就是坏数据——标题里出现 "[devin tool] Ran ls" 之类。
+        // 已知未决：memory agent 依赖 toolCalls 写记忆，Devin 不产生 toolCalls，
+        // 该链路对 devin-acp 不闭环（产品方向待定，见 spec）。
         if (!isMainTurn && (update.kind === "tool" || update.kind === "plan")) {
           continue;
         }
