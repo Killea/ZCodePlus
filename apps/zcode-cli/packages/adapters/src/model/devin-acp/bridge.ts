@@ -62,6 +62,10 @@ export class DevinAcpBridge {
   private resolution?: DevinBinaryResolution;
   private starting?: Promise<void>;
   private readonly sessions = new Map<string, SessionRecord>();
+  /** 同 key 并发 ensureSession 的在途去重：防重复 session/new 产生幽灵 session。 */
+  private readonly creating = new Map<string, Promise<SessionRecord>>();
+  /** 每 ACP session 的 prompt 串行队列：并发 prompt 会让 updateHandlers 互相覆盖。 */
+  private readonly promptQueues = new Map<string, Promise<unknown>>();
   private readonly updateHandlers = new Map<string, (update: DevinAcpUpdate) => void>();
   /** 每个 ACP session 的工具/plan 标记去重状态；随 sessions 一起清理。 */
   private readonly markerStates = new Map<string, UpdateMarkerState>();
@@ -92,12 +96,47 @@ export class DevinAcpBridge {
     const existing = this.sessions.get(sessionKey);
     if (existing) return { acpSessionId: existing.acpSessionId, isNew: false };
 
-    const record = await this.createSession();
+    // 同 key 并发（如 sidecar 与主回合并行时同 operation 的重试）会重复
+    // session/new：后者覆盖 map，前者 session 在 Devin 侧泄漏成幽灵。在途去重，
+    // 只有创建发起者拿到 isNew=true（等待者复用结果，不再重发历史前缀）。
+    let creating = this.creating.get(sessionKey);
+    const isCreator = creating === undefined;
+    if (!creating) {
+      creating = this.createSession().finally(() => {
+        this.creating.delete(sessionKey);
+      });
+      this.creating.set(sessionKey, creating);
+    }
+    const record = await creating;
     this.sessions.set(sessionKey, record);
-    return { acpSessionId: record.acpSessionId, isNew: true };
+    return { acpSessionId: record.acpSessionId, isNew: isCreator };
+  }
+
+  /** 尽力取消指定 ACP session 上的在途任务（generator 被提前丢弃时调用）。 */
+  cancelPrompt(acpSessionId: string): void {
+    this.transport?.notify("session/cancel", { sessionId: acpSessionId });
   }
 
   async runPrompt(input: {
+    readonly acpSessionId: string;
+    readonly parts: readonly DevinAcpPromptPart[];
+    readonly signal?: AbortSignal;
+    readonly onUpdate: (update: DevinAcpUpdate) => void;
+  }): Promise<{ stopReason: string }> {
+    // 同一 ACP session 上并发 prompt 会让 updateHandlers 互相覆盖、事件错归因；
+    // ACP 语义上 session 也是串行会话。按 session 排队执行。
+    const key = input.acpSessionId;
+    const prev = this.promptQueues.get(key) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(() => this.runPromptOnce(input));
+    this.promptQueues.set(key, run);
+    try {
+      return await run;
+    } finally {
+      if (this.promptQueues.get(key) === run) this.promptQueues.delete(key);
+    }
+  }
+
+  private async runPromptOnce(input: {
     readonly acpSessionId: string;
     readonly parts: readonly DevinAcpPromptPart[];
     readonly signal?: AbortSignal;
@@ -211,16 +250,17 @@ export class DevinAcpBridge {
     const record: SessionRecord = { acpSessionId: result.sessionId };
     const mode = this.options.mode?.trim();
     if (mode) {
-      // mode 值以 session/new 广告的 configOptions 为准；设置失败只告警不中断。
-      transport
-        .request(
+      // mode 值以 session/new 广告的 configOptions 为准；await 应用避免首个
+      // prompt 先于 mode 生效到达；设置失败只告警不中断。
+      try {
+        await transport.request(
           "session/set_config_option",
           { sessionId: record.acpSessionId, configId: "mode", value: mode },
           { timeoutMs: SESSION_NEW_TIMEOUT_MS },
-        )
-        .catch((error: unknown) => {
-          this.logger?.warn(`[devin-acp] set mode=${mode} failed: ${String(error)}`);
-        });
+        );
+      } catch (error) {
+        this.logger?.warn(`[devin-acp] set mode=${mode} failed: ${String(error)}`);
+      }
     }
     return record;
   }

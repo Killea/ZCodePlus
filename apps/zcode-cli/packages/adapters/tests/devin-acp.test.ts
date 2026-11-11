@@ -92,6 +92,20 @@ describe("flattenTranscriptForNewSession", () => {
     expect(transcript).toContain("tool Read");
     expect(transcript.length).toBeLessThan(1000);
   });
+
+  it("includeSystem 时保留 system 消息（sidecar payload）", () => {
+    const transcript = flattenTranscriptForNewSession(
+      [system("你是摘要器"), user("转录内容")],
+      { includeSystem: true },
+    );
+    expect(transcript).toContain("system: 你是摘要器");
+    expect(transcript).toContain("user: 转录内容");
+  });
+
+  it("无可序列化内容时返回空串（防空 prompt）", () => {
+    expect(flattenTranscriptForNewSession([system("仅系统")])).toBe("");
+    expect(flattenTranscriptForNewSession([])).toBe("");
+  });
 });
 
 describe("AcpTransport", () => {

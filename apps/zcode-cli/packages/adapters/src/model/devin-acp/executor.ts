@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   getCurrentModelInvocationContext,
   modelMessageContentToText,
@@ -19,7 +19,8 @@ import {
   type DevinContextForwardPolicy,
 } from "./context-filter.js";
 
-const DEFAULT_SESSION_KEY = "default";
+/** bridge 进程池容量：超出时 LRU 驱逐并 dispose，避免配置变更累积僵尸 devin 进程。 */
+const BRIDGE_POOL_MAX = 4;
 const TEXT_BLOCK_ID = "devin-text";
 const REASONING_BLOCK_ID = "devin-thought";
 
@@ -66,13 +67,26 @@ export class DevinModelExecutor implements ModelExecutor {
 
   constructor(options: DevinModelExecutorOptions) {
     const key = bridgePoolKey(options);
-    let bridge = DevinModelExecutor.bridgePool.get(key);
+    const pool = DevinModelExecutor.bridgePool;
+    let bridge = pool.get(key);
     if (bridge === undefined) {
       bridge = new DevinAcpBridge(options);
-      DevinModelExecutor.bridgePool.set(key, bridge);
+      pool.set(key, bridge);
+      // Map 保序=插入序；超限驱逐最旧项并 dispose，否则配置每次变更
+      // 都会多留一个常驻 devin acp 子进程陪跑到 agent 退出。
+      while (pool.size > BRIDGE_POOL_MAX) {
+        const oldestKey = pool.keys().next().value;
+        if (oldestKey === undefined) break;
+        const evicted = pool.get(oldestKey);
+        pool.delete(oldestKey);
+        void evicted?.dispose();
+      }
     } else {
       // 同 key 复用时刷新注入依赖（logger / listMcpServers getter 可能换了实例）。
       bridge.updateDeps(options);
+      // LRU touch：移到末尾。
+      pool.delete(key);
+      pool.set(key, bridge);
     }
     this.bridge = bridge;
     this.contextForward = options.contextForward ?? "memory-only";
@@ -101,7 +115,9 @@ export class DevinModelExecutor implements ModelExecutor {
     yield { type: "start" };
     const invocation = getCurrentModelInvocationContext();
     const operation = invocation?.modelCall?.operation;
-    const sessionId = invocation?.traceContext?.sessionId ?? DEFAULT_SESSION_KEY;
+    // sessionId 缺失时用随机 key：牺牲续聊换隔离，避免不明来源的调用
+    // 把多个 ZCode session 混进同一个 ACP session（跨会话污染）。
+    const sessionId = invocation?.traceContext?.sessionId ?? randomUUID();
     // compact/标题/记忆提取等 sidecar 调用是自包含任务，不是会话续聊：
     // 若打进主 ACP session，"总结对话"这类指令会成为 Devin 的真实上下文并污染
     // 后续回复（表现为压缩后"指令丢失"）。sidecar 一律按 operation 分键走独立 session。
@@ -140,6 +156,7 @@ export class DevinModelExecutor implements ModelExecutor {
       }
     };
 
+    let promptSettled = false;
     try {
       const promptDone = this.bridge.runPrompt({
         acpSessionId: handle.acpSessionId,
@@ -148,8 +165,14 @@ export class DevinModelExecutor implements ModelExecutor {
         onUpdate: (update) => updates.push(update),
       });
       promptDone.then(
-        (result) => updates.complete(result.stopReason),
-        (error: unknown) => updates.fail(error),
+        (result) => {
+          promptSettled = true;
+          updates.complete(result.stopReason);
+        },
+        (error: unknown) => {
+          promptSettled = true;
+          updates.fail(error);
+        },
       );
 
       let stopReason = "end_turn";
@@ -205,6 +228,10 @@ export class DevinModelExecutor implements ModelExecutor {
       yield* closeReasoning();
       yield* closeText();
       throw error;
+    } finally {
+      // 消费方提前 break/丢弃 generator（非 abortSignal 路径）时，Devin 侧任务
+      // 仍在跑且 updates 无界堆积；尽力取消避免泄漏。
+      if (!promptSettled) this.bridge.cancelPrompt(handle.acpSessionId);
     }
   }
 
@@ -251,9 +278,10 @@ export class DevinModelExecutor implements ModelExecutor {
   ): DevinAcpPromptPart[] {
     const text = flattenTranscriptForNewSession(messages, {
       // sidecar 的 messages 即任务主体（如 compact 的转录+指令），不是会话历史：
-      // 上限放宽避免摘要输入被砍到失真。
+      // 上限放宽避免摘要输入被砍到失真；system 角色也是 payload 的一部分。
       maxChars: 400_000,
       header: "以下是本次调用的完整输入内容：",
+      includeSystem: true,
     });
     return text ? [{ type: "text", text }] : [];
   }

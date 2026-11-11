@@ -230,8 +230,23 @@ prompt 发送：逐条 role 打标、assistant/user 文本截断到上限、tool
 session，"请总结这段对话"这类指令会成为 Devin 的真实上下文且转录本身
 不会送达（续聊路径只发最后一条 user 消息）——实测导致压缩后 Devin
 回复跑偏（"A 还没做，是否要做"）。sidecar 的 messages 即任务主体，
-由同一确定性 serializer 全量序列化（上限放宽到 400K 字符）单条 text
-part 发送，不做 contextForward 注入。
+由同一确定性 serializer 全量序列化（上限放宽到 400K 字符、含 system
+角色）单条 text part 发送，不做 contextForward 注入。
+
+### 并发与生命周期约束
+
+- `ensureSession` 对同 key 并发做在途去重（`creating` map）：防重复
+  `session/new` 产生幽灵 session；只有创建发起者拿到 `isNew=true`。
+- `runPrompt` 按 `acpSessionId` 串行排队：同一 ACP session 并发 prompt
+  会让 update handler 互相覆盖、事件错归因。
+- `traceContext.sessionId` 缺失时 sessionKey 用随机值：牺牲续聊换隔离，
+  防止无上下文的调用把多个 ZCode session 混进一个 ACP session。
+- bridge 进程池 LRU 上限 4，驱逐时 `dispose()`：配置每次变更都会改
+  池 key，不设上限会让旧 `devin acp` 子进程陪跑到 agent 退出。
+- `streamText` generator 被提前丢弃（非 abortSignal 路径）时 finally
+  发 `session/cancel`：防 Devin 侧任务继续跑、updates 无界堆积。
+- `session/set_config_option`(mode) 在 `session/new` 后 await：避免首个
+  prompt 先于 mode 生效。
 
 ### Context meter（用量感知）
 

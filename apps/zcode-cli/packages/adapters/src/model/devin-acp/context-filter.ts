@@ -74,11 +74,15 @@ function splitIntoSections(text: string): SectionSlice[] {
  */
 export function flattenTranscriptForNewSession(
   messages: readonly ModelInputMessage[],
-  options: { readonly maxChars?: number; readonly header?: string } = {},
+  options: {
+    readonly maxChars?: number;
+    readonly header?: string;
+    readonly includeSystem?: boolean;
+  } = {},
 ): string {
   const lines: string[] = [];
   for (const message of messages) {
-    if (message.role === "system") continue;
+    if (message.role === "system" && !options.includeSystem) continue;
     const text = truncate(modelMessageContentToText(message.content), MESSAGE_MAX_CHARS);
     if (message.role === "tool") {
       const status = message.isError ? "失败" : "完成";
@@ -96,6 +100,7 @@ export function flattenTranscriptForNewSession(
     if (!text) continue;
     lines.push(`${message.role}: ${text}`);
   }
+  if (lines.length === 0) return "";
   const transcript = lines.join("\n");
   const maxChars = options.maxChars ?? TRANSCRIPT_MAX_CHARS;
   const trimmed = transcript.length > maxChars
