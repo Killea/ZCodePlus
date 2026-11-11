@@ -2,7 +2,7 @@
 import { createElement } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TID_V4_COMPOSER_MEMORY_PICKER } from "@zcode/shared";
+import { TID_V4_COMPOSER_MEMORY_PICKER } from "@zcode/shared/test-ids";
 import type { GlobalMemoryEntryMeta } from "@zcode/services";
 
 vi.mock("@/i18n/IntlProvider.js", () => {
@@ -89,10 +89,7 @@ describe("V4ComposerMemoryPicker", () => {
 
   it("default 条目有自定义 name 时显示自定义名", async () => {
     renderPicker({
-      memories: [
-        { id: "default", name: "开发机器", chars: 10, updatedAt: 1 },
-        ...entries.slice(1),
-      ],
+      memories: [{ id: "default", name: "开发机器", chars: 10, updatedAt: 1 }, ...entries.slice(1)],
     });
     await openMenu();
 

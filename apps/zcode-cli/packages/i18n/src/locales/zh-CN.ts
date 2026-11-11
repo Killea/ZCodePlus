@@ -39,6 +39,7 @@ export const zhCN: ZCodeCopy = {
     从本次 prompt/TUI 的可用工具集中移除整个工具，不修改持久化配置。
     工具名用逗号或空格分隔，例如 "Bash Edit"。
     "Bash(git *)" 也会移除整个 Bash，不支持按命令内容匹配。
+  --toolsearch-mode <auto|native|local|off> ToolSearch 模式（默认 off，仅本次启动）
   --force-mcs      对 Anthropic provider 强制启用 mid-conversation system 投影
   --locale <locale>  UI 语言：en-US、zh-CN 或 auto
   --mode <mode>    prompt 权限模式：build、edit、plan、yolo 或 guarded（--prompt 默认 yolo）
@@ -71,6 +72,9 @@ Slash Commands:
 `,
   },
   tui: {
+    approval: {
+      fromSession: (sessionId) => `来自后台会话 ${sessionId}`,
+    },
     copy: {
       copied: "已复制选中文本到剪贴板。",
       failed: "无法复制选中文本。",

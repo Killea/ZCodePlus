@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-subagent-context-boundaries",
-  "spec": "./test/e2e/conversation-session/conversation-session-subagent-context-boundaries.test.ts",
+  "spec": "./test/e2e/conversation-session/subagents/conversation-session-subagent-context-boundaries.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-subagent-context-boundaries.json"
@@ -62,13 +62,6 @@
       "kind": "subagent",
       "source": "synthetic",
       "timingPolicy": "controlled-stream",
-      "syntheticReason": "仅用 provider 回放及测试 stdio 代理控制时序/读取故障；真实 Settings、Host、CLI 和 child runtime 执行，生产代码和依赖不变。"
-    },
-    {
-      "id": "scb-running-continuation",
-      "kind": "subagent",
-      "source": "synthetic",
-      "timingPolicy": "fast-text",
       "syntheticReason": "仅用 provider 回放及测试 stdio 代理控制时序/读取故障；真实 Settings、Host、CLI 和 child runtime 执行，生产代码和依赖不变。"
     },
     {

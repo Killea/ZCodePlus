@@ -111,8 +111,8 @@ completion-blocking active work：
 | desktop/mobile busy + accepted input                            | 按 CLI 串行 admission 顺序进入同一 FIFO；不存在双队列竞态                                                                                                                |
 | guide ineligible/attachment/compact/verifier                    | 保留完整 Submission（含 ModelSelection）并 fallback CLI queue；compact 不进入 guided row；模型/provider 不参与 eligibility                                               |
 | guide + ordinary queue nonempty                                 | guide 进入当前 active turn；普通 queue 保持未来 turn FIFO，不构成 guide eligibility guard                                                                                |
-| guide + toolResultBatch=committed                               | 全部 sibling tool results 先落事实，再最多内联消费一条 guide；同一 product turn 继续，Session Selection 与下一 model step 的 Active Model 切到该 Submission 的 Selection |
-| accepted guide + current visual work segment                    | 关闭上一 segment，在同一 product turn 以 guided user entity 开启新 segment；各段工时与折叠独立                                                                           |
+| guide + toolResultBatch=committed                               | 全部 sibling tool results 先落事实，再按 FIFO 一次内联消费全部已等待的 guide；同一 product turn 继续，Session Selection 与下一 model step 的 Active Model 切到最后一条 Submission 的 Selection |
+| accepted guide + current visual work segment                    | 关闭上一 segment，在同一 product turn 以 guided user entity 开启新 segment；一起消费的相邻 guide 共用一段；各段工时与折叠独立                                            |
 | guide + parallelTools + toolResultBatch=pending                 | 不消费；单个 sibling 先完成不能构成 guide boundary                                                                                                                       |
 | guide + turn terminal + toolResultBatch=none                    | 同一 intent 原地 fallback queue；保留 IDs、payload、admission order                                                                                                      |
 | ordinary queue + session ready + goal=none/complete + autoDrain | 按 FIFO 提升一个队首，并按原 text/goal/compact kind 执行                                                                                                                 |
@@ -121,7 +121,9 @@ completion-blocking active work：
 | verifierTerminal=manualCancel                                   | target→paused、autoDrain=false；不自动消费 queue                                                                                                                         |
 | activeWork=goalVerifier + stop                                  | 按投影携带的 `foregroundExecutionId` 取消同一 goal execution；verifier→continuation 阶段切换不改变 execution 身份；已切到无关新 execution 时 noop                        |
 | CLI restart + admitted nonterminal input                        | explicit discarded；`queue/guide` 静默结算，只有未进 transcript 的 `startNow`/`unknown` 提示确认重发；不自动重放                                                         |
-| accepted input ACK + projection silent                          | 宽限期后对当前 owned subscription single-flight resync；权威 queue/user row 到达后收口；不补造 UI 事实、不自动重发                                                    |
+| `sendText`/`editUserQuery` accepted input ACK + projection silent | 宽限期后对当前 owned subscription single-flight resync；权威 queue/user row 到达后收口；edit 已提交 branch cut 时也不补造 UI 事实、不恢复旧分支、不自动重发 |
+| edit/retry preflight passed + branch cut committed + Registry changed | Core 不重复执行可变目录准入；模型创建失败时沿普通轮生命周期先落 replacement `TurnStarted`/user row，再落 `TurnError(model_creation)`；落库失败仍报原始创建错误，Stop 为 `completed(cancelled)`，hook 拦截按普通轮处理；guide 回落 queue；workspace rewind 可保留，但 replacement 不得丢失 |
+| `/compact` + Registry changed                                   | 不发布 `TurnStarted`、不落 `/compact` user row；直接发布 `TurnError(model_creation)` |
 | sendQueuedNow                                                   | reserve -> stop barrier -> promote；成功才 remove，失败原位保留                                                                                                          |
 | collaborationMode=plan + goal command                           | UI admission reject；toast；保留 composer 原文；不创建 session、不发 command                                                                                             |
 
@@ -143,7 +145,7 @@ guide 与普通 queue 的状态层级不能折叠成一个 generic round-trip dr
 
 ```text
 Guide inline path
-  admitted -> wait complete tool batch -> one guided drain -> same product turn
+  admitted -> wait complete tool batch -> drain waiting guides (turn-steering.md「Drain 边界」) -> same product turn
        \-> no batch before terminal -> same intent becomes ordinary queue
 
 Ordinary queue path

@@ -20,6 +20,7 @@ export interface OfficialPluginListingSeed {
 
 export const OFFICIAL_BROWSER_USE_PLUGIN_NAME = "browser-use";
 export const OFFICIAL_BROWSER_USE_PLUGIN_ID = `${OFFICIAL_BROWSER_USE_PLUGIN_NAME}@${ZCODE_OFFICIAL_PLUGIN_MARKETPLACE}`;
+export const OFFICIAL_VISUALIZE_PLUGIN_ID = `visualize@${ZCODE_OFFICIAL_PLUGIN_MARKETPLACE}`;
 /**
  * node_repl 宿主。它不是面向用户的插件：没有 skill、没有 listing、不进市场，唯一职责是
  * 携带 `dist/mcp/server.js` 这个 Browser Use 与 Computer Use 共用的运行时产物。
@@ -35,6 +36,11 @@ export const OFFICIAL_CUA_PLUGIN_NAME = "computer-use";
 export const OFFICIAL_CUA_PLUGIN_ID = `${OFFICIAL_CUA_PLUGIN_NAME}@${ZCODE_OFFICIAL_PLUGIN_MARKETPLACE}`;
 
 export interface OfficialPluginDefinition {
+  /**
+   * 卸载（抑制）后的可恢复条目没有运行时信息，商店只能靠这里判断是否归入「UI 插件」。
+   * 插件包 manifest 声明 ui.surfaces 时必须同时声明 "ui"，由 bootstrap 测试校验一致。
+   */
+  componentTypes?: readonly string[];
   // 内容型 plugin (无 MCP server / 无系统依赖) 可以设为 true,
   // 这样用户首次 `/skill <name>` 就能用,不必先 `zcode plugins enable`。
   // 默认 false 保持 ios-simulator / android-emulator 这类重负载 plugin 原来行为。
@@ -45,6 +51,11 @@ export interface OfficialPluginDefinition {
    * 仅用于产品归属和设置页状态展示；运行时仍保留宿主 identity。
    */
   hostMcpServerNames?: readonly string[];
+  /**
+   * 构建产物内嵌每次构建不同、但不改版本号的值时，指向构建脚本写出的身份文件。
+   * seed 把文件内容记入 marker，内容变化按版本变化处理。
+   */
+  buildIdentityPath?: string;
   name: string;
   /** filesystem/SEA seed 缺少任一项时拒绝生成残缺的官方插件缓存。 */
   requiredSeedPaths?: readonly string[];
@@ -58,6 +69,14 @@ const ZAI_AUTHOR = { name: "Z.ai", url: "https://z.ai" } as const;
 const OFFICIAL_PLUGIN_ASSETS_BASE_URL = "https://cdn-zcode.z.ai/zcode/official-plugin/assets";
 
 export const OFFICIAL_NODE_REPL_HOST_REQUIRED_SEED_PATHS = ["dist/mcp/server.js"] as const;
+const NODE_REPL_HOST_BUILD_IDENTITY_PATH = "dist/build-identity.json";
+
+/** 文档插件（documents / pdf / presentations / spreadsheets）查看面板的构建产物。 */
+export const OFFICIAL_OFFICE_VIEWER_RUNTIME_PATHS = [
+  "dist/server.mjs",
+  "dist/ui/assets.json",
+  "dist/ui/panel.html",
+] as const;
 
 export const OFFICIAL_BROWSER_USE_REQUIRED_SEED_PATHS = [
   "docs/api.json",
@@ -85,9 +104,31 @@ export const OFFICIAL_ZCODE_GUIDE_REQUIRED_SEED_PATHS = [
   "skills/zcode-configuration-guide/SKILL.md",
 ] as const;
 
+// design 是纯内容型插件（技能 + 设计资源 + SessionStart hook，无 MCP），技能正文按需读取 references/
+// 与 scripts/；hook 只注入一句指针，正文缺失时 hook 静默退出，会话里就再也触发不到技能。
+// 所以这里钉住入口、7 份规则文件、三个随包脚本和 hook，seed 缺任一项都拒绝生成残缺缓存。
+export const OFFICIAL_DESIGN_REQUIRED_SEED_PATHS = [
+  "skills/design/SKILL.md",
+  "skills/design/references/catalog.md",
+  "skills/design/references/check.md",
+  "skills/design/references/create.md",
+  "skills/design/references/design-system.md",
+  "skills/design/references/interact.md",
+  "skills/design/references/output.md",
+  "skills/design/references/redesign.md",
+  "skills/design/scripts/adapt-canvas.mjs",
+  "skills/design/scripts/design-lint.mjs",
+  "skills/design/scripts/design-tokens.mjs",
+  "skills/design/scripts/import-design-system.mjs",
+  "hooks/hooks.json",
+  "hooks/run-hook.cmd",
+  "hooks/design-rules",
+] as const;
+
 export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = [
   {
-    defaultEnabled: true,
+    // 交互视图默认关闭，避免默认注入固定上下文；旧开关由配置迁移关闭一次。
+    defaultEnabled: false,
     listing: {
       author: ZAI_AUTHOR,
       category: "productivity",
@@ -128,7 +169,7 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
       "../../visualize-plugin",
       "../../../visualize-plugin",
     ],
-    version: "0.1.0",
+    version: "0.1.2",
   },
   {
     // 无 listing：宿主不进市场、不对用户露出。它必须始终可用，因为 node_repl 的注册门禁
@@ -138,6 +179,8 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     // 约定要防的是「首启即注入整套工具集并拉起 Helper」，而 seed 宿主两件都不做——工具是否
     // 进模型工具池由两个能力插件的启停决定，Helper 由 SDK 首次调用时才拉起。
     defaultEnabled: true,
+    // server.js 内嵌 CUA Helper build id（每条 CI 流水线不同），由 scripts/build.mjs 同步写出。
+    buildIdentityPath: NODE_REPL_HOST_BUILD_IDENTITY_PATH,
     name: OFFICIAL_NODE_REPL_HOST_PLUGIN_NAME,
     requiredSeedPaths: OFFICIAL_NODE_REPL_HOST_REQUIRED_SEED_PATHS,
     rootCandidates: [
@@ -146,7 +189,7 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
       "../../node-repl-host",
       "../../../node-repl-host",
     ],
-    version: "0.6.1",
+    version: "0.7.0",
   },
   {
     listing: {
@@ -166,7 +209,7 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
       "../../android-emulator-plugin",
       "../../../android-emulator-plugin",
     ],
-    version: "0.1.0",
+    version: "0.1.1",
   },
   {
     // manifest 只声明 browser-use skill；宿主 node_repl MCP 独立注入，package 另外携带其 server/client
@@ -197,13 +240,16 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
   },
   ...(
     [
-      ["documents", "docx", "Documents", "Word文档"],
-      ["pdf", "pdf", "PDF", "PDF"],
-      ["presentations", "pptx", "Presentations", "演示文档"],
-      ["spreadsheets", "xlsx", "Spreadsheets", "电子表格"],
+      // 版本按插件各自升，换新缓存目录：pdf 0.2.1 起面板带中日韩字体回退；0.2.1（pdf 0.2.2）起
+      // server 由工作区内各 session 共享，旧缓存的 server 不区分 session，不能沿用。
+      ["documents", "docx", "Documents", "Word文档", "0.2.2"],
+      ["pdf", "pdf", "PDF", "PDF", "0.2.3"],
+      ["presentations", "pptx", "Presentations", "演示文档", "0.2.2"],
+      ["spreadsheets", "xlsx", "Spreadsheets", "电子表格", "0.2.2"],
     ] as const
   ).map(
-    ([name, skill, displayName, chineseName]): OfficialPluginDefinition => ({
+    ([name, skill, displayName, chineseName, version]): OfficialPluginDefinition => ({
+      componentTypes: ["ui"],
       defaultEnabled: true,
       listing: {
         author: ZAI_AUTHOR,
@@ -215,14 +261,21 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
         description_i18n: { "zh-CN": `创建、编辑与审阅${chineseName}（${skill.toUpperCase()}）。` },
       },
       name,
-      requiredSeedPaths: ["agents/visual-judge.md", `skills/${skill}/SKILL.md`],
+      // 0.2.0 起文档插件同时提供查看面板：MCP server 与面板资源由 office-runtime 构建进 dist/，
+      // 缺任一项都会 seed 出能看到面板入口却无法启动的残缺插件。
+      requiredSeedPaths: [
+        "agents/visual-judge.md",
+        `skills/${skill}/SKILL.md`,
+        `skills/${skill}-viewer/SKILL.md`,
+        ...OFFICIAL_OFFICE_VIEWER_RUNTIME_PATHS,
+      ],
       rootCandidates: [
         `packages/${name}-plugin`,
         `../${name}-plugin`,
         `../../${name}-plugin`,
         `../../../${name}-plugin`,
       ],
-      version: "0.1.8",
+      version,
     }),
   ),
   {
@@ -367,6 +420,33 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     version: "0.3.0",
   },
   {
+    // 设计工作流（HTML 设计稿、交互原型、HTML 演示稿）。纯内容型，默认关闭；用户可启用、可停用、不可卸载。
+    // 版本与 package.json / 两份 plugin.json / sea-official-plugin-assets.mjs 同步 bump。
+    listing: {
+      author: ZAI_AUTHOR,
+      category: "productivity",
+      displayName: "Design",
+      // 英文名与描述回退到 manifest（displayName / description）；这里只放 zh-CN 覆盖。
+      displayName_i18n: { "zh-CN": "设计" },
+      description_i18n: {
+        "zh-CN": "做网页设计稿、原型和演示稿；桌面端本地工作区可在内置浏览器里点选修改。",
+      },
+      examplePrompts: ["Design a landing page for a budgeting app", "Build an 8-page HTML deck"],
+      examplePrompts_i18n: {
+        "zh-CN": ["给记账 App 设计一个落地页", "做一份 8 页的 HTML 演示稿"],
+      },
+    },
+    name: "design",
+    requiredSeedPaths: OFFICIAL_DESIGN_REQUIRED_SEED_PATHS,
+    rootCandidates: [
+      "packages/design-plugin",
+      "../design-plugin",
+      "../../design-plugin",
+      "../../../design-plugin",
+    ],
+    version: "0.7.2",
+  },
+  {
     // 产品决策：电脑控制回退为默认关闭，需用户在设置页显式开启。
     // 因此这里不声明 defaultEnabled——computer-use 携带 MCP server 与系统 Helper 依赖，
     // 默认开启意味着每个新用户首启即注入整套工具集并拉起 Helper。
@@ -377,7 +457,7 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     // isZCodeCuaInternalFeatureEnabled（打包层默认 true）与输入框入口 hidden 默认值的联动语义。
     name: "computer-use",
     hostMcpServerNames: ["node_repl"],
-    // 用户露出名统一为「Computer Use / 电脑控制」。包名与 producer 仓库仍保持 zcode-cua，
+    // 用户露出名统一为「Computer Use / 电脑控制」。包名与 producer workspace 包仍保持 zcode-cua，
     // 以兼容原生 Helper identity；EN 描述基线走 manifest
     // description，这里只放 zh-CN 覆盖；resolveLocalizedText 在 en-US 时回退到 manifest。
     listing: {
@@ -404,26 +484,61 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     runtimeTopLevelPaths: ["node_modules"],
     // 这里的 version 追踪上游 zcode-cua runtime 版本，使插件 UI 展示、缓存路径、
     // marketplace 条目都对齐；具体版本由原子 producer bump 工作流维护。
-    version: "0.6.4",
+    version: "0.6.5",
+  },
+  {
+    // ZCode Sites（技术方案 4）：Skill 指导 Agent 把项目改造并打包成 runner 可直接运行的产物包，
+    // 再用 scripts/zcode-site.mjs（CLI）上传发布；commands/ 是 /site-* 斜杠命令。
+    // 0.4.0 起自带 Sites 面板（UI plugin）：MCP server 与面板页面构建进 dist/，只给面板用，模型看不到
+    // （docs/site/sites-panel.md）。默认开启，用户不必先去设置里打开就能让 Agent 部署站点。
+    componentTypes: ["ui"],
+    name: "zcode-site",
+    defaultEnabled: true,
+    listing: {
+      author: ZAI_AUTHOR,
+      category: "productivity",
+      displayName: "ZCode Sites",
+      displayName_i18n: { "zh-CN": "ZCode Sites" },
+      description_i18n: {
+        "zh-CN": "把 Web 项目改造为可在云端 Linux 运行的部署包，一个 start.sh 即可启动。",
+      },
+      examplePrompts: ["Deploy this project as a website"],
+      examplePrompts_i18n: { "zh-CN": ["把这个项目部署成网站"] },
+      icon: `${OFFICIAL_PLUGIN_ASSETS_BASE_URL}/zcode-site/icon.png`,
+    },
+    rootCandidates: [
+      "packages/zcode-site-plugin",
+      "../zcode-site-plugin",
+      "../../zcode-site-plugin",
+      "../../../zcode-site-plugin",
+    ],
+    requiredSeedPaths: [
+      "commands/site-deploy.md",
+      "scripts/zcode-site.mjs",
+      "scripts/stage.mjs",
+      "scripts/errors.mjs",
+      "skills/site-deploy/SKILL.md",
+      "skills/site-deploy/templates/static.sh",
+      "skills/site-deploy/templates/static-server.mjs",
+      "skills/site-deploy/templates/node.sh",
+      "skills/site-deploy/templates/python.sh",
+      // 缺了会 seed 出能看到面板入口却启动不了 MCP server 的残缺插件。
+      "dist/server.mjs",
+      "dist/ui/panel.html",
+    ],
+    version: "0.5.0",
   },
 ];
 
 // 在 official plugin 定义里标了 defaultEnabled: true 的, 拼成 `<name>@<marketplace>` 形式,
 // 透传给 adapter 让它在用户没显式配置时默认开启 (内容型 plugin 才适用)。
 // 注意: 任何解析 plugin 的入口 (CLI 子命令 resolveZCodePlugins、应用启动 resolveStartupPlugins)
-// 都必须把这个集合传给 discoverNodePluginsSync, 否则 defaultEnabled 不生效。
+// 都必须把这个集合传给 discoverNodePlugins, 否则 defaultEnabled 不生效。
 export const DEFAULT_ENABLED_OFFICIAL_PLUGIN_IDS: ReadonlySet<string> = new Set(
   OFFICIAL_PLUGIN_DEFINITIONS.filter((definition) => definition.defaultEnabled).map(
     (definition) => `${definition.name}@${ZCODE_OFFICIAL_PLUGIN_MARKETPLACE}`,
   ),
 );
-
-export function resolveOfficialPluginHostMcpServerNames(pluginId: string): string[] {
-  const definition = OFFICIAL_PLUGIN_DEFINITIONS.find(
-    (candidate) => `${candidate.name}@${ZCODE_OFFICIAL_PLUGIN_MARKETPLACE}` === pluginId,
-  );
-  return definition?.hostMcpServerNames ? [...definition.hostMcpServerNames] : [];
-}
 
 /**
  * 官方插件由 host CLI 注入的 MCP（如 browser-use 的 `node_repl`）server name 不带 `plugin:` 前缀，

@@ -11,6 +11,7 @@ import {
   CoreErrorType,
   SessionEventType,
   createCoreError,
+  traceContextToLogContext,
   type BashInput,
   type BashOutput,
   type BackgroundExecutionStartResult,
@@ -45,7 +46,11 @@ export {
   getBashUserFacingName,
 } from "./bash-metadata.js";
 import { readStringProperty } from "./bash-metadata.js";
-import { formatBashModelContent, formatPersistedBashModelContent } from "./bash-model-content.js";
+import {
+  formatBashModelContent,
+  formatPersistedBashModelContent,
+  isBashModelContentBounded,
+} from "./bash-model-content.js";
 
 /** session shell selection 尚未初始化时 guarded matcher 采用的文法；与 readonly 判定的假设一致。 */
 const GUARDED_DEFAULT_DIALECT: ExecutionShellSelection["dialect"] = "posix";
@@ -125,6 +130,9 @@ export function resolveBashPermissionCapability(
     );
     if (match.status === "matched") return { userApprovalRule: match.ruleId };
   }
+  // Bash 会把 # 后的 CMD 命令当注释；异构 shell 不能用 Bash AST 证明整条命令只读。
+  const dialect = context?.bashShellSelection?.dialect;
+  if (dialect === "cmd" || dialect === "legacy-shell") return undefined;
   if (!command || !isRuntimeReadOnlyBashCommand(command, context)) return undefined;
   return {
     destructive: false,
@@ -178,25 +186,18 @@ async function executeBashHandler(
   const request = createExecutionRequest(parsed, context, timeoutPolicy);
   const progressTiming: BashProgressTiming = {};
   const commandTelemetry = startBashCommandTelemetry(parsed, context);
-  const runOptions = createExecutionRunOptions(context, progressTiming, commandTelemetry);
-  // 后台命令完成后 runTaskNotificationBatch 会另起一轮通知 turn，该 turn 不带
-  // turnExecutionModel，闲时 turn 结束/失败后就会落到用户自己的套餐上跑完整 agent loop。
-  // 与 subagent runner 的 BACKGROUND_UNAVAILABLE 对称：闲时 turn 拒绝显式后台，也关闭超时自动转后台。
-  const backgroundDisabled = context.offPeakTurn === true;
-  if (parsed.run_in_background && backgroundDisabled) {
-    throw createCoreError(
-      CoreErrorType.ToolExecutionFailed,
-      "Idle-time tasks do not support background commands. Run this command in the foreground without run_in_background.",
-      {
-        context: {
-          toolCallId: context.toolCallId,
-          toolName: "Bash",
-        },
-        recoverable: true,
-      },
-    );
-  }
-  const eligibleForAutoBackground = !backgroundDisabled && isBashAutoBackgroundEligible(parsed);
+  const processLog: BashProcessLogState = {
+    runInBackground: parsed.run_in_background === true,
+    startedLogged: false,
+  };
+  const runOptions = createExecutionRunOptions(
+    context,
+    progressTiming,
+    commandTelemetry,
+    processLog,
+  );
+  // 闲时后台归属由 Runtime 生命周期保留，Bash 复用普通显式/超时后台路径。
+  const eligibleForAutoBackground = isBashAutoBackgroundEligible(parsed);
   const backgroundLifecyclePort = supportsBashBackgroundLifecycle(executionPort)
     ? executionPort
     : undefined;
@@ -245,10 +246,17 @@ async function executeBashHandler(
     : await runCommand();
 
   if (runResult.kind === "backgrounded") {
-    return toBackgroundedBashOutput(runResult.task, parsed);
+    // explicit 模式下适配器在 started 事件里就提交后台，之后的事件（含这次 started）都不再转发；
+    // 启动日志在这里用 task.pid 补写。auto_on_timeout 已在前台阶段收到 started，不会重复写。
+    logBashProcessStarted(context, processLog, runResult.task.pid);
+    // auto_on_timeout 只在超时计时器到点时转后台，所以这里记录的就是触发转后台的超时。
+    const timedOutAfterMs =
+      !parsed.run_in_background && eligibleForAutoBackground ? request.timeoutMs : undefined;
+    return toBackgroundedBashOutput(runResult.task, parsed, timedOutAfterMs);
   }
 
   const result = runResult.result;
+  logBashProcessExited(context, result);
   const cwdDecision = decideBashCwdPolicy({
     status: result.status,
     exitCode: result.exitCode,
@@ -292,6 +300,7 @@ function emptyBashOutput(input: BashInput): BashOutput {
 function toBackgroundedBashOutput(
   task: BackgroundExecutionStartResult,
   input: BashInput,
+  timedOutAfterMs: number | undefined,
 ): BashOutput {
   return attachToolExecutionTelemetry(
     {
@@ -300,6 +309,7 @@ function toBackgroundedBashOutput(
       interrupted: false,
       status: "backgrounded",
       backgroundTaskId: task.taskId,
+      ...(timedOutAfterMs !== undefined && timedOutAfterMs > 0 ? { timedOutAfterMs } : {}),
       rawOutputPath: task.outputPath,
       persistedOutputPath: task.outputPath,
       stdoutPersistedOutputPath: task.stdoutPersistedOutputPath,
@@ -314,10 +324,15 @@ function createExecutionRunOptions(
   context: ToolExecutionContext,
   progressTiming?: BashProgressTiming,
   telemetry?: CommandExecutionSpanWriter,
+  processLog?: BashProcessLogState,
 ): ExecutionRunOptions {
   return {
     signal: context.abortSignal,
     onEvent: async (event) => {
+      if (event.type === "started") {
+        if (processLog) logBashProcessStarted(context, processLog, event.pid);
+        return;
+      }
       if (event.type !== "progress") return;
       if (
         progressTiming &&
@@ -330,6 +345,48 @@ function createExecutionRunOptions(
       await emitProgressEvent(event, context);
     },
   };
+}
+
+// 系统侧（任务管理器、Windows 资源耗尽事件）只认 pid；pid 与 toolCallId 同时落到 info 日志，
+// 才能把占用内存的进程对回具体的工具调用。Windows 上这是 bash.exe / cmd.exe 外壳的 pid，
+// 命令本身是它的子孙进程。后台命令的结束日志由 background task tracking 写。
+interface BashProcessLogState {
+  runInBackground: boolean;
+  /** started 事件和转后台补写两条入口共用，保证每次调用只写一条启动日志。 */
+  startedLogged: boolean;
+}
+
+function logBashProcessStarted(
+  context: ToolExecutionContext,
+  state: BashProcessLogState,
+  pid: number | undefined,
+): void {
+  if (state.startedLogged) return;
+  state.startedLogged = true;
+  context.logger?.info("Bash process started", {
+    ...(context.traceContext ? traceContextToLogContext(context.traceContext) : {}),
+    event: "tool.bash.process.started",
+    module: "core.tool.bash",
+    pid,
+    runInBackground: state.runInBackground,
+    toolCallId: context.toolCallId,
+  });
+}
+
+function logBashProcessExited(context: ToolExecutionContext, result: ExecutionResult): void {
+  context.logger?.info("Bash process exited", {
+    ...(context.traceContext ? traceContextToLogContext(context.traceContext) : {}),
+    cancelled: result.cancelled,
+    durationMs: result.durationMs,
+    event: "tool.bash.process.exited",
+    exitCode: result.exitCode,
+    module: "core.tool.bash",
+    pid: result.pid,
+    signal: result.signal,
+    executionStatus: result.status,
+    timedOut: result.timedOut,
+    toolCallId: context.toolCallId,
+  });
 }
 
 function startBashCommandTelemetry(
@@ -431,6 +488,17 @@ async function emitProgressEvent(
   });
 }
 
+function createBashSessionEnv(context: ToolExecutionContext): Record<string, string> {
+  // 工作区根目录是会话创建时的工作目录，不随 `cd` 变化。
+  return {
+    CLAUDE_CODE_SESSION_ID: context.sessionId,
+    CLAUDE_PROJECT_DIR: context.workspaceRoot,
+    CLAUDE_SESSION_ID: context.sessionId,
+    ZCODE_PROJECT_DIR: context.workspaceRoot,
+    ZCODE_SESSION_ID: context.sessionId,
+  };
+}
+
 function createExecutionRequest(
   input: BashInput,
   context: ToolExecutionContext,
@@ -463,6 +531,10 @@ function createExecutionRequest(
       workspaceRoot: context.workspaceRoot,
     }),
     ...(bashPrelude ? { bashPrelude } : {}),
+    // 会话上下文变量与 hooks 的插件环境一致（configured-runner-input.ts createPluginEnvOverlay）。
+    // 自定义命令的 `!` 块改为转交模型经 Bash 执行后，原来由命令解析阶段执行器提供的这组变量
+    // 只能在这里提供；插件脚本在自身进程里读取会话 ID 区分会话，缺了它会跨会话生效。
+    env: { set: createBashSessionEnv(context) },
     captureCwdAfterSuccess: input.run_in_background ? undefined : true,
     timeoutMs: resolveBashTimeoutMs(input.timeout, timeoutPolicy),
     outputLimit: {
@@ -505,6 +577,8 @@ export const bashToolEntry: ToolEntry = {
   },
   formatModelContent: formatBashModelContent,
   formatPersistedModelContent: formatPersistedBashModelContent,
+  // 失败正文已按字符保留头尾，不再按字节预算落盘。
+  isModelContentBounded: isBashModelContentBounded,
   handler: bashHandler,
   resolveTimeoutBudgetMs: createBashTimeoutBudgetResolver(DEFAULT_BASH_TIMEOUT_POLICY),
   resolvePermissionCapability: resolveBashPermissionCapability,
@@ -608,7 +682,7 @@ function createBashInputJsonSchema(timeoutPolicy: BashTimeoutPolicy): Record<str
       ...properties,
       timeout: {
         ...timeoutProperty,
-        description: `Optional timeout in milliseconds (max ${timeoutPolicy.maxTimeoutMs})`,
+        description: `Optional timeout in milliseconds (max ${timeoutPolicy.maxTimeoutMs} for a foreground command)`,
       },
     },
   };

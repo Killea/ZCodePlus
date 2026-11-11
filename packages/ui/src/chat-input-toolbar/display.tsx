@@ -7,16 +7,19 @@ import {
   type RefObject,
 } from "react";
 import {
-  TID_CHAT_MODE_SELECT_ITEM,
-  TID_CHAT_MODE_SELECT_TRIGGER,
-  TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM,
-  TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER,
-  testId,
+  zcodeProviderRuntimeHeadersErrorCode,
   type ZCodeApiRetryStatus,
   type ZCodeConfigOption,
   type ZCodeConfigSelectValue,
   type ZCodeProvider,
 } from "@zcode/shared";
+import {
+  TID_CHAT_MODE_SELECT_ITEM,
+  TID_CHAT_MODE_SELECT_TRIGGER,
+  TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM,
+  TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER,
+  testId,
+} from "@zcode/shared/test-ids";
 import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import {
   Select,
@@ -149,7 +152,12 @@ export function ChatApiRetryStatus({
     // 这里先收敛成稳定的重试状态文案，只展示第几次重试。
     const formatter = new Intl.NumberFormat(locale);
     return intl.formatMessage(
-      { id: "chat.apiRetryStatus" },
+      {
+        id:
+          apiRetry.error === zcodeProviderRuntimeHeadersErrorCode.configNetwork
+            ? "chat.configReadRetryStatus"
+            : "chat.apiRetryStatus",
+      },
       {
         attempt: formatter.format(apiRetry.attempt),
         maxRetries: formatter.format(apiRetry.maxRetries),

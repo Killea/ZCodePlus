@@ -1,5 +1,11 @@
 # 闲时任务（Off-Peak Task）v1 实现 Spec
 
+> **2026-10-21 过期处理修订：** 服务端已拆分 `3102`（ready 过号）、`3106`（active 运行超时）和 `3104`（其他无效票据）。关闭自动补号的决定不变；排队票过期、运行中 `3102` / `3106` 和遗留无票任务均以失败结束，保留原任务与会话；仅用户创建、Continue 或重试可请求新票。下文历史换票描述以本条为准。
+
+错误横幅仅在 `3106` 时明确提示运行超时。`3102` 和仅有过期标记的历史错误使用通用票据过期文案，兼容旧服务端曾将两种原因合并为 `3102` 的记录；不新增横幅重试或切模型动作。
+
+> **后台生命周期修订：** 本次实现边界与验证进度见 [实施计划](./background-lifecycle-plan.md)。D51/D52 的后台与 SendMessage 限制由下述生命周期取代；历史决定保留在 decisions.md。
+
 > **状态：已实现，持续按 Figma 收口。** 当前仓库已包含 `offPeak` 领域类型、repo、service、
 > scheduler、UI 与进程内 mock；本文记录当前产品语义与实现约束。
 >
@@ -17,7 +23,7 @@
 
 ## 1. 一句话定义
 
-闲时任务 = **Automations 体系下的一次性后台任务**（D28，Figma 定稿范式）：用户在 Automations 主视图/模板卡创建（title + instructions + 项目 + 权限 + 模型），提交即 `POST /ticket` 取号排队。**排队由服务端承载**（全局 ticket FIFO、按资源空余控并发准入）；客户端用批量 `POST /ticket/status` 观察 ticket，`ready` 时写 `schedulable=true` 并派发。无人值守执行按 3h active ticket 分段，收到 `400/3102` 后用同 task_id 重取号并 resume 同一 session，直到自然完成；每个自动派发 turn 使用用户不可见的 idle plan provider。
+闲时任务 = **Automations 体系下的一次性后台任务**（D28，Figma 定稿范式）：用户在 Automations 主视图/模板卡创建（title + instructions + 项目 + 权限 + 模型），提交即 `POST /ticket` 取号排队。**排队由服务端承载**（全局 ticket FIFO、按资源空余控并发准入）；客户端用批量 `POST /ticket/status` 观察 ticket，`ready` 时写 `schedulable=true` 并派发。无人值守执行使用当前 ticket，收到 `400/3102` / `400/3106` 后停止执行并记录票据过期，不自动重新取号；每个自动派发 turn 使用用户不可见的 idle plan provider。
 
 命名按层级固定：英文 UI 的单项概念使用 `Idle-time task`，侧栏系统分组使用复数
 `Idle-time tasks`；中文 UI 统一使用「闲时任务」。TypeScript 类型/变量/常量分别使用
@@ -124,7 +130,7 @@ D48 起，闲时任务的**已派发会话**在 tasks-index 拥有一等 task �
 queued ⇄ paused（用户 Pause/Continue；票过期停在 paused 等手动继续）
 queued ──服务端 ready 且被派发──▶ running ─────────▶ completed
   │                             │ ├─ 不可恢复错误 ─▶ failed
-  │                             │ └─ 400/3102 ─────▶ queued（换票，复用 session）
+  │                             │ └─ 3102 / 3106 ──▶ failed（不自动补号）
   └── 用户取消（任何非终态） ──────────────────────▶ cancelled
 ```
 
@@ -132,9 +138,10 @@ queued ──服务端 ready 且被派发──▶ running ───────
 
 - 终态不可逆出；文件修改任何情况不回滚。
 - 任务可多个并发执行，并发额度由服务端调度决定（D20）；单任务派发 single-flight 防重复。同 workspace 并发的文件冲突风险与手动并发对话一致，不新增隔离。
-- ~~composer 锁定~~（D28/D30 作废）：run session 是普通对话，running 中补发 prompt 走现有 busy queue；自动 turn terminal 后再 drain，排队消息按 Session Selection 创建用户模型。任务操作收敛在卡片菜单：queued「Pause / Delete」、paused「Continue / Delete」、running「取消」。
+- ~~composer 锁定~~（D28/D30 作废）：run session 是普通对话，补发 prompt 仍走现有 CommandInbox；消息被接纳即接管整项任务，执行顺序仍按既有队列规则。任务操作收敛在卡片菜单：queued「Pause / Delete」、paused「Continue / Delete」、running「取消」。
 - `build` 权限模式 / elicitation 复用普通 session 的交互链路：Agent 在会话内等待用户响应，但 Off-Peak 聚合状态保持 `running`，卡片不提供独立 Review 状态或专用通知。批准/拒绝都在同一个自动 turn 内继续，仍使用该 turn 的 idle Active Model；不承诺 D11/D27 历史方案中的批准后切用户 provider。
-- failed 不自动重试；用户可手动重新入队 = 重新提交尝试。
+- failed 不自动重试；用户可手动重新入队 = 重新提交尝试。排队票过期、运行中票据过期与遗留无票 queued 任务均失败收口；停止驻留 CLI 的换票等待及其后台工作，保留会话、文件和原票据。仅手动 Continue 的当次调用允许补票，失败后不得由轮询继续补票。
+- 聊天错误提示按服务端业务码解释原因：`3102` 中文为「排到任务时设备未在线。额度已返还，请保持设备在线后重新创建闲时任务。」；`3106` 继续提示超过单次最长运行时间。仅有 `off-peak-ticket-expired` 标记的历史错误无法区分两者，显示「此闲时任务已无法继续，请创建新的闲时任务。」，不承诺额度返还。英文表达相同含义；文案不改变任务调度或额度核算。
 
 ## 3. 调度规则（D18/D26/D39：客户端不承载排队核心）
 
@@ -143,13 +150,15 @@ queued ──服务端 ready 且被派发──▶ running ───────
   1. **取号**：创建任务时 `POST /ticket {task_id}`；服务端返回 ticket/state/position，成功才落本地 task。`429/3103 + next_take_at` 表示当前无法取号。
   2. **批量同步 + 派发**：有非终态 ticket 时用一个共享 timer 调 `POST /ticket/status`；服务端 `ready` 写成 `schedulable=true`，scheduler 再按本地 FIFO 事务认领。
   3. **处理 messages 容量等待**：idle provider 收到 HTTP `429/3105 + Retry-After` 时在 adapter 内等待重试；普通 provider 不走该特判。
-- **无窗口可错过（D21/D9）**：机器睡眠 / app 未开期间什么都不发生，恢复后继续轮询与派发。⚠ automation 的 `MISFIRE_GRACE_MS` skip 策略与此无关，不得复用。
+- **休眠与恢复**：机器睡眠 / app 未开期间不推进本地调度，恢复后以服务端票据状态为准；有效票继续轮询与派发，过期票失败收口且不补号。automation 的 `MISFIRE_GRACE_MS` skip 策略与此无关，不得复用。
 - `POST /ticket` 若直接返回 ready，service 立即写 `schedulable=true` 并唤醒 scheduler；否则由后续 batch status 观察 ready。
-- running 中途每次模型请求**皆可能被重新排队**（D19）：仅 idle plan provider 把 HTTP 429/3105 分类为 `OffpeakQueued`，单次等待 `min(Retry-After 或 60s, 5min)`，abort-aware、无限幂等探测且不消耗普通 retry budget。stream 仅在可见输出边界前重试。客户端不新增持久态；由于 running 在 `sendPrompt` ACK 后写入，首个 messages 请求等待 429 时 UI 也保持 running。ready 票等待到 TTL 过期后由 3102 统一换票，不另设“首派超阈值弃派”状态机。
+- running 中途每次模型请求**皆可能被重新排队**（D19）：仅 idle plan provider 把 HTTP 429/3105 分类为 `OffpeakQueued`，单次等待 `min(Retry-After 或 60s, 5min)`，abort-aware、无限幂等探测且不消耗普通 retry budget。stream 仅在可见输出边界前重试。客户端不新增持久态；由于 running 在 `sendPrompt` ACK 后写入，首个 messages 请求等待 429 时 UI 也保持 running。ready 票等待到 TTL 过期后由 3102 结束执行，不另设“首派超阈值弃派”状态机。
 - 派发执行：新对话 = createTask + sendPrompt；续已有对话 = resume sessionId + sendPrompt。permissionMode 随派发下发。
 - 中断恢复：app 重启发现 running 残留（进程已死）→ 置回 queued 队首，授权后重新发起尝试并 resume 同一 session 续跑（"重启后自动续跑"文案的实现口径）。
-- provider：闲时执行 → idle plan（3h ticket 分段 + 自动续跑，D26）。隐藏的 Built-in `builtin:offpeak-idle-plan` 提供静态 Provider/Model 事实；每次派发提交标准 Model Selection，并在 `modelExecution` 中只携带本次 Request Auth、前台 Child override 与后台拒绝策略。它通过同一 Registry/ModelFactory 创建 idle Active Model，不修改 Session Selection，也不构造完整 Runtime Model 快照。首次派发创建 session 时，通过 `workspace/readState(preferWorkspaceDefaults=true)` 按完整 `providerId/modelId` 选择 `defaultModel → lastUsed → settings.model.current`，不得按 `available[0]` 或 provider registry 顺序猜测；多 provider 时模型栏因此稳定显示 workspace 用户模型。OffPeak 表单模型只决定 idle 自动 turn，不覆盖 Session Selection。permission approval 发生在同一自动 turn 时继续使用 idle Active Model，不切用户 provider，也没有套餐配额提示；用户补发 prompt 在当前 turn terminal 后 drain，并按自己的普通 Submission 与 Session Selection 创建用户模型。D11/D27 的批准切换属于未采纳的历史意图；~~立即执行~~ v1 已砍掉（D32）。
+- provider：闲时任务启动后，运行时 `sessionModelSelection` 维护闲时续跑选择，后台 Agent、SendMessage 恢复及 Bash 完成唤起继承同一执行归属和动态票据；临时闲时选择不写入普通 `runtime/model_selection`。用户消息被 CLI 接纳时立即接管整项任务，按 admission 顺序更新 Session Selection；只改模型菜单不接管。正在执行的子 agent 保留本轮模型，后续唤起与恢复用用户模型。permission/elicitation 响应不属于新用户消息，不改变套餐归属。
 - 派发失败分类：网络、Agent 启动等未知或可自愈错误为 `transient`，保持 queued 并按 30s 起、15min 封顶退避；用户 workspace 无可用模型、idle plan 无可用模型或双凭证缺失属于确定性 `permanent`，必须直接转 `failed`、记录原因并停止重试/重取号，由用户修复配置后重新提交。禁止把确定性配置错误伪装成长期“等待闲时算力”。
+
+正式 UI 回放的主页布局与额度置灰场景也必须准备账号控制面、有效登录和当前连接。取号网关 mock 不提供 Registry 模型事实；未准备账号时不应假定创建入口可见。
 
 ## 4. 当前服务端契约（D26/D39；客户端同时提供进程内 mock）
 
@@ -256,7 +265,7 @@ POST /ticket/status          { ticket_ids:[…≤100] } → { next_poll_after, t
 #    本地 running 在 sendPrompt ACK 后写入，可能早于服务端 active
 # 3. 调模型（= Anthropic /messages；ready 后 5min 内发首个即准入 active）
 POST /anthropic/v1/messages  # 头 +X-Off-Peak-Ticket-ID: <ticket_id>，body 原生 Anthropic
-#    429/3105 模型并发满→带 Retry-After，按 D24 min(Retry-After,5min) 退避；400/3102 ticket 不可用→触发续跑；400/3006 模型不在白名单；429/3103 取号超限→data.next_take_at + 刷新额度快照
+#    429/3105 模型并发满→带 Retry-After，按 D24 min(Retry-After,5min) 退避；400/3102 ready 过号、400/3106 active 超时→失败且不补号；400/3104 其他无效票据→普通失败；400/3006 模型不在白名单；429/3103 取号超限→data.next_take_at + 刷新额度快照
 # 4. 结算（客户端统一带双凭证；服务端当前只校验 JWT；无 body）
 POST /ticket/:ticket_id/settle → { ticket_id, state:settled, settled_at }
 
@@ -268,9 +277,9 @@ GET /api/v1/client/configs   → data.configs.offPeak: { enable_offpeak_task }
 
 ### 取号额度口径（服务端 off_peak_design.md，权威）
 
-- 服务端内部配置 `take_number.{window, limit}` 不再下发客户端；客户端只消费 availability 的 `can_take_number` 与 `next_take_at`，**实际取号仍是最终准入依据**（超限 429/3103）。
-- 计数依据 = 该用户 `off_peak_tickets.created_at`；**每次成功创建 ticket 计一次**；同用户同 `task_id` 幂等提交不重复计数。
-- 幂等免计**只在最新 ticket 未过期时成立**：最新 ticket 已 expired → 重新取号新建 ticket，**计入额度**。settle / ready 过期 / active 到期**均不返还**已占用名额；ticket 创建时间移出滚动窗口后名额自动恢复。
+- 服务端内部配置 `take_number.{timezone, daily_limit, daily_limits}` 不再下发客户端；客户端只消费 availability 的 `can_take_number` 与 `next_take_at`，**实际取号仍是最终准入依据**（超限 429/3103）。
+- 按配置时区的自然日 `[当日 00:00, 次日 00:00)` 统计该用户 `off_peak_tickets.created_at`；套餐档位决定当日上限，重复返回未过期票不重复计数。
+- 最新票 expired 后可以手动申请新票；**新票会占用额度**。旧票若从未激活，且已 expired 或 settled，则不计入当日名额；旧票若已经激活，过期或 settle 后仍计入创建当日额度。availability 受限时 `next_take_at` 为下一自然日零点。
 - availability 额度已满 → HTTP 200，`can_take_number=false` + `next_take_at`（Unix 毫秒）；到点重新查询。
 - 实际取号超限 → `HTTP 429 + code 3103 + data.next_take_at`；查询与取号之间的并发竞态由该响应兜底。
 - availability 查询失败、加载中或结果未知时均禁入；下一次成功刷新返回 `can_take_number=true`
@@ -294,7 +303,7 @@ GET /api/v1/client/configs   → data.configs.offPeak: { enable_offpeak_task }
 | 侧栏               | Group 视图系统分组「Idle-time tasks」= tasks-index 真实系统分组（D48-A：`OFF_PEAK_DEFAULT_GROUP_ID`，与 cron 分组同构；Project 视图不出现独立系统分组；完整契约见 §5.1）。组内成员 = **已派发过的闲时会话**（与 cron 组只装运行产物同构）；排队/暂停任务派发前不上侧栏，只在 Automations 主视图管理（作用域同 grouped 视图：只显示已打开项目）。行尾按 task meta `offPeakTaskId` 展示月亮标识与 `updatedAt` 相对时间，不展示位次徽章；行点击进 session 对话。折叠、收起全部、组内拖拽、整组拖动、置顶全部走 grouped 原生管线并随其持久化。行关闭 = 归档（无确认弹窗）；删除/取消入口在 Automations 卡片菜单。组头「+」打开 Automations。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | 编辑               | queued/paused 全字段可编辑；running 起锁定（仅取消）；终态只读；丢弃草稿弹窗与 scheduled 共用 Automation confirmation presentation：桌面宽 448px、最小高 180px。中文固定为标题「丢弃闲时任务的草稿？」、正文「你对当前闲时任务的更改将会丢失。」、操作「取消 / 丢弃」；英文对应为标题 `Discard Idle-time task draft?`、正文 `Your changes to the current idle-time task will be lost.`、操作 `Cancel / Discard`。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | 通知               | Off-Peak 聚合只发完成/失败通知；permission/elicitation 等确认通知由普通 session 通知链路负责，避免同一请求重复通知。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 多端               | 手机 `/remote` 完全隐藏 Automations 导航与路由，陈旧路由回退聊天；桌面远程 workspace 隐藏 Idle-time。Scheduled 与 Idle-time 新建均只允许本地项目；既有远程任务继续可见和管理。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 多端               | 手机 `/remote` 完全隐藏 Automations 导航与路由，陈旧路由回退聊天；桌面远程 workspace 隐藏 Idle-time。Scheduled 与 Idle-time 新建均只允许本地项目；既有远程任务继续可见和管理。闲时任务只在本地生效：远程 workspace（含已识别的 Source Server）的 Renderer 服务集合固定使用本地 Desktop Host 的 `offPeakTaskService`，不得路由到远端（远端未注册 `off-peak-task` 频道，每次调用都会等满 1000ms 未知频道超时）。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 `OffPeakNewTaskEntry` 保留底部固定区的独立宽度约束，但当前不挂载到 New task 首页：横幅使用 `580px` 上限，三列模板按钮
 使用原布局的 `780px` 上限；两者都配合 `w-full` 向窄屏收缩，不依赖
@@ -496,7 +505,7 @@ off-peak session 投影去重（`off-peak-session-projection`）随之整体退�
 ```text
 普通用户 turn ──────────── OffPeakCreate ✅  OffPeakList ✅
 cron automation 自动 turn ─ OffPeakCreate ✅（D49-3 组合玩法） OffPeakList ✅
-闲时自动派发 turn ───────── OffPeakCreate ❌ SendMessage ❌ Workflow ❌（D52，denylist ["CronCreate","OffPeakCreate","SendMessage","Workflow"]） OffPeakList ✅
+闲时自动派发 turn ───────── OffPeakCreate ❌ Workflow/动态工作流执行入口 ❌ CronCreate ❌；SendMessage ✅ Agent 后台 ✅ Bash 后台 ✅ OffPeakList ✅
 subagent_child ──────────── 均不注册
 ```
 
@@ -515,11 +524,37 @@ running/终态沿用 readOnly 只读，D30-7）；任务已删除时 toast targe
 
 **绑定会话运行（D50）**：任务在创建它的会话里执行。派发前先探测会话是否正在跑用户 turn，忙则
 transient 退避重试且不改任何会话配置；派发写入的权限模式（缺省 yolo）任务结束后不回滚；用户在任务轮
-点 Stop = 取消任务（票作废）；绑定会话被删除 = permanent 失败。Automations 卡片脚注与编辑页展示绑定
-会话标题（`sessionTitle`，list 时联查 tasks-index），编辑页附 Stop 即取消提示。表单创建仍新建独立 session。
+点聊天 Stop 沿用普通 Agent 的停止行为；任务卡「取消」才终止整项闲时任务并抑制迟到唤起；绑定会话被删除 = permanent 失败。Automations 卡片脚注与编辑页展示绑定
+会话标题（`sessionTitle`，list 时联查 tasks-index），编辑页区分聊天停止与任务卡取消。表单创建仍新建独立 session。
 
 **不做**：会话内 update/cancel 工具；会话标题冻结（不照抄 CronCreate 的
 setCustomSessionTitle）；卡片活状态订阅；本地额度计数；绑定/独立会话开关；任务结束后权限模式回滚。
+
+## 后台工作与票据收口
+
+主轮自然结束后，只要后台工作、未消费通知、已接纳输入或换票等待尚在，就保持整项任务未完成。CLI 根据既有任务登记表和命令队列判定，Host 只消费显式生命周期事件。票据释放与任务完成独立：用户接管后闲时子轮全部结束即可释放旧票，任务仍可能继续走用户套餐。
+
+```mermaid
+stateDiagram-v2
+  闲时执行 --> 等待后台: 主轮结束且后台未完成
+  等待后台 --> 闲时执行: 回复或完成通知
+  闲时执行 --> 失败: 请求返回3102或3106
+  等待后台 --> 失败: 唤起时票据过期
+  闲时执行 --> 用户执行: 用户消息被接纳
+  等待后台 --> 用户执行: 用户消息被接纳
+  闲时执行 --> 整项完成: 无剩余工作
+  用户执行 --> 整项完成: 无剩余工作
+```
+
+收到票据过期通知后由 Host 记录失败并取消原执行，结束模型请求的换票等待及后台工作；不重发原始 prompt 或重跑工具。并发票据错误不得重复取号；接管、取消后的迟到票据只释放。后台登记、通知队列、票据凭据与临时闲时选择均不做跨 App/CLI 重启恢复；已有任务行的冷启动回收仍按原规则处理，不还原已消失的后台进程。
+
+取消必须幂等：已完成或已取消执行的 cancel 不得停止同会话后续用户轮。有效取消只停止发起取消时捕获的前台执行。
+
+旧换票协议保留兼容能力，但本版本的自动路径不再发起取号；若处理升级前的在途交接，仍遵守下述幂等约束：换票 RPC 回执失败表示交接结果未知，Host 保留同一 `executionId + renewalId + ticketId` 及内存凭据，通过既有同步周期重试确认；不将未知交接写回 queued、不重取票、不重放任务。新一轮 ticket_needed 废弃旧交接的回执写入；接管或完成后仍可确认已安装的票，未安装的候选票只释放。交接重试不新增持久化、计时器或对话恢复队列，desktop continuous 与 mobile replayable 边界不变。
+
+CLI/TUI 的输入默认值命名为 `cliDefaultSelection`，复用 `provider_config.json` 的 `config.defaultModelSelection` 与现有普通 session entry。`/model`、`/effort` 只改变输入默认值及原有记忆位置，发送才更新运行时 Session Selection。无配置或数据库迁移。加速卡通过 `selectionFallback.target` 传入该条用户消息的普通选择；Core 的 `highspeedFallbackSelection` 固定本轮接纳前的 Session 候选，用于加速卡过期或请求失败回退，与闲时续票无关。
+
+自动 Project Memory 提取仍跳过：具体是成功结束后的后台项目记忆提取，不修改会话 Memory 开关。child runtime 内嵌 Bash 的结束清理与普通 Agent 一致。
 
 ## 6. 复用点速查（feat/cron 基建）
 

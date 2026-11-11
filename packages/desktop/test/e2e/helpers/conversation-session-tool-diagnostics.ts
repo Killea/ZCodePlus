@@ -6,9 +6,8 @@ import {
   TID_CHAT_MESSAGE_FORK_BUTTON,
   TID_CHAT_TOOL_CALL_BLOCK,
   TID_CHAT_VIEW,
-  TID_TOOL_SUMMARY_TRIGGER,
   TID_V4_SESSION_PANE,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 
 export interface ToolCallBlockSnapshot {
   exists: boolean;
@@ -96,46 +95,31 @@ export type ToolCallMatcher =
 export function expandAssistantHistoriesWithContent(): Promise<void> {
   return browser.execute((historyTriggerPrefix) => {
     const triggers = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        `[data-testid^="${historyTriggerPrefix}-"]`,
-      ),
+      document.querySelectorAll<HTMLElement>(`[data-testid^="${historyTriggerPrefix}-"]`),
     );
     for (const trigger of triggers) {
       const expanded =
         trigger.getAttribute("aria-expanded") === "true" ||
         trigger.getAttribute("data-history-open") === "true";
-      if (
-        trigger.getAttribute("data-history-has-content") !== "false" &&
-        !expanded
-      ) {
+      if (trigger.getAttribute("data-history-has-content") !== "false" && !expanded) {
         trigger.click();
       }
     }
   }, TID_CHAT_ASSISTANT_HISTORY_TRIGGER);
 }
 
-/**
- * 展开当前已渲染的工具分组，令按原始 tool call id 的断言可以观察到 child。
- *
- * V4 会把连续的 Bash/terminal 调用折叠进 ExecuteGroup，父节点刻意只锚定
- * 首个 child 的 id 以避免流式新增时重建。若等待器只扫描折叠态 DOM，第二个
- * child 会被误判为未渲染，进而把分组 UI 的正常行为报告成 E2E 失败。
- */
-export function expandVisibleToolCallGroups(): Promise<void> {
-  return browser.execute((summaryTriggerPrefix) => {
-    const groupNames = new Set(["Explore", "ExecuteGroup", "ChangesGroup"]);
-    const groups = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-tool-call-id][data-tool-name]"),
-    ).filter((group) => groupNames.has(group.dataset.toolName ?? ""));
-    for (const group of groups) {
-      const trigger = group.querySelector<HTMLElement>(
-        `[data-testid^="${summaryTriggerPrefix}-"]`,
-      );
-      if (trigger?.getAttribute("aria-expanded") !== "true") {
-        trigger?.click();
-      }
+/** 摘要组默认收起时子项不挂载；工具 DOM 访问必须在展开外层过程后再展开内部组。 */
+export function expandVisibleSummaryGroups(): Promise<void> {
+  return browser.execute(() => {
+    const triggers = document.querySelectorAll<HTMLElement>(
+      '[data-summary-group-trigger][aria-expanded="false"]',
+    );
+    for (const trigger of triggers) {
+      const rect = trigger.getBoundingClientRect();
+      const style = getComputedStyle(trigger);
+      if (rect.width > 0 && rect.height > 0 && style.visibility !== "hidden") trigger.click();
     }
-  }, TID_TOOL_SUMMARY_TRIGGER);
+  });
 }
 
 export function getToolCallDiagnostics(
@@ -153,19 +137,17 @@ export function getToolCallDiagnostics(
       v4PaneTestId,
       expectedMatcher,
     ) => {
-      const normalizeText = (value: string) =>
-        value.replace(/\u00a0/g, " ").trim();
+      const normalizeText = (value: string) => value.replace(/\u00a0/g, " ").trim();
       const blocks = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          `[data-testid^="${toolBlockPrefix}-"]`,
-        ),
+        document.querySelectorAll<HTMLElement>(`[data-testid^="${toolBlockPrefix}-"]`),
       ).map((block) => ({
         exists: true,
         hasEditAction: Boolean(
-          block.querySelector(`[data-testid^="${editButtonPrefix}-"]`),
+          // V4 消息操作已换前缀；负向断言必须检查现行入口，不能仅检查退役节点。
+          block.querySelector(`[data-testid^="${editButtonPrefix}-"], [data-testid^="v4-edit-"]`),
         ),
         hasForkAction: Boolean(
-          block.querySelector(`[data-testid^="${forkButtonPrefix}-"]`),
+          block.querySelector(`[data-testid^="${forkButtonPrefix}-"], [data-testid^="v4-fork-"]`),
         ),
         status: block.getAttribute("data-status"),
         testId: block.getAttribute("data-testid") ?? "",
@@ -184,32 +166,20 @@ export function getToolCallDiagnostics(
               if (expectedMatcher.type === "toolCallId") {
                 return (
                   block.toolCallId === expectedMatcher.value ||
-                  block.toolCallId?.startsWith(`${expectedMatcher.value}:`) ||
-                  // 现行 V4 会把连续 Bash 收拢到 ExecuteGroup；父组稳定地以首个真实
-                  // tool call id 作为 identity。折叠态不会渲染 child DOM，诊断必须在
-                  // 此处识别这个可追溯的投影，而不是要求 UI 恢复旧的平铺结构。
-                  block.toolCallId === `execute:${expectedMatcher.value}`
+                  block.toolCallId?.startsWith(`${expectedMatcher.value}:`)
                 );
               }
-              return (
-                block.toolName === expectedMatcher.value ||
-                (expectedMatcher.value === "Bash" &&
-                  block.toolName === "ExecuteGroup")
-              );
+              return block.toolName === expectedMatcher.value;
             }) ?? null);
 
       const assistantMessages = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          `[data-testid^="${assistantMessagePrefix}-"]`,
-        ),
+        document.querySelectorAll<HTMLElement>(`[data-testid^="${assistantMessagePrefix}-"]`),
       ).map((message) => ({
         messageId: message.getAttribute("data-message-id"),
         text: normalizeText(message.innerText),
       }));
       const assistantHistory = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          `[data-testid^="${historyTriggerPrefix}-"]`,
-        ),
+        document.querySelectorAll<HTMLElement>(`[data-testid^="${historyTriggerPrefix}-"]`),
       ).map((trigger) => {
         const triggerTestId = trigger.getAttribute("data-testid") ?? "";
         // Bug 根因：V4 history 只把 unit.key 编入 test id，不再写
@@ -221,15 +191,12 @@ export function getToolCallDiagnostics(
             : null);
         const content =
           stateKey !== null
-            ? Array.from(
-                document.querySelectorAll<HTMLElement>(
-                  `[data-testid^="${historyContentPrefix}-"]`,
-                ),
+            ? (Array.from(
+                document.querySelectorAll<HTMLElement>(`[data-testid^="${historyContentPrefix}-"]`),
               ).find(
                 (candidate) =>
-                  candidate.getAttribute("data-testid") ===
-                  `${historyContentPrefix}-${stateKey}`,
-              ) ?? null
+                  candidate.getAttribute("data-testid") === `${historyContentPrefix}-${stateKey}`,
+              ) ?? null)
             : null;
         return {
           contentExists: Boolean(content),
@@ -242,9 +209,7 @@ export function getToolCallDiagnostics(
         };
       });
 
-      const chatView = document.querySelector<HTMLElement>(
-        `[data-testid="${chatViewTestId}"]`,
-      );
+      const chatView = document.querySelector<HTMLElement>(`[data-testid="${chatViewTestId}"]`);
       const chatState = chatView
         ? {
             activeInputId: chatView.getAttribute("data-active-input-id"),
@@ -268,10 +233,7 @@ export function getToolCallDiagnostics(
             workspaces?: Record<
               string,
               {
-                taskMessagesByTaskId?: Record<
-                  string,
-                  RendererStoreRawMessage[]
-                >;
+                taskMessagesByTaskId?: Record<string, RendererStoreRawMessage[]>;
               }
             >;
           };
@@ -306,30 +268,27 @@ export function getToolCallDiagnostics(
         };
         const messages = Object.entries(state.workspaces ?? {}).flatMap(
           ([workspaceKey, workspace]) =>
-            Object.entries(workspace.taskMessagesByTaskId ?? {}).flatMap(
-              ([taskId, taskMessages]) =>
-                taskMessages.map((message) => ({
-                  content: message.content ?? "",
-                  id: message.id ?? null,
-                  partTypes: (message.parts ?? []).map(
-                    (part) => part.type ?? "",
-                  ),
-                  role: message.role ?? null,
-                  taskId,
-                  toolCalls: (message.toolCalls ?? []).map((toolCall) => {
-                    const rawError = readRawToolError(toolCall);
-                    return {
-                      error: toolCall.error ?? null,
-                      output: toolCall.output ?? null,
-                      rawErrorDetail: rawError.rawErrorDetail,
-                      rawErrorMessage: rawError.rawErrorMessage,
-                      status: toolCall.status ?? null,
-                      toolId: toolCall.toolId ?? null,
-                      toolName: toolCall.toolName ?? null,
-                    };
-                  }),
-                  workspaceKey,
-                })),
+            Object.entries(workspace.taskMessagesByTaskId ?? {}).flatMap(([taskId, taskMessages]) =>
+              taskMessages.map((message) => ({
+                content: message.content ?? "",
+                id: message.id ?? null,
+                partTypes: (message.parts ?? []).map((part) => part.type ?? ""),
+                role: message.role ?? null,
+                taskId,
+                toolCalls: (message.toolCalls ?? []).map((toolCall) => {
+                  const rawError = readRawToolError(toolCall);
+                  return {
+                    error: toolCall.error ?? null,
+                    output: toolCall.output ?? null,
+                    rawErrorDetail: rawError.rawErrorDetail,
+                    rawErrorMessage: rawError.rawErrorMessage,
+                    status: toolCall.status ?? null,
+                    toolId: toolCall.toolId ?? null,
+                    toolName: toolCall.toolName ?? null,
+                  };
+                }),
+                workspaceKey,
+              })),
             ),
         );
         return {

@@ -1,3 +1,7 @@
+import { tmpdir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import * as executionAdapters from "@zcode/adapters/exec";
 import { createSqliteSessionStore } from "@zcode/adapters/storage";
 import {
   SESSION_ENTRY_MODEL_SELECTION,
@@ -14,6 +18,9 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { createZCodeApp } from "../src/app/create-app.js";
 import { createApiKeyProviderConfig } from "./provider-config-fixtures.js";
+import { V4CommandExecutor } from "../src/zcode-protocol-v4/commands/executor.js";
+import type { V4SessionRecordView } from "../src/zcode-protocol-v4/commands/types.js";
+import type { CommandEnvelope } from "@zcode/shared/zcode-protocol-v4";
 
 const { createModelAdapterMock } = vi.hoisted(() => ({
   createModelAdapterMock: vi.fn(),
@@ -25,6 +32,81 @@ vi.mock("../src/model-factory.js", async (importOriginal) => ({
 }));
 
 describe("ZCode App Provider Registry runtime", () => {
+  it.each(["", "   ", "high", "invalid"])(
+    "同名模型跨 Provider 命令通过真实 Registry/facade 校验 thought=%j",
+    async (thought) => {
+      const storageDir = await mkdtemp(join(tmpdir(), "registry-switch-"));
+      const registry = new ProviderRegistry([
+        provider(),
+        { ...provider(), providerId: "provider-b" },
+      ]);
+      const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
+      const previous = {
+        providerId: "provider-a",
+        modelId: "model-b",
+        options: { reasoningLevel: "low" },
+      };
+      const app = await createZCodeApp({
+        configuredDefaultModelSelection: previous,
+        readSubagentRuntimeConfig: async () => ({ kind: "built-in-fallback" }),
+        env: {},
+        modelAdapter: fakeModelAdapter(),
+        providerRegistry: registry,
+        runtimeConfig: {
+          mcp: { enabled: false },
+          workingDirectory: process.cwd(),
+          storage: { dir: storageDir },
+        },
+        sessionStore,
+        skipUserConfig: true,
+      });
+      const selected = vi.spyOn(app.runtime, "emitModelSelected");
+      const persisted = vi.spyOn(sessionStore, "saveSessionEntry");
+      const record = {
+        app,
+        workspace: { workspacePath: process.cwd() },
+        persistence: "immediate",
+        traceContext: { traceId: "registry-switch" },
+      } as V4SessionRecordView;
+      const executor = new V4CommandExecutor({ getRecord: () => record });
+      try {
+        const result = executor.execute({
+          type: "switchModelConfig",
+          sessionId: app.sessionId,
+          commandId: "registry-switch",
+          baseRevision: 0,
+          payload: { provider: "provider-b", model: "model-b", thought },
+        } as CommandEnvelope);
+        if (thought === "invalid") {
+          await expect(result).rejects.toThrow("not supported");
+          expect(app.runtime.getSessionModelSelection()).toEqual(previous);
+          expect(selected).not.toHaveBeenCalled();
+          expect(persisted).not.toHaveBeenCalled();
+        } else {
+          await result;
+          const expected = {
+            providerId: "provider-b",
+            modelId: "model-b",
+            options: { reasoningLevel: "high" },
+          };
+          expect(app.runtime.getSessionModelSelection()).toEqual(expected);
+          expect(persisted).toHaveBeenCalledWith(expect.objectContaining({ data: expected }));
+          expect(selected).toHaveBeenCalledTimes(1);
+          expect(selected).toHaveBeenCalledWith(
+            expect.objectContaining({
+              modelSelection: expected,
+              previousModelSelection: previous,
+            }),
+          );
+        }
+      } finally {
+        await app.close?.();
+        sessionStore.close();
+        await rm(storageDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("拒绝在没有进程 Provider Registry 时构造 App", async () => {
     await expect(
       // @ts-expect-error 回归保护：运行时仍需拒绝未迁移的 JavaScript/嵌入调用方。
@@ -38,7 +120,7 @@ describe("ZCode App Provider Registry runtime", () => {
 
   it("新 Session 优先 Configured Default；未配置时按正式初始规则选择最高档", async () => {
     const registry = new ProviderRegistry([provider()]);
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const common = {
       env: {},
       modelAdapter: fakeModelAdapter(),
@@ -51,6 +133,7 @@ describe("ZCode App Provider Registry runtime", () => {
       skipUserConfig: true,
     } as const;
 
+    const execution = vi.spyOn(executionAdapters, "createNodeExecutionAdapter");
     const configured = await createZCodeApp({
       ...common,
       configuredDefaultModelSelection: {
@@ -59,6 +142,10 @@ describe("ZCode App Provider Registry runtime", () => {
         options: { reasoningLevel: "low" },
       },
     });
+    expect(execution).toHaveBeenCalledWith(
+      expect.objectContaining({ bashOutputTempDir: tmpdir() }),
+    );
+    execution.mockRestore();
     expect(configured.getModel()).toBe("provider-a/model-b");
     expect(configured.getThoughtLevel()).toBe("low");
     await configured.close?.();
@@ -77,7 +164,7 @@ describe("ZCode App Provider Registry runtime", () => {
 
   it("恢复 Session 时使用持久 Session Selection 覆盖 Environment 默认值", async () => {
     const registry = new ProviderRegistry([provider()]);
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const sessionId = createSessionId("provider-registry-resume");
     await sessionStore.createSession({
       id: sessionId,
@@ -182,7 +269,7 @@ describe("ZCode App Provider Registry runtime", () => {
         return registry.onDidChange(listener);
       },
     };
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const app = await createZCodeApp({
       env: {},
       modelAdapter: {
@@ -233,11 +320,6 @@ describe("ZCode App Provider Registry runtime", () => {
     });
     expect(app.getThoughtLevel()).toBe("low");
 
-    expect("setModelCatalogOverlay" in app).toBe(false);
-
-    expect("setTurnModelCatalogOverlay" in app).toBe(false);
-    expect("clearTurnModelCatalogOverlay" in app).toBe(false);
-
     await app.close?.();
     sessionStore.close();
   });
@@ -245,7 +327,7 @@ describe("ZCode App Provider Registry runtime", () => {
   it("连接测试会在正式 ModelFactory 前补齐最低推理档位", async () => {
     const registry = new ProviderRegistry([provider()]);
     const createdReasoningLevels: string[] = [];
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const app = await createZCodeApp({
       configuredDefaultModelSelection: {
         providerId: "provider-a",
@@ -283,40 +365,10 @@ describe("ZCode App Provider Registry runtime", () => {
     sessionStore.close();
   });
 
-  it("进程 Registry 模式不公开 Workspace Provider Overlay 写入口", async () => {
-    const registry = new ProviderRegistry([provider()]);
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
-    const app = await createZCodeApp({
-      env: {},
-      modelAdapter: {
-        addStatusSink() {},
-        createModel: () => fakeModel(),
-        setModelIoFullRetentionEnabled() {},
-      } as never,
-      providerRegistry: registry,
-      runtimeConfig: {
-        mcp: { enabled: false },
-        workingDirectory: process.cwd(),
-        modelSelection: {
-          providerId: "provider-a",
-          modelId: "model-a",
-          options: { reasoningLevel: "disabled" },
-        },
-      },
-      sessionStore,
-      skipUserConfig: true,
-    });
-
-    expect("setModelCatalogOverlay" in app).toBe(false);
-
-    await app.close?.();
-    sessionStore.close();
-  });
-
   it("Expert Workflow 子 Runtime 继续使用进程 Registry 的 ModelFactory", async () => {
     const registry = new ProviderRegistry([provider()]);
     const createdModels: string[] = [];
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const app = await createZCodeApp({
       env: {},
       modelAdapter: fakeModelAdapter(() => {
@@ -352,7 +404,7 @@ describe("ZCode App Provider Registry runtime", () => {
     const registry = new ProviderRegistry([provider()]);
     const adapter = fakeModelAdapter(() => workflowModel());
     createModelAdapterMock.mockReturnValue(adapter);
-    const sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    const sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     const app = await createZCodeApp({
       env: {},
       providerRegistry: registry,

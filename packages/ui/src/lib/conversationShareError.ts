@@ -1,4 +1,5 @@
 import type { ConversationShareFailureIssue } from "@zcode/services";
+import { conversationShareRejectionSchema, type ConversationShareRejection } from "@zcode/shared";
 
 export interface ConversationShareErrorDetails {
   name: string;
@@ -9,6 +10,7 @@ export interface ConversationShareErrorDetails {
   code?: number;
   requestId?: string;
   clientRequestId?: string;
+  rejection?: ConversationShareRejection;
   issues?: readonly ConversationShareFailureIssue[];
   issueCount?: number;
   omittedIssueCount?: number;
@@ -21,6 +23,13 @@ const PUBLISH_ERROR_MESSAGE_BY_KIND: Readonly<Record<string, string>> = {
   limit_exceeded: "conversationShare.error.limitExceeded",
   rate_limited: "conversationShare.error.rateLimited",
   network: "conversationShare.error.network",
+  service_unavailable: "conversationShare.error.serviceUnavailable",
+  safety_check_rejected: "conversationShare.error.safetyCheckRejected",
+  safety_check_unavailable: "conversationShare.error.safetyCheckUnavailable",
+  not_found: "conversationShare.error.preparationNotFound",
+  expired: "conversationShare.error.preparationExpired",
+  revoked: "conversationShare.error.shareRevoked",
+  unsupported_schema_version: "conversationShare.import.unsupportedVersion",
   safety_check_timeout: "conversationShare.error.safetyCheckTimeout",
   invalid_selection: "conversationShare.error.invalidSelection",
   invalid_conversation: "conversationShare.error.invalidConversation",
@@ -220,9 +229,11 @@ export function getConversationShareErrorDetails(error: unknown): ConversationSh
     typeof omittedIssueCountValue === "number"
       ? omittedIssueCountValue
       : Math.max(0, issueCount - issues.length);
+  const rejection = conversationShareRejectionSchema.safeParse(readField("rejection"));
   return {
     name,
     kind,
+    ...(rejection.success ? { rejection: rejection.data } : {}),
     ...(reasonCode === undefined ? {} : { reasonCode }),
     ...(Object.keys(diagnostics).length === 0 ? {} : { diagnostics }),
     ...(status === undefined ? {} : { status }),
@@ -255,10 +266,20 @@ export function formatConversationShareErrorSummary(error: unknown): {
 }
 
 const ISSUE_MESSAGE_IDS: Readonly<Record<ConversationShareFailureIssue["code"], string>> = {
+  authentication_required: "conversationShare.error.authenticationRequired",
+  network: "conversationShare.error.network",
+  service_unavailable: "conversationShare.error.serviceUnavailable",
+  rate_limited: "conversationShare.error.rateLimited",
+  feature_disabled: "conversationShare.error.featureDisabled",
+  connection_unavailable: "conversationShare.error.connectionUnavailable",
+  invalid_contract: "conversationShare.issue.invalidServiceResponse",
+  disclosure_required: "conversationShare.error.disclosureRequired",
+
   artifact_type_not_allowed: "conversationShare.issue.artifactTypeNotAllowed",
   artifact_extension_missing: "conversationShare.issue.artifactExtensionMissing",
   artifact_outside_workspace: "conversationShare.issue.artifactOutsideWorkspace",
   artifact_changed: "conversationShare.issue.artifactChanged",
+  content_unavailable: "conversationShare.issue.contentUnavailable",
   artifact_read_failed: "conversationShare.issue.artifactReadFailed",
   input_attachment: "conversationShare.issue.inputAttachment",
   input_attachment_unavailable: "conversationShare.issue.inputAttachmentUnavailable",
@@ -301,6 +322,7 @@ const WARNING_MESSAGE_IDS: Readonly<
 > = {
   artifact_type_not_allowed: "conversationShare.warning.artifactTypeSkipped",
   artifact_changed: "conversationShare.warning.artifactChangedSkipped",
+  content_unavailable: "conversationShare.issue.contentUnavailable",
   artifact_read_failed: "conversationShare.warning.artifactSkipped",
   input_attachment: "conversationShare.warning.inputAttachmentSkipped",
   input_attachment_unavailable: "conversationShare.warning.inputAttachmentUnavailable",
@@ -319,9 +341,16 @@ const ARTIFACT_TYPE_LABELS: Readonly<Record<string, { zh: string; en: string }>>
   audio: { zh: "音频", en: "audio" },
 };
 
+// 这里只有中英两套文案：中文界面用中文，其它界面语言（含 ja-JP/ru-RU/ko-KR）用英文。
+function isChineseShareLocale(locale: string): boolean {
+  return locale === "zh-CN";
+}
+
 function artifactLabel(value: string, locale: string): string {
   const key = value.replace(/^\./u, "").toLowerCase();
-  return ARTIFACT_TYPE_LABELS[key]?.[locale === "en-US" ? "en" : "zh"] ?? value.toUpperCase();
+  return (
+    ARTIFACT_TYPE_LABELS[key]?.[isChineseShareLocale(locale) ? "zh" : "en"] ?? value.toUpperCase()
+  );
 }
 
 export function formatConversationShareArtifactType(
@@ -340,12 +369,12 @@ export function formatConversationShareAllowedArtifacts(
     const labels = issue.allowedArtifacts.map((artifact) =>
       artifactLabel(artifact.displayName || artifact.type, locale),
     );
-    return [...new Set(labels)].join(locale === "en-US" ? ", " : "、");
+    return [...new Set(labels)].join(isChineseShareLocale(locale) ? "、" : ", ");
   }
   if (issue.allowedFormats && issue.allowedFormats.length > 0) {
-    return issue.allowedFormats.join(locale === "en-US" ? ", " : "、");
+    return issue.allowedFormats.join(isChineseShareLocale(locale) ? "、" : ", ");
   }
-  return locale === "en-US" ? "temporarily unavailable" : "暂时无法获取";
+  return isChineseShareLocale(locale) ? "暂时无法获取" : "temporarily unavailable";
 }
 
 export function resolveConversationShareWarningMessageId(
@@ -380,6 +409,10 @@ export function resolveConversationShareFallbackIssueCode(
   if (details.kind === "artifact_not_allowed") return "artifact_type_not_allowed";
   if (details.kind === "limit_exceeded") return "payload_limit";
   if (details.kind === "upload_incomplete") return "upload_incomplete";
+  // 预检可能在读取 capabilities 前因缺少登录态失败，不能把已知 kind 丢成 unknown。
+  if (Object.prototype.hasOwnProperty.call(ISSUE_MESSAGE_IDS, details.kind)) {
+    return details.kind as ConversationShareFailureIssue["code"];
+  }
   return "unknown";
 }
 

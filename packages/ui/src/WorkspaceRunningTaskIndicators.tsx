@@ -6,7 +6,7 @@ import {
   TID_HEADER_RUNNING_TASKS,
   TID_HEADER_RUNNING_TASKS_OVERFLOW,
   testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import { cn } from "@/components/lib/utils.js";
 import { Button } from "@/components/ui/button.js";
 import {

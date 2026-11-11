@@ -92,6 +92,12 @@ Active。Active 是可丢弃的缓存/LKG，不是启动前提：Active 缺失�
 再用 Bundled 重建 Active。只有 Bundled 本身也无法通过 Release Schema 与现有 Provider/Rule Parser 时才允许
 启动失败。客户端不增加发布者业务完整性规则；未来如需发布门禁，另立基于最终发布流程的新任务。
 
+Bundled 在进程生命周期内不可变（升级以退出旧进程为前提）。进程运行中 Bundled 文件被删除（ENOENT）时，
+继续使用本进程最近一次成功解析的同一 Bundled 路径内容作为基线，并照常用选中的候选重建 Active；不需要重启
+进程，也不向 Bundled 路径回写（Desktop 的 Bundled 位于只读安装资源内）。Bundled 存在但无效时仍按上文失败。
+本进程从未成功读取 Bundled 且两份文件都不可用时，错误必须携带具体原因（含缺失文件路径），不能产生空的
+AggregateError：锁内读取保留 Bundled 与 Active 两份原因；绕过 Active 边界的回退读取至少保留 Bundled 的原因。
+
 不同 Endpoint 的 Active/LKG 和 revision 互不比较、互不回退。切换到没有 Active 的 Endpoint 时先使用
 Bundled 完成 ready，再后台刷新该 Endpoint；切回旧 Endpoint 可以复用它自己的 LKG。旧的未分区缓存尚未
 形成正式发布兼容，不提供 dual-read。
@@ -738,6 +744,14 @@ Runtime Snapshot、Catalog enrichment 和旧 hardcode 不参与迁移。独立�
 Key 不再读取。旧文件没有明确表达的 Model Property 不写 Personal Override，由 Built-in 通用 Rule 提供默认；
 Importer 不增加 `COMPATIBILITY_*`，也不按 Catalog、modelId、Provider 类型或 Endpoint 猜值。解析失败或
 Overlay 后完整校验失败时不修改原文件。
+
+Standalone CLI 为兼容评测使用的 `~/.zcode/cli/config.json`，首次导入时还保留自定义模型的输出上限：
+按 `limit.output` → `options.max_tokens` → 模型顶层 `maxOutputTokens` 选取有限正整数，写入精确
+Personal Model Rule 的 `optionSpecs.maxOutputTokens.max`。仅有 output、没有 context 也创建规则；
+缺失时不写默认值，map 仍从正式配置规则继承。不接受字符串转换，不扩展 `extra_body` 等任意 options，
+原有 parser 对非法显式字段的拒绝行为保持不变。此例外只适用于 CLI 首次导入，不改变 Desktop 的
+context-only 迁移；已有正式 Personal 文件不补迁，修改旧文件不会覆盖新配置。实现与验收见
+[Todo161](../../steps/todo-161-cli-legacy-output-token-migration.md)。
 
 无版本 Legacy importer 是过渡发布设施。强制升级窗口结束，且最低支持版本/升级链已经保证用户经过带
 importer 的版本，或者产品明确接受更早版本用户重新配置后，删除 importer、旧 parser、Catalog 依赖、

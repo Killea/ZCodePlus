@@ -74,6 +74,7 @@ import type {
   ModelSelection,
   ToolArtifactStorePort,
   WorkflowEscalatePort,
+  WorkflowWebSearchBudgetPort,
   WorkflowSubmitPort,
 } from "@zcode/contracts";
 import type { AgentRuntime } from "@zcode/core";
@@ -161,6 +162,11 @@ export interface DynamicWorkflowActorRuntimeInput {
    * 恰是作者没标记的那一个。
    */
   escalatePort: WorkflowEscalatePort;
+  /**
+   * 每个 ask 的 WebSearch 预算端口：计数在 driver 的会话状态里（startAsk 归零），上限取
+   * persona 的 `budget.webSearch`，缺席用默认值。恒注入，与升级端口同路下传到 runtime deps。
+   */
+  webSearchBudgetPort: WorkflowWebSearchBudgetPort;
   /**
    * 这个 actor 上一次解析出的模型（journal 里的 `resolvedModel`，`providerId/modelId`），
    * 只有 resume 会带上它。没有 {@link DynamicWorkflowActorRuntimeInput.runSubagentModel} 时工厂
@@ -384,6 +390,7 @@ export function createDynamicWorkflowRunService(
     trackSettlement,
     close,
     assertOpen,
+    trackOperation,
     noteForeignTerminalRow,
   } = createRunServiceLifecycle({
     journal: deps.journal,
@@ -402,6 +409,7 @@ export function createDynamicWorkflowRunService(
     runs,
     escalations,
     caps,
+    assertOpen,
     trackSettlement,
   };
 
@@ -416,12 +424,12 @@ export function createDynamicWorkflowRunService(
       request: DynamicWorkflowRunSubmitRequest,
     ): Promise<DynamicWorkflowRunSubmitResult> {
       assertOpen();
-      return submitDynamicWorkflowRun(entryContext, request);
+      return trackOperation(() => submitDynamicWorkflowRun(entryContext, request));
     },
 
     async amend(request: DynamicWorkflowRunAmendRequest): Promise<DynamicWorkflowRunAmendResult> {
       assertOpen();
-      return amendDynamicWorkflowRun(entryContext, request);
+      return trackOperation(() => amendDynamicWorkflowRun(entryContext, request));
     },
 
     /**
@@ -446,7 +454,7 @@ export function createDynamicWorkflowRunService(
 
     async resume(runId: string): Promise<DynamicWorkflowRunResumeResult> {
       assertOpen();
-      return resumeDynamicWorkflowRun(entryContext, runId);
+      return trackOperation(() => resumeDynamicWorkflowRun(entryContext, runId));
     },
 
     async listRunsForSession(limit?: number): Promise<DynamicWorkflowRunSessionSummary[]> {

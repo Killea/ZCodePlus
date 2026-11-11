@@ -7,7 +7,10 @@ import {
   GLOBAL_MEMORY_NAME_CHARACTER_LIMIT,
   type IMemoryService,
 } from "@zcode/services";
-import { TID_SETTINGS_MEMORY_GLOBAL_EDITOR, TID_SETTINGS_MEMORY_GLOBAL_SAVE } from "@zcode/shared";
+import {
+  TID_SETTINGS_MEMORY_GLOBAL_EDITOR,
+  TID_SETTINGS_MEMORY_GLOBAL_SAVE,
+} from "@zcode/shared/test-ids";
 import { cn } from "@/components/lib/utils.js";
 import { runUserActionAsync } from "@/lib/userActionTelemetry.js";
 import { Button } from "@/components/ui/button.js";

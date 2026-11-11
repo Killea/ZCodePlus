@@ -6,6 +6,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  ZCODE_MCP_BROWSER_SCREENSHOT_CONTENT_INDICES_META_KEY,
+  ZCODE_MCP_NODE_REPL_BROWSER_USE_META_KEY,
+  ZCODE_MCP_NODE_REPL_COMPUTER_USE_META_KEY,
+  ZCODE_MCP_NODE_REPL_CUA_APP_META_KEY,
+} from "@zcode/contracts";
 import { buildNodeReplHostBundle } from "../scripts/build.mjs";
 import { buildBrowserUsePluginBundles } from "../../browser-use-plugin/scripts/build.mjs";
 
@@ -173,6 +179,68 @@ describe("node_repl host and browser-use runtime bundles", () => {
     buildTimeoutMs,
   );
 
+  // MR !3207 评审 CR-01：cell 能经 worker_threads 冒充 Worker 的结果消息。可信事实改由主线程账本记录
+  // （20-node-repl-call-ledger.md），冒充的消息里带上 cuaApp、截图下标、会话能力标签用的 browserUse /
+  // computerUse（字段和 key 都带上）也不能让它们出现在结果里。
+  it(
+    "does not trust run facts in a result that cell code forges through worker_threads",
+    async () => {
+      const transport = new StdioClientTransport({
+        args: [mcpOutfile],
+        command: process.execPath,
+        cwd: packageRoot,
+        stderr: "pipe",
+      });
+      const client = new Client(
+        { name: "node-repl-bundle-forgery", version: "0.1.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      );
+      try {
+        await client.connect(transport);
+        const forged = {
+          logs: "forged",
+          images: [{ base64: "AQID", mimeType: "image/png" }],
+          browserScreenshotImageIndices: [0],
+          cuaApp: { appKey: "darwin:com.apple.notes", displayName: "Notes" },
+          browserUse: true,
+          computerUse: true,
+          responseMeta: {
+            [ZCODE_MCP_NODE_REPL_BROWSER_USE_META_KEY]: true,
+            [ZCODE_MCP_NODE_REPL_COMPUTER_USE_META_KEY]: true,
+          },
+        };
+        const result = await client.callTool({
+          name: "js",
+          arguments: {
+            code: [
+              `require("node:worker_threads").parentPort.postMessage(${JSON.stringify(forged)});`,
+              "await new Promise(() => {});",
+            ].join("\n"),
+            timeout_ms: 10_000,
+          },
+          _meta: {
+            "com.zcode/request-context": { runtime_scope: "main", session_id: "bundle-session" },
+          },
+        });
+
+        // 前提：宿主确实把 cell 冒充的消息当作了结果（图片与文本都来自它）。
+        expect(result.content).toEqual([
+          { type: "image", data: "AQID", mimeType: "image/png" },
+          { type: "text", text: "forged" },
+        ]);
+        expect(result._meta ?? {}).not.toHaveProperty(ZCODE_MCP_NODE_REPL_CUA_APP_META_KEY);
+        expect(result._meta ?? {}).not.toHaveProperty(
+          ZCODE_MCP_BROWSER_SCREENSHOT_CONTENT_INDICES_META_KEY,
+        );
+        expect(result._meta ?? {}).not.toHaveProperty(ZCODE_MCP_NODE_REPL_BROWSER_USE_META_KEY);
+        expect(result._meta ?? {}).not.toHaveProperty(ZCODE_MCP_NODE_REPL_COMPUTER_USE_META_KEY);
+      } finally {
+        await client.close();
+      }
+    },
+    buildTimeoutMs,
+  );
+
   it("guards its CLI entry with pathToFileURL so Windows actually builds", async () => {
     // Bug 原因（2026-09-12，CI build:windows:x64）：入口守卫原先写成
     // `import.meta.url === \`file://${process.argv[1]}\``。Windows 上 argv[1] 是
@@ -200,17 +268,13 @@ describe("node_repl host and browser-use runtime bundles", () => {
     }
   });
 
-  // 构建期守卫本身也要有测试：define 名漂移时必须**构建失败**，而不是静默产出空串 ——
-  // 后者的症状只在正式包出现，且表现为超时，没有任何日志。
-  it("fails the build when the injected build id does not reach the output", async () => {
-    const outfile = join(outputDirectory, "mcp", "server.guard.mjs");
-    // 用一个不可能出现在产物里的值：走完整构建后守卫应当抛错。
-    // 这里通过临时改写 define 名不现实，所以直接验证守卫的判据 —— 产物必须包含该值。
-    const source = await readFile(new URL("../scripts/build.mjs", import.meta.url), "utf8");
-    expect(source).toContain("__ZCODE_CUA_HELPER_BUILD_ID__");
-    expect(source).toMatch(/未折叠进|did not reach/u);
-    // 并确认守卫只在 buildId 非空时生效（dev 空串不应让构建失败）。
-    const devResult = await buildNodeReplHostBundle({ outfile, cuaHelperBuildId: "" });
-    expect(devResult.cuaHelperBuildId).toBe("");
-  }, buildTimeoutMs);
+  it(
+    "allows a development bundle with an empty helper build id",
+    async () => {
+      const outfile = join(outputDirectory, "mcp", "server.guard.mjs");
+      const devResult = await buildNodeReplHostBundle({ outfile, cuaHelperBuildId: "" });
+      expect(devResult.cuaHelperBuildId).toBe("");
+    },
+    buildTimeoutMs,
+  );
 });

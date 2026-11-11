@@ -63,7 +63,12 @@ async function runChild(
 ): Promise<unknown[]> {
   const root = await tempRoot("dwf-child-entry-");
   const entryPath = join(root, "run.mjs");
-  await writeFile(entryPath, render({ ...payload, maxOldSpaceSizeMb: 256 }, { runId: "run" }), "utf8");
+  // run 身份是 payload 的必备字段（沙箱据它构造冻结的 `run` 全局）。
+  await writeFile(
+    entryPath,
+    render({ ...payload, run: { id: "run" }, maxOldSpaceSizeMb: 256 }, { runId: "run" }),
+    "utf8",
+  );
   const result = spawnSync(process.execPath, ["--max-old-space-size=256", entryPath], {
     encoding: "utf8",
     input: "",
@@ -92,6 +97,31 @@ describe.each([
     expect(lines).toEqual([
       { kind: "event", type: "log", message: "from the sandbox" },
       { kind: "complete", ok: true, value: { ok: 42 } },
+    ]);
+  });
+
+  it("lets no outer-realm function reach the script", async () => {
+    // 跨 realm 边界（tests/security.test.ts 的 "realm boundary"）在发布形态下同样成立：
+    // 打包 / 压缩若把 null 原型沙箱或传输闭包弄丢，这里会拿到宿主 process。
+    const render = await bundledRenderChildEntry(minify);
+
+    const lines = await runChild(render, {
+      lowered: [
+        'const foreign = (v) => (typeof v === "function" || (typeof v === "object" && v !== null)) && v.constructor !== undefined && v.constructor.constructor !== Function;',
+        "const hits = [];",
+        "for (const k of Object.getOwnPropertyNames(globalThis)) { let v; try { v = globalThis[k]; } catch (e) { continue; } if (foreign(v)) hits.push(k); }",
+        'let viaGlobal = "blocked";',
+        'try { viaGlobal = typeof globalThis.constructor.constructor("return process")(); } catch (e) {}',
+        "return { hits, viaGlobal, send: typeof globalThis.__send, finish: typeof globalThis.__finish };",
+      ].join("\n"),
+    });
+
+    expect(lines).toEqual([
+      {
+        kind: "complete",
+        ok: true,
+        value: { hits: [], viaGlobal: "blocked", send: "undefined", finish: "undefined" },
+      },
     ]);
   });
 
@@ -129,6 +159,8 @@ describe.each([
             "log",
             "publishArtifact",
             "report",
+            // run 身份（facade 的 `run`）：与 args 一样是值，不是可调用物。
+            "run",
             "worldRead",
           ],
         },

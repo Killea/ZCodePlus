@@ -1,3 +1,5 @@
+import { drainMemoryExtractions } from "../src/runtime/helpers/project-memory-extraction.js";
+import { isHiddenReminderMessage } from "../src/runtime/helpers/conversation.js";
 import { describe, expect, it } from "vitest";
 import {
   createPartId,
@@ -6,6 +8,7 @@ import {
   type MessagePart,
   type MessageWithParts,
   type ModelInputFormat,
+  type Model,
   type ModelInvocationContext,
   type ModelRequest,
   type ModelResult,
@@ -18,7 +21,7 @@ import {
 import { createTestAgentRuntime } from "./test-agent-runtime.js";
 import { createTestModelSelection } from "./test-model-selection.js";
 import { resolveProjectMemoryRoot } from "../src/memory/project-root.js";
-import { createReadFileStateKey } from "../src/tool/read-file-state.js";
+import { createReadFileStatePathKey } from "../src/tool/read-file-state.js";
 import { createToolRegistry, type ToolRegistry } from "../src/tool/registry.js";
 import { MemoryFileSystem } from "./memory-test-utils.js";
 import { createTestImageArtifactStore } from "./test-image-artifact-store.js";
@@ -169,8 +172,11 @@ describe("AgentRuntime background Memory extraction", () => {
       runtime
         .getTools()
         .map((tool) => tool.name)
-        .filter((name) => name !== "WebSearch"),
+        .filter(
+          (name) => name !== "WebSearch" && name !== "ToolSearch" && name !== "DeferredToolCall",
+        ),
     );
+    expect(request.toolSearchEnabled).toBe(false);
     expect(headerRefreshCount).toBe(1);
 
     extractionResponse.resolve(textResult(request, "Nothing to save."));
@@ -179,6 +185,52 @@ describe("AgentRuntime background Memory extraction", () => {
       modelRequestSessionType: "main",
       metadata: { querySource: "project_memory_extract", skipTranscript: true },
     });
+  });
+
+  it("prepares inherited ToolSearch history against the frozen Memory tool scope", async () => {
+    const requests: ModelRequest[] = [];
+    let mainRequests = 0;
+    const generateText = async (request: ModelRequest): Promise<ModelResult> => {
+      requests.push(request);
+      if (isExtractionRequest(request)) return textResult(request, "Nothing to save.");
+      if (++mainRequests === 1)
+        return {
+          text: "",
+          finishReason: "tool-calls",
+          usage: {},
+          toolCalls: [
+            { id: "search-memory", name: "ToolSearch", input: { query: "select:TaskOutput" } },
+          ],
+        };
+      return textResult(request, "main answer");
+    };
+    const baseFactory = createTestModelFactory({ generateText });
+    const withSearch = (model: Model): Model => ({
+      ...model,
+      requestCapabilities: { toolSearch: { protocolSupported: true, defaultEnabled: true } },
+      bind: (options) => withSearch(model.bind(options)),
+    });
+    const runtime = createExtractionRuntime({
+      generateText,
+      modelFactory: (input) => withSearch(baseFactory(input)),
+      toolSearch: { mode: "native" },
+    });
+    await runtime.executeTurn("remember that I use TaskOutput");
+    await runtime.drainMemoryExtractions();
+    const extraction = requests.find(isExtractionRequest)!;
+    expect(extraction.toolSearchEnabled).toBe(false);
+    expect(extraction.tools?.some((tool) => tool.name === "ToolSearch")).toBe(false);
+    expect(
+      extraction.tools?.find((tool) => tool.name === "TaskOutput")?.deferLoading,
+    ).toBeUndefined();
+    expect(providerMessagesToText(extraction.messages)).toContain(
+      "Tool references removed - tool search not enabled",
+    );
+    expect(JSON.stringify(extraction.messages)).not.toContain('"tool_reference"');
+    expect(providerMessagesToText(extraction.messages)).not.toContain("schemas are NOT loaded");
+    expect(
+      JSON.stringify(requests.filter((request) => !isExtractionRequest(request)).at(-1)?.messages),
+    ).toContain('"tool_reference"');
   });
 
   it("bounds a lazy pending snapshot to the successful Main turn that scheduled it", async () => {
@@ -228,7 +280,10 @@ describe("AgentRuntime background Memory extraction", () => {
       (message) => message.info.id === firstTurnBoundary!.info.id,
     );
     expect(firstTurnBoundaryIndex).toBeGreaterThanOrEqual(0);
-    const expectedPendingMessageCount = secondTurnMessages.length - firstTurnBoundaryIndex - 1;
+    // "~N messages" 只数对话消息：第二轮的隐藏提醒记录（token 预算提醒）不计入。
+    const expectedPendingMessageCount = secondTurnMessages
+      .slice(firstTurnBoundaryIndex + 1)
+      .filter((message) => !isHiddenReminderMessage(message)).length;
 
     const futureTurn = runtime.executeTurn(
       "future turn content must stay outside pending extraction",
@@ -309,20 +364,36 @@ describe("AgentRuntime background Memory extraction", () => {
     expect(replacementRequestText).toContain(EXTRACTION_PROMPT_MARKER);
   });
 
+  it("schedules Extraction for a remote workspace whose CLI runs on the remote host", async () => {
+    let extractionRequestCount = 0;
+    const runtime = createExtractionRuntime({
+      isRemoteWorkspace: () => true,
+      async generateText(request) {
+        if (isExtractionRequest(request)) extractionRequestCount += 1;
+        return textResult(
+          request,
+          isExtractionRequest(request) ? "Nothing to save." : "main answer",
+        );
+      },
+    });
+
+    await runtime.executeTurn("persist this durable project preference");
+    await runtime.drainMemoryExtractions();
+
+    expect(extractionRequestCount).toBe(1);
+  });
+
   it.each<{
-    isRemoteWorkspace?: () => boolean;
     memory?: { enabled?: boolean; use?: boolean };
     name: string;
     taskType?: SessionTaskType;
   }>([
-    { isRemoteWorkspace: () => true, name: "remote workspace" },
     { name: "child task", taskType: "subagent_child" },
     { memory: { enabled: false }, name: "disabled feature" },
     { memory: { use: false }, name: "disabled use" },
   ])("does not schedule Extraction for $name", async (input) => {
     let extractionRequestCount = 0;
     const runtime = createExtractionRuntime({
-      isRemoteWorkspace: input.isRemoteWorkspace,
       memory: input.memory,
       taskType: input.taskType,
       async generateText(request) {
@@ -532,7 +603,7 @@ describe("AgentRuntime background Memory extraction", () => {
         return textResult(request, "Nothing to save.");
       },
     });
-    (runtime as any).readFileState.set(createReadFileStateKey(memoryPath, 1, undefined), {
+    (runtime as any).readFileState.set(createReadFileStatePathKey(memoryPath), {
       path: memoryPath,
       content: "old fact",
       isPartialView: false,
@@ -545,6 +616,113 @@ describe("AgentRuntime background Memory extraction", () => {
 
     expect(followupRequestText).not.toContain("has not been read");
     expect(fileSystemPort.files[memoryPath]).toBe("new fact");
+  });
+
+  // Memory Agent 与 Main 共用单步内核：同一批工具结果的批次提示、同一个渲染器、同一套调度。
+  it.each([
+    { label: "MCS", midConversationSystem: true, noticeRole: "system" },
+    { label: "non-MCS", midConversationSystem: false, noticeRole: "user" },
+  ])(
+    "delivers the Read partial-view notice to the next Extraction request ($label)",
+    async ({ midConversationSystem, noticeRole }) => {
+      const longPath = `${WORKSPACE_PATH}/long-notes.md`;
+      const fileSystemPort = new MemoryFileSystem({
+        [longPath]: Array.from(
+          { length: 1_800 },
+          (_, index) => `line ${index + 1} ${"durable project detail ".repeat(4)}`,
+        ).join("\n"),
+      });
+      let extractionTurn = 0;
+      let followup: ModelRequest | undefined;
+      const generateText = async (request: ModelRequest): Promise<ModelResult> => {
+        if (!isExtractionRequest(request)) return textResult(request, "main answer");
+        extractionTurn += 1;
+        if (extractionTurn === 1) {
+          return {
+            ...textResult(request, ""),
+            finishReason: "tool_calls",
+            toolCalls: [{ id: "read-long", name: "Read", input: { file_path: longPath } }],
+          };
+        }
+        followup = request;
+        return textResult(request, "Nothing to save.");
+      };
+      const runtime = createExtractionRuntime({
+        fileSystemPort,
+        generateText,
+        modelFactory: createTestModelFactory({
+          generateText,
+          properties: { supportsMidConversationSystem: midConversationSystem },
+        }),
+      });
+
+      await runtime.executeTurn("persist this durable project preference");
+      await runtime.drainMemoryExtractions();
+
+      const messages = followup!.messages;
+      const toolIndex = messages.findIndex(
+        (message) => message.role === "tool" && message.toolCallId === "read-long",
+      );
+      expect(toolIndex).toBeGreaterThan(0);
+      expect(providerMessagesToText([messages[toolIndex]!])).not.toContain("PARTIAL view");
+      const notice = messages[toolIndex + 1]!;
+      expect(notice.role).toBe(noticeRole);
+      expect(providerMessagesToText([notice])).toContain(
+        `[Truncated: PARTIAL view \u2014 ${longPath}: showing lines 1-`,
+      );
+    },
+  );
+
+  it("runs the Edits of one Extraction batch one after another", async () => {
+    const memoryRoot = resolveProjectMemoryRoot({
+      cliStorageRoot: CLI_STORAGE_ROOT,
+      workspacePath: WORKSPACE_PATH,
+    });
+    const memoryPath = `${memoryRoot}/fact.md`;
+    const fileSystemPort = new MemoryFileSystem({ [memoryPath]: "first" });
+    let extractionTurn = 0;
+    let followupRequestText = "";
+    const runtime = createExtractionRuntime({
+      fileSystemPort,
+      async generateText(request) {
+        if (!isExtractionRequest(request)) return textResult(request, "main answer");
+        extractionTurn += 1;
+        if (extractionTurn === 1) {
+          return {
+            ...textResult(request, ""),
+            finishReason: "tool_calls",
+            toolCalls: [
+              {
+                id: "edit-first",
+                name: "Edit",
+                input: { file_path: memoryPath, old_string: "first", new_string: "second" },
+              },
+              {
+                id: "edit-second",
+                name: "Edit",
+                input: { file_path: memoryPath, old_string: "second", new_string: "third" },
+              },
+            ],
+          };
+        }
+        followupRequestText = providerMessagesToText(request.messages);
+        return textResult(request, "Nothing to save.");
+      },
+    });
+    (runtime as any).readFileState.set(createReadFileStatePathKey(memoryPath), {
+      path: memoryPath,
+      content: "first",
+      isPartialView: false,
+      readAt: new Date(),
+      sizeBytes: Buffer.byteLength("first"),
+    });
+
+    await runtime.executeTurn("persist this durable project preference");
+    await runtime.drainMemoryExtractions();
+
+    // Edit 不是 concurrentSafe：与 Main 一样按顺序执行，第二个 Edit 看到第一个的结果。
+    expect(followupRequestText).not.toContain("String to replace not found");
+    expect(fileSystemPort.files[memoryPath]).toBe("third");
   });
 
   it("does not let discarded branch prose satisfy the Extraction gate after rewind", async () => {
@@ -620,8 +798,9 @@ describe("AgentRuntime background Memory extraction", () => {
 
     expect(extractionRequests).toHaveLength(3);
     const finalRequestText = providerMessagesToText(extractionRequests.at(-1)?.messages ?? []);
-    // durable 消息计数包含首次目录与 rewind 后补发的目录。
-    expect(finalRequestText).toContain("most recent ~6 messages");
+    // 只数当前路径上的对话消息（两轮各一问一答）；首次与 rewind 后补发的持久化公告
+    // （environment、model、agent 目录、date）不计入。
+    expect(finalRequestText).toContain("most recent ~4 messages");
   });
 
   it("reads durable messages and branch metadata at each schedule boundary only", async () => {
@@ -680,6 +859,7 @@ describe("AgentRuntime background Memory extraction", () => {
 });
 
 function createExtractionRuntime(input: {
+  toolSearch?: { mode: "native" | "local" | "off" | "auto" };
   artifactStore?: ToolArtifactStorePort;
   generateText: (
     request: ModelRequest,
@@ -699,6 +879,7 @@ function createExtractionRuntime(input: {
   return createTestAgentRuntime(
     createSessionId(`runtime-memory-extraction-${crypto.randomUUID()}`),
     {
+      toolSearch: input.toolSearch,
       memory: {
         cliStorageRoot: CLI_STORAGE_ROOT,
         enabled: true,
@@ -756,6 +937,12 @@ function createMemorySessionStore(): SessionStorePort {
       return session;
     },
     async getSession() {
+      return session;
+    },
+    // 终态结果由 CLI 存储维护；夹具也须更新同一条会话记录。
+    async updateSession(input) {
+      if (!session || session.id !== input.id) throw new Error("Session not found");
+      session = { ...session, ...input, time: { ...session.time, ...input.time } };
       return session;
     },
     async getProjectPermission() {
@@ -853,3 +1040,15 @@ async function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
     signal.addEventListener("abort", () => resolve(), { once: true }),
   );
 }
+
+describe("memory cleanup deadline", () => {
+  it("reports an unresolved drain instead of declaring resources released", async () => {
+    const pending = Promise.withResolvers<void>();
+    const owner = { memoryExtractionScheduler: { drain: () => pending.promise } };
+    await expect(drainMemoryExtractions.call(owner as never, 5)).rejects.toThrow(
+      "Memory extraction drain timed out",
+    );
+    pending.resolve();
+    await drainMemoryExtractions.call(owner as never, null);
+  });
+});

@@ -12,7 +12,7 @@
 
 ## 当前依赖树的生成状态
 
-`THIRD-PARTY-NOTICES.md` 与 `inventory.json` 已在冻结安装后按当前锁文件重新生成，基础许可标识与声明新鲜度检查通过。开源导出流程会再按开源树的实际依赖重新生成，两棵树不共用生成结果。
+`THIRD-PARTY-NOTICES.md` 与 `inventory.json` 已在冻结安装后按当前锁文件重新生成，基础许可分类、声明输入哈希和新鲜度校验通过。OFL-1.1 作为标准开放字体许可参与分类，完整原文仍必须随对应字体包进入声明；开源导出流程会再按开源树的实际依赖重新生成，两棵树不共用生成结果。
 
 基础检查通过不代表材料缺口已关闭：`inventory.json` 的 `reviewRequired` 仍保留待补齐的原文和来源证据。当前覆盖的精确包版本、复制组件与待核验数量以生成清单为准，避免文档中的历史数量被误当作当前状态。
 
@@ -28,7 +28,7 @@ node scripts/licenses.mjs check --strict
 
 严格检查目前只作为显式命令运行，尚未接入 SEA 的 CI 发布和手动 SMB 上传入口：当前清单仍有已登记缺口，接入后这两条发布路径会立即失败。本地构建仍可用于核验修复，基础检查会明确提示未解决数量。
 
-生成器以根锁文件的生产依赖图为覆盖集合，先比较实际安装图，再按精确版本读取内容；旧安装图必须先 frozen install，不能直接重生成。标识门禁和声明生成共用递归扫描，覆盖所有 workspace、嵌套版本和符号链接，并按真实目录防环。相同原文按 SHA-256 去重；同名不同版本分别记录。支持的平台可选包必须已安装。三个未安装 Canvas 目标（Android、Linux armv7、Linux riscv64）不属于当前桌面发行目标。
+生成器以根 lockfile 的生产依赖图为覆盖集合，并先把两侧换行统一为 LF 再严格比对 `pnpm-lock.yaml` 与 pnpm 的 `node_modules/.pnpm/lock.yaml` 安装快照（Windows autocrlf 工作区的 CRLF 不算依赖图漂移）；旧安装图必须先 frozen install，不能直接重生成。Windows 上递归 `pnpm list` 会超过文件句柄上限，因此生成器固定根 lockfile，按唯一 workspace 名称逐项读取 lockfile-only 图，避免跨 workspace dedupe 漏掉传递依赖。标识门禁和声明生成共用该锁图，再按真实目录递归扫描实装包并防环。相同原文按 SHA-256 去重；同名不同版本分别记录。支持的平台可选包必须已安装。三个未安装 Canvas 目标（Android、Linux armv7、Linux riscv64）不属于当前桌面发行目标。
 
 审核并提交通知和 `inventory.json`。清单同时记录锁文件、manifest、补丁、复制文件和补充材料的哈希；版本变化或声明被截断会使显式检查失败；构建只读取已有声明，不因此中断。该检查确认材料新鲜度与许可标识，不自动证明所有发行义务已经履行。
 
@@ -65,15 +65,15 @@ ugrep 的 BSD-3-Clause 版权、条件和免责声明完整保留。ripgrep 保�
 
 Knip 文档镜像现已登记：原始导入的 169 个文件与上游 Knip 6.0.6 的固定参考提交逐一匹配，补齐 ISC 原文；随镜像复制的 Source Sans Pro 与 Hack 字体按字体内版本单独登记原始许可。来源、版本与本地改动说明见 [镜像 README](../docs/knip/docs/README.md)。
 
-Apache-2.0 复制内容中的 148 个已确认改编文件包含文件内来源和 `Modified by ZCode:` 声明，并登记到 `modifiedFiles`；生成时校验该声明仍存在。Markdown frontmatter、脚本 shebang 和 JavaScript directive 保持有效。未确认源自上游的自有文件不追加上游归属。
+Apache-2.0 复制内容中的 147 个已确认改编文件包含文件内来源和 `Modified by ZCode:` 声明，并登记到 `modifiedFiles`；生成时校验该声明仍存在。Markdown frontmatter、脚本 shebang 和 JavaScript directive 保持有效。未确认源自上游的自有文件不追加上游归属。
 
-| 内容                                  | 本地范围                                                                                           | 上游许可与修改说明                                                                                                                                   |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| shadcn/ui                             | `packages/ui/src/components/ui/`、`packages/ui/src/styles.css` 的上游衍生部分                      | MIT；本地修改包含样式、国际化和组件组合，自有组件不归属于上游。                                                                                      |
-| AI Elements                           | `packages/ui/src/components/ai-elements/`、`.agents/skills/ai-elements/`（含 references、scripts） | Apache-2.0，Copyright 2023 Vercel, Inc.；本地修改包含样式、导入路径、组件扩展及技能使用说明，参考 commit 中包含技能正文。                            |
-| agent-browser、dogfood、electron 技能 | `.agents/skills/` 下对应三个目录                                                                   | Apache-2.0，Copyright 2025 Vercel Inc.；固定 v0.20.0 的实际 commit 核对原技能和 LICENSE，本地说明和使用约定有修改。                                  |
-| VS Code IPC 与基础工具                | `packages/rpc/src/`、`packages/rpc/examples/` 中的衍生部分，及 `wire-codec.ts` 对该传输格式的适配  | MIT，保留 Microsoft 原始版权行；本地进行了模块拆分、传输扩展、注释和封装修改，不将所有本地实现归属于上游。                                           |
-| Superpowers 技能描述                  | `packages/ui/src/lib/builtinSkillI18n.ts` 中的 Superpowers 描述及翻译                              | MIT，Copyright (c) 2025 Jesse Vincent；对应上游 v5.1.0。原插件目录当前仅余 LICENSE，不声明仍分发已删除的整包实现。该文件其他技能描述不在此授权范围。 |
+| 内容                        | 本地范围                                                                                           | 上游许可与修改说明                                                                                                                                   |
+| --------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| shadcn/ui                   | `packages/ui/src/components/ui/`、`packages/ui/src/styles.css` 的上游衍生部分                      | MIT；本地修改包含样式、国际化和组件组合，自有组件不归属于上游。                                                                                      |
+| AI Elements                 | `packages/ui/src/components/ai-elements/`、`.agents/skills/ai-elements/`（含 references、scripts） | Apache-2.0，Copyright 2023 Vercel, Inc.；本地修改包含样式、导入路径、组件扩展及技能使用说明，参考 commit 中包含技能正文。                            |
+| agent-browser、dogfood 技能 | `.agents/skills/` 下对应两个目录                                                                   | Apache-2.0，Copyright 2025 Vercel Inc.；固定 v0.20.0 的实际 commit 核对原技能和 LICENSE，本地说明和使用约定有修改。                                  |
+| VS Code IPC 与基础工具      | `packages/rpc/src/`、`packages/rpc/examples/` 中的衍生部分，及 `wire-codec.ts` 对该传输格式的适配  | MIT，保留 Microsoft 原始版权行；本地进行了模块拆分、传输扩展、注释和封装修改，不将所有本地实现归属于上游。                                           |
+| Superpowers 技能描述        | `packages/ui/src/lib/builtinSkillI18n.ts` 中的 Superpowers 描述及翻译                              | MIT，Copyright (c) 2025 Jesse Vincent；对应上游 v5.1.0。原插件目录当前仅余 LICENSE，不声明仍分发已删除的整包实现。该文件其他技能描述不在此授权范围。 |
 
 已核对 `@pierre/diffs@1.1.22` 的实际安装包：生产依赖声明已经包含其 Apache-2.0 标识及原始 LICENSE，不另造一份重复声明。
 
@@ -85,3 +85,20 @@ Apache-2.0 复制内容中的 148 个已确认改编文件包含文件内来源�
 - 原清单提及 `apps/zcode-cli/.agents/skills/` 下的技能，但该目录在当前 checkout 中不存在；锁文件中残留来源信息不代表还分发那些文件。
 
 待核验条目以当前 `inventory.json` 的 `reviewRequired` 为准。其余来源疑点尚未证明属于第三方复制，不凭相似性推定权利人；需要另行核对。基础声明新鲜度检查通过不代表这些边界问题已经解决。具体规则与验收见 [SPEC.md](SPEC.md)。
+
+## 旧 npm 许可标识复核（2026-10-15）
+
+基础标识检查只对下列精确版本接受原发布方的 `MIT/X11` 标识，不扩展通用 allowlist，
+不把标识视为完整上游许可文本。升级版本或许可字段变化后重新阻断。
+
+- `buffers@0.1.1`：npm 包缺少许可字段。原作者在
+  [固定提交](https://github.com/bitpay/node-buffers/commit/1b745ee35d33eb166e15ef1866073a07c6d7de87)
+  为同一版本补充 `license: MIT/X11`。该提交的 `index.js` 与当前冻结安装的发布包逐字节一致；
+  SHA-256 为 `97801e296ba5f3c32242f647e1daac5917e300367fed7935ab1e62f40adb1b8a`。
+  原始 metadata 快照保存在 `upstream/buffers-0.1.1-package.json`，SHA-256 为
+  `eb42a43d5b685e6de2f2f4a5e18a70255be72349def7eedf504b912dd908913e`。
+- `chainsaw@0.1.0`：冻结安装的 npm 包自身声明 `MIT/X11`；保留原始 metadata 快照
+  `upstream/chainsaw-0.1.0-package.json`，不覆盖发布方字段。
+
+这两个包由表格解析构建依赖引入；当前生产依赖图未包含它们。若以后进入发行产物，
+仍须收集该版本的完整许可原文。现有 `reviewRequired` 材料缺口继续保留，严格检查不得绕过。

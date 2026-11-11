@@ -14,8 +14,12 @@ import {
   runMemoryAgentLoop,
   type MemoryAgentModelRequest,
 } from "../src/memory/memory-agent-loop.js";
+import {
+  isRuntimeAttachmentEntry,
+  type RuntimeMessageEntry,
+} from "../src/agent/message-history.js";
 import { DEFAULT_MODEL_REQUEST_MEDIA_BUDGET_BYTES } from "../src/runtime/helpers/media-budget.js";
-import type { ToolExecutionResult } from "../src/tool/types.js";
+import type { ExecutableToolCall, ToolExecutionResult } from "../src/tool/types.js";
 import { createTestInputFormat } from "./test-runtime-model.js";
 
 const modelSelection = {
@@ -37,7 +41,9 @@ describe("runMemoryAgentLoop", () => {
       tool("Agent", false, "session"),
     ]) satisfies readonly ModelToolContract[];
     const requests: MemoryAgentModelRequest[] = [];
-    const executeTool = vi.fn(async (call) => executionResult(call.id, call.name, "written"));
+    const executeToolCalls = vi.fn(async (calls: ExecutableToolCall[]) =>
+      calls.map((call) => executionResult(call.id, call.name, "written")),
+    );
     const model = generateOnlyModel(async (request) => {
       requests.push(request as MemoryAgentModelRequest);
       if (requests.length < 5) {
@@ -60,24 +66,26 @@ describe("runMemoryAgentLoop", () => {
 
     const result = await runMemoryAgentLoop({
       abortSignal: new AbortController().signal,
-      executeTool,
+      entries: messageEntries(initialMessages),
+      executeToolCalls,
       maxTurns: 5,
-      messages: initialMessages,
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender(tools),
       model,
       rootDir: memoryRoot,
-      tools,
       workingDirectory: "/workspace",
       workspaceRoot: "/workspace",
     });
 
     expect(requests).toHaveLength(5);
-    expect(executeTool).toHaveBeenCalledTimes(5);
-    expect(executeTool).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "write-last", name: "Write" }),
+    expect(executeToolCalls).toHaveBeenCalledTimes(5);
+    expect(executeToolCalls).toHaveBeenLastCalledWith(
+      [expect.objectContaining({ id: "write-last", name: "Write" })],
       expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
     );
     expect(requests[0]?.messages).toEqual(initialMessages);
     expect(requests.every((request) => request.tools === tools)).toBe(true);
+    expect(requests.every((request) => request.toolSearchEnabled === false)).toBe(true);
     expect(requests.every((request) => request.options?.reasoningLevel === "low")).toBe(true);
     expect(requests.every((request) => request.options?.maxOutputTokens === 5_000)).toBe(true);
     expect(requests[1]?.messages.slice(-2)).toEqual([
@@ -95,11 +103,10 @@ describe("runMemoryAgentLoop", () => {
       }),
     ]);
     expect(result.turns).toBe(5);
-    expect(result.messages.slice(-2)).toEqual([
+    expect(messagesOf(result.entries).slice(-2)).toEqual([
       expect.objectContaining({ role: "assistant", content: "last turn" }),
       expect.objectContaining({ role: "tool", toolCallId: "write-last", isError: false }),
     ]);
-    expect(initialMessages).toHaveLength(3);
   });
 
   it("applies media capability and budget projection on every model turn", async () => {
@@ -118,10 +125,12 @@ describe("runMemoryAgentLoop", () => {
       dataUrl: sharedImageDataUrl,
     };
     const requests: ModelRequest[] = [];
-    const executeTool = vi.fn(async (call) => ({
-      ...executionResult(call.id, call.name, "read media"),
-      modelContent: [unsupportedVideo, historicalImage],
-    }));
+    const executeToolCalls = vi.fn(async (calls: ExecutableToolCall[]) =>
+      calls.map((call) => ({
+        ...executionResult(call.id, call.name, "read media"),
+        modelContent: [unsupportedVideo, historicalImage],
+      })),
+    );
     const model = generateOnlyModel(
       async (request) => {
         requests.push(request);
@@ -138,9 +147,7 @@ describe("runMemoryAgentLoop", () => {
     );
 
     await runMemoryAgentLoop({
-      executeTool,
-      maxTurns: 2,
-      messages: [
+      entries: messageEntries([
         {
           role: "user",
           content: [
@@ -150,10 +157,13 @@ describe("runMemoryAgentLoop", () => {
           ],
         },
         { role: "user", content: "extract memory" },
-      ],
+      ]),
+      executeToolCalls,
+      maxTurns: 2,
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender([tool("Read", true, "none")]),
       model,
       rootDir: memoryRoot,
-      tools: [tool("Read", true, "none")],
       workingDirectory: "/workspace",
       workspaceRoot: "/workspace",
     });
@@ -175,7 +185,7 @@ describe("runMemoryAgentLoop", () => {
   });
 
   it("returns the exact provider-visible denial text without invoking the executor", async () => {
-    const executeTool = vi.fn();
+    const executeToolCalls = vi.fn();
     const requests: ModelRequest[] = [];
     const model = generateOnlyModel(async (request) => {
       requests.push(request);
@@ -191,17 +201,21 @@ describe("runMemoryAgentLoop", () => {
     });
 
     const result = await runMemoryAgentLoop({
-      executeTool,
+      entries: messageEntries([{ role: "user", content: "extract" }]),
+      executeToolCalls,
       maxTurns: 2,
-      messages: [{ role: "user", content: "extract" }],
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender([
+        tool("WebFetch", true, "network"),
+        tool("Bash", false, "workspace"),
+      ]),
       model,
       rootDir: memoryRoot,
-      tools: [tool("WebFetch", true, "network"), tool("Bash", false, "workspace")],
       workingDirectory: "/workspace",
       workspaceRoot: "/workspace",
     });
 
-    expect(executeTool).not.toHaveBeenCalled();
+    expect(executeToolCalls).not.toHaveBeenCalled();
     const deniedToolMessages = [
       {
         content:
@@ -222,11 +236,11 @@ describe("runMemoryAgentLoop", () => {
     ];
     expect(requests).toHaveLength(2);
     expect(requests[1]?.messages.slice(-2)).toEqual(deniedToolMessages);
-    expect(result.messages.slice(-3, -1)).toEqual(deniedToolMessages);
+    expect(messagesOf(result.entries).slice(-3, -1)).toEqual(deniedToolMessages);
   });
 
   it("returns the catalog-miss result before applying the Memory tool policy", async () => {
-    const executeTool = vi.fn();
+    const executeToolCalls = vi.fn();
     const requests: ModelRequest[] = [];
     const model = generateOnlyModel(async (request) => {
       requests.push(request);
@@ -242,17 +256,18 @@ describe("runMemoryAgentLoop", () => {
     });
 
     await runMemoryAgentLoop({
-      executeTool,
+      entries: messageEntries([{ role: "user", content: "extract" }]),
+      executeToolCalls,
       maxTurns: 2,
-      messages: [{ role: "user", content: "extract" }],
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender([tool("Read", true, "none")]),
       model,
       rootDir: memoryRoot,
-      tools: [tool("Read", true, "none")],
       workingDirectory: "/workspace",
       workspaceRoot: "/workspace",
     });
 
-    expect(executeTool).not.toHaveBeenCalled();
+    expect(executeToolCalls).not.toHaveBeenCalled();
     expect(requests).toHaveLength(2);
     expect(requests[1]?.messages.slice(-2)).toEqual([
       {
@@ -274,7 +289,9 @@ describe("runMemoryAgentLoop", () => {
 
   it("executes tool calls returned by the fiftieth Dream turn", async () => {
     let requestCount = 0;
-    const executeTool = vi.fn(async (call) => executionResult(call.id, call.name, "done"));
+    const executeToolCalls = vi.fn(async (calls: ExecutableToolCall[]) =>
+      calls.map((call) => executionResult(call.id, call.name, "done")),
+    );
     const model = generateOnlyModel(async () => {
       requestCount += 1;
       return modelResult({
@@ -291,22 +308,114 @@ describe("runMemoryAgentLoop", () => {
     });
 
     const result = await runMemoryAgentLoop({
-      executeTool,
+      entries: messageEntries([{ role: "user", content: "dream" }]),
+      executeToolCalls,
       maxTurns: 50,
-      messages: [{ role: "user", content: "dream" }],
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender([
+        tool("Read", true, "none"),
+        tool("Write", false, "workspace"),
+      ]),
       model,
       rootDir: memoryRoot,
-      tools: [tool("Read", true, "none"), tool("Write", false, "workspace")],
       workingDirectory: "/workspace",
       workspaceRoot: "/workspace",
     });
 
     expect(result.turns).toBe(50);
-    expect(executeTool).toHaveBeenCalledTimes(50);
-    expect(executeTool).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "write-fiftieth", name: "Write" }),
+    expect(executeToolCalls).toHaveBeenCalledTimes(50);
+    expect(executeToolCalls).toHaveBeenLastCalledWith(
+      [expect.objectContaining({ id: "write-fiftieth", name: "Write" })],
       expect.any(Object),
     );
+  });
+
+  it("gives every allowed call a tool result even when the executor returns none for it", async () => {
+    const requests: ModelRequest[] = [];
+    const executeToolCalls = vi.fn(async (calls: ExecutableToolCall[]) => [
+      executionResult(calls[0]!.id, calls[0]!.name, "read"),
+    ]);
+    const model = generateOnlyModel(async (request) => {
+      requests.push(request);
+      return requests.length === 1
+        ? modelResult({
+            toolCalls: [
+              { id: "read-1", name: "Read", input: {} },
+              { id: "read-2", name: "Read", input: {} },
+            ],
+          })
+        : modelResult({ text: "done" });
+    });
+
+    await runMemoryAgentLoop({
+      entries: messageEntries([{ role: "user", content: "extract" }]),
+      executeToolCalls,
+      maxTurns: 2,
+      registry: noBatchNoticeRegistry,
+      renderRequest: passthroughRender([tool("Read", true, "none")]),
+      model,
+      rootDir: memoryRoot,
+      workingDirectory: "/workspace",
+      workspaceRoot: "/workspace",
+    });
+
+    // 每个 tool_use 都要有 tool_result，否则下一次请求会被 provider 拒绝。
+    expect(requests[1]?.messages.slice(-2)).toEqual([
+      expect.objectContaining({ role: "tool", toolCallId: "read-1", isError: false }),
+      expect.objectContaining({ role: "tool", toolCallId: "read-2", isError: true }),
+    ]);
+  });
+
+  it("keeps tool results in call order and appends the batch notices after them", async () => {
+    const tools = [tool("Read", true, "none"), tool("WebFetch", true, "network")];
+    const executeToolCalls = vi.fn(async (calls: ExecutableToolCall[]) =>
+      calls.map((call) => executionResult(call.id, call.name, { notice: `${call.id} notice` })),
+    );
+    const model = generateOnlyModel(async (request) =>
+      request.messages.length === 1
+        ? modelResult({
+            toolCalls: [
+              { id: "read-1", name: "Read", input: {} },
+              { id: "network", name: "WebFetch", input: {} },
+              { id: "read-2", name: "Read", input: {} },
+            ],
+          })
+        : modelResult({ text: "done" }),
+    );
+
+    const result = await runMemoryAgentLoop({
+      entries: messageEntries([{ role: "user", content: "extract" }]),
+      executeToolCalls,
+      maxTurns: 2,
+      registry: {
+        get: (name: string) =>
+          name === "Read"
+            ? ({
+                formatBatchNotice: (output: unknown) => ({
+                  source: "read_truncation_notice",
+                  content: (output as { notice: string }).notice,
+                }),
+              } as never)
+            : undefined,
+      },
+      renderRequest: passthroughRender(tools),
+      model,
+      rootDir: memoryRoot,
+      workingDirectory: "/workspace",
+      workspaceRoot: "/workspace",
+    });
+
+    // 被拒绝的 call 不进入调度；结果按声明顺序，批次附件排在这批 tool result 之后。
+    expect(executeToolCalls).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: "read-1" }), expect.objectContaining({ id: "read-2" })],
+      expect.any(Object),
+    );
+    const batch = result.entries.slice(2, 7);
+    expect(
+      batch.map((entry) =>
+        isRuntimeAttachmentEntry(entry) ? entry.content : entry.message.toolCallId,
+      ),
+    ).toEqual(["read-1", "network", "read-2", "read-1 notice", "read-2 notice"]);
   });
 });
 
@@ -428,6 +537,29 @@ describe("evaluateMemoryAgentToolPolicy", () => {
     expect(decide(name, input, registeredTools)).toMatchObject({ allowed: false });
   });
 });
+
+const noBatchNoticeRegistry = { get: () => undefined };
+
+function messageEntries(messages: readonly ModelInputMessage[]): RuntimeMessageEntry[] {
+  return messages.map((message) => ({ message }));
+}
+
+function messagesOf(entries: readonly RuntimeMessageEntry[]): ModelInputMessage[] {
+  return entries.flatMap((entry) => (isRuntimeAttachmentEntry(entry) ? [] : [entry.message]));
+}
+
+/** 循环机制测试用：entries 原样作为请求消息；与 Main 渲染器的一致性在 runtime 测试里覆盖。 */
+function passthroughRender(tools: readonly ModelToolContract[]) {
+  return (entries: readonly RuntimeMessageEntry[]) => ({
+    messages: entries.map((entry) =>
+      isRuntimeAttachmentEntry(entry)
+        ? { role: "user" as const, content: entry.content }
+        : entry.message,
+    ),
+    tools: tools as ModelToolContract[],
+    toolSearchEnabled: false,
+  });
+}
 
 function decide(name: string, input: unknown, tools: readonly ModelToolContract[]) {
   return evaluateMemoryAgentToolPolicy({

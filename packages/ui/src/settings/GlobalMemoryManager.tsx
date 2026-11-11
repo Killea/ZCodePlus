@@ -10,7 +10,7 @@ import {
   TID_SETTINGS_GLOBAL_MEMORY_DELETE,
   TID_SETTINGS_GLOBAL_MEMORY_LIST,
   TID_SETTINGS_GLOBAL_MEMORY_PROMPT_INFO,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import { cn } from "@/components/lib/utils.js";
 import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import { runUserAction, runUserActionAsync } from "@/lib/userActionTelemetry.js";

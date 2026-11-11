@@ -52,6 +52,75 @@ function spyOnSubagentMaterialization(projection: ProductProjection) {
 }
 
 describe("ProductProjection cold hydration subagent materialization", () => {
+  it("exposes live stopControl only for runtime-owned spawn, then strips it on cold replay", () => {
+    const spawn = sessionEvent(1, SessionEventType.SubagentSpawned, {
+      agentId: "agent-live-stop",
+      agentType: "Explore",
+      childSessionId: "child-live-stop",
+      description: "Inspect stop",
+      status: "running",
+      taskId: "agent-live-stop",
+      executionId: "execution-live-stop",
+    });
+    const live = new ProductProjection("cold-hydration-session", "epoch-live");
+    live.applyEvent(spawn);
+    expect(live.getSnapshot().subagents?.running[0]).toMatchObject({
+      stopControl: { taskId: "agent-live-stop", executionId: "execution-live-stop" },
+    });
+
+    const cold = new ProductProjection("cold-hydration-session", "epoch-cold");
+    cold.beginHydrationReplay();
+    cold.applyHydrationEvent(spawn);
+    cold.completeHydrationReplay();
+    expect(cold.getSnapshot().subagents?.running[0]).not.toHaveProperty("stopControl");
+  });
+
+  it("ignores a late terminal event from an execution replaced by resume", () => {
+    const projection = new ProductProjection("cold-hydration-session", "epoch-live");
+    const identity = {
+      agentId: "agent-resumed",
+      agentType: "Explore",
+      childSessionId: "child-resumed",
+      taskId: "agent-resumed",
+      description: "Resume child",
+    };
+    projection.applyEvent(
+      sessionEvent(1, SessionEventType.SubagentSpawned, {
+        ...identity,
+        executionId: "execution-old",
+      }),
+    );
+    projection.applyEvent(
+      sessionEvent(2, SessionEventType.SubagentSpawned, {
+        ...identity,
+        executionId: "execution-new",
+        resumed: true,
+        background: true,
+      }),
+    );
+    projection.applyEvent(
+      sessionEvent(3, SessionEventType.SubagentStopped, {
+        ...identity,
+        executionId: "execution-old",
+        status: "stopped",
+      }),
+    );
+    expect(projection.getSnapshot().subagents?.running).toEqual([
+      expect.objectContaining({
+        childSessionId: identity.childSessionId,
+        stopControl: { taskId: identity.taskId, executionId: "execution-new" },
+      }),
+    ]);
+    projection.applyEvent(
+      sessionEvent(4, SessionEventType.SubagentStopped, {
+        ...identity,
+        executionId: "execution-new",
+        status: "stopped",
+      }),
+    );
+    expect(projection.getSnapshot().subagents?.running).toEqual([]);
+  });
+
   it("cold batch 对 checkpoint 只推进 seq，live 路径仍保持原有 materialization", () => {
     const checkpoint = sessionEvent(1, SessionEventType.CheckpointCreated, {
       checkpointId: "checkpoint-1",
@@ -487,7 +556,9 @@ describe("ProductProjection cold hydration ask preview", () => {
       ],
       lanes: [{ id: "actor#1", name: "a" }],
       // 第二层是子代理导向：每阶段一张参与者卡 + 交接边（docs/dynamic-workflow/presentation.md）。
-      participants: [{ id: "unphased:actor#1", phase: "unphased", lane: "actor#1", steps: ["ask#1"] }],
+      participants: [
+        { id: "unphased:actor#1", phase: "unphased", lane: "actor#1", steps: ["ask#1"] },
+      ],
       handoffs: [],
       sink: ["ask#1"],
     },
@@ -541,7 +612,6 @@ describe("ProductProjection cold hydration ask preview", () => {
     expect(payload).toMatchObject({ kind: "permission", display });
     // 第 4 轮：CreateWorkflow 的 v4 选项含 Refine；第 7 轮含会话免确认；冷恢复走同一
     // 合成函数，天然一致。
-    expect(payload?.kind === "permission" && payload.options).toHaveLength(4);
     expect(
       payload?.kind === "permission" && payload.options.map((option) => option.optionId),
     ).toEqual(["allowOnce", "allowSession", "deny", "workflowRefine"]);

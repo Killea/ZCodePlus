@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-ttft-stages",
-  "spec": "./test/e2e/conversation-session/conversation-session-ttft-stages.test.ts",
+  "spec": "./test/e2e/conversation-session/telemetry/conversation-session-ttft-stages.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-ttft-stages.json"
@@ -14,6 +14,13 @@
     }
   ],
   "requests": [
+    {
+      "id": "ttft-stages-title-sidecar",
+      "kind": "common",
+      "source": "synthetic",
+      "timingPolicy": "fast-text",
+      "syntheticReason": "运行时证据显示 session_title 旁路缺少 fixture；固定标题响应隔离标题生成，主用例不验证标题内容。"
+    },
     {
       "id": "ttft-text",
       "kind": "main",

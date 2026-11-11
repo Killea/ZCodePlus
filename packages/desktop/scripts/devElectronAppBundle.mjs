@@ -6,12 +6,28 @@ import {
   macosLocalNetworkUsageDescription,
   patchMacBundleLocalNetworkUsage,
 } from "./macos-local-network-usage.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 export const DEV_ELECTRON_PROTOCOL_SCHEME = "zcode";
 export const DEV_ELECTRON_APP_NAME = "ZCode Dev";
 export const DEV_ELECTRON_APP_BUNDLE_ID = "dev.zcode.app.development";
 // 副本布局版本，见 prepareDevElectronAppBundle 中的指纹说明。
-export const DEV_ELECTRON_BUNDLE_FORMAT = 2;
+export const DEV_ELECTRON_BUNDLE_FORMAT = 3;
+const execFileAsync = promisify(execFile);
+
+async function signDevElectronApp(appPath) {
+  // Electron 42 起通知要求有效签名；原 npm runtime 签名可能不完整，修改身份后也必须重签。
+  // 仅对 ignored 的开发副本做 ad-hoc 签名，正式发布仍走现有证书、公证流程。
+  await execFileAsync("/usr/bin/codesign", [
+    "--deep",
+    "--force",
+    "--sign",
+    "-",
+    "--preserve-metadata=entitlements,flags,runtime",
+    appPath,
+  ]);
+}
 
 function escapeXml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
@@ -70,6 +86,7 @@ export async function prepareDevElectronAppBundle({
   runtimeRoot,
   electronVersion,
   arch,
+  signApp = signDevElectronApp,
 }) {
   const appPath = resolveDevElectronAppBundlePath({ runtimeRoot, electronVersion, arch });
   const infoPlistPath = posix.join(appPath, "Contents", "Info.plist");
@@ -124,10 +141,12 @@ export async function prepareDevElectronAppBundle({
     await writeFile(infoPlistPath, patchedInfoPlist, "utf8");
     // raw Electron 的 Helper 子 bundle 仍带 com.github.Electron 身份；dev 下发起
     // LAN 连接的进程归因在这些 Helper 上，同样要补 usage description。
+    // 必须在签名前完成：codesign 覆盖的是定稿后的 plist，顺序反了签名就废了。
     await patchMacBundleLocalNetworkUsage({
       appPath,
       description: macosLocalNetworkUsageDescription(DEV_ELECTRON_APP_NAME),
     });
+    await signApp(appPath);
     // 指纹最后写：中途失败时下次仍会判定为需要重拷，不会留下半成品缓存。
     if (sourceStamp !== undefined) await writeFile(sourceStampPath, sourceStamp, "utf8");
   }

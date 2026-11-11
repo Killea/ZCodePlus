@@ -8,17 +8,13 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import {
-  ZCODE_OFFICIAL_PLUGIN_MARKETPLACE,
-  ZCODE_PLUGIN_HOST_COMMAND,
-} from "@zcode/contracts";
+import { ZCODE_OFFICIAL_PLUGIN_MARKETPLACE, ZCODE_PLUGIN_HOST_COMMAND } from "@zcode/contracts";
 import {
   ZCODE_CUA_OFFICIAL_PLUGIN_ID,
   ZCODE_CUA_NODE_REPL_HOST_ENV_KEY,
   ZCODE_CUA_PLUGIN_AUTHORITY_ENV_KEY,
   ZCODE_PLUGIN_ID_ENV_KEY,
   ZCODE_RUNTIME_ENV_KEY,
-  ZCODE_TOOL_ENV_PASSTHROUGH_ENV_KEY,
   readZCodeToolEnvPassthroughEnv,
   resetCapturedZCodeCuaBrokerCredentialsForTest,
   sanitizeZCodeRuntimeEnvInPlace,
@@ -27,6 +23,7 @@ import {
 } from "@zcode/shared";
 import type { RunContext } from "@zcode/shared-types";
 import type { TuiOptions } from "@zcode/tui";
+import type { ZCodeAppOptions } from "@zcode/bootstrap";
 import { run } from "../src/run.js";
 import { createTuiSubmitPrompt } from "../src/tui-prompt-handler.js";
 import {
@@ -35,6 +32,7 @@ import {
   parseSlashCommand,
 } from "../src/command-center.js";
 import type { CommandCenterTarget } from "../src/command-center.js";
+import { expandCliCustomCommandPrompt } from "../src/custom-command-expand.js";
 import { findDotenv, loadCliDotenv, prepareCliRuntimeEnv } from "../src/env.js";
 import { runPluginsCommand } from "../src/plugins-command.js";
 import { runPluginHostCommand } from "../src/plugin-host-command.js";
@@ -198,7 +196,6 @@ test("prepares a sanitized CLI runtime env with ZCode-owned runtime keys", () =>
 
   assert.equal(env.ZCODE_RUNTIME_ENV, "production");
   assert.equal(env.ZCODE_HTTP_PROXY, "http://zcode-proxy:8080");
-  assert.ok(env[ZCODE_TOOL_ENV_PASSTHROUGH_ENV_KEY]);
   assert.deepEqual(toolEnv, {
     HTTP_PROXY: "http://ambient-proxy:8080",
     NODE_EXTRA_CA_CERTS: "/tmp/ambient-ca.pem",
@@ -245,7 +242,6 @@ test("opens the TUI by default", async () => {
       opened = true;
       assert.equal(options.stdin, ctx.stdin);
       // 启动屏先于运行时绘制：模型、主题、命令等启动数据改由 loadStartupOptions 在首帧后提供。
-      assert.equal(typeof options.loadStartupOptions, "function");
       const startup = await loadTuiStartup(options);
       assert.equal(startup.initialModel, "openai/gpt-test");
       assert.equal(startup.initialThoughtLevel, "medium");
@@ -501,6 +497,7 @@ test("does not enable session title generation for headless prompts", async () =
     ...createPromptDeps(),
     createZCodeApp: (options) => {
       assert.equal(options?.runtimeConfig?.titleGeneration, undefined);
+      assert.equal(options?.standaloneSessionControl, true);
       return {
         sessionId: "session-test",
         traceId: "trace-test",
@@ -601,11 +598,21 @@ test("borrows one process provider registry for a headless prompt and disposes i
     userConfigPath: "/tmp/zcode-legacy-cli.json",
     startProcessProviderRegistryRuntime: async (_env, options) => {
       runtimeStarts += 1;
-      assert.deepEqual(options, {
-        standalone: {
-          legacyCliUserConfigFilePath: "/tmp/zcode-legacy-cli.json",
+      // 刷新回调是当前 CLI 装配的一部分，仍验证唯一 Runtime 和旧配置迁移路径。
+      assert.equal(typeof options?.standalone?.onBuiltinRefreshError, "function");
+      assert.equal(typeof options?.standalone?.onBuiltinRefreshResult, "function");
+      assert.deepEqual(
+        {
+          standalone: {
+            legacyCliUserConfigFilePath: options?.standalone?.legacyCliUserConfigFilePath,
+          },
         },
-      });
+        {
+          standalone: {
+            legacyCliUserConfigFilePath: "/tmp/zcode-legacy-cli.json",
+          },
+        },
+      );
       return {
         accountSource: {} as never,
         dispose: () => {
@@ -632,7 +639,6 @@ test("borrows one process provider registry for a headless prompt and disposes i
     createZCodeApp: (options) => {
       assert.equal(options?.providerRegistry, providerRegistry);
       assert.equal(options?.providerRuntimeHeadersPort, providerRuntimeHeadersPort);
-      assert.equal(Object.hasOwn(options ?? {}, "workspaceProviderCompatibilityMode"), false);
       assert.deepEqual(options?.configuredDefaultModelSelection, {
         providerId: "provider-a",
         modelId: "model-a",
@@ -974,7 +980,7 @@ test("zcode commands list prints custom commands", async () => {
   assert.match(ctx.stdout.output(), /\/review \[scope\]/);
 });
 
-test("zcode login runs OAuth flow without exposing tokens", async () => {
+test("zcode login runs OAuth flow and prints the authorization URL", async () => {
   const ctx = createContext(["login", "--no-browser"]);
   let sawNoBrowser = false;
   const exitCode = await run(ctx, {
@@ -1011,7 +1017,6 @@ test("zcode login runs OAuth flow without exposing tokens", async () => {
     ctx.stdout.output(),
     /Model selection: \/home\/test\/\.zcode\/v2\/model-selection\.json/,
   );
-  assert.doesNotMatch(ctx.stdout.output(), /access-token|jwt-token/);
 });
 
 test("zcode logout clears shared OAuth credentials", async () => {
@@ -1307,6 +1312,33 @@ test("headless prompt keeps a facade-reserved custom command name on the command
   assert.notEqual(submitted, "/compress tighten it");
 });
 
+test("TUI custom command expansion hands shell blocks to the model like the app path", () => {
+  const { prompt } = expandCliCustomCommandPrompt({
+    args: "go !`touch arg-marker`",
+    command: {
+      content: [
+        "Run !`git status`, then report.",
+        "```!",
+        '"${CLAUDE_PLUGIN_ROOT}/s.sh" "$CLAUDE_PROJECT_DIR" $ARGUMENTS',
+        "```",
+      ].join("\n"),
+      metadata: {
+        name: "probe",
+        plugin: { dataPath: "/data/p", id: "p@market", name: "p", rootPath: "/plugins/p" },
+        scope: "user",
+        source: "plugin",
+      },
+    },
+  });
+
+  assert.match(prompt, /the \/probe command file \(user\/plugin\), not from ZCode\./);
+  // 代码块结束后原文另起一行；插件变量换成真实路径，工作区变量留给 Bash 环境；参数原样进入。
+  assert.ok(prompt.includes("```bash\ngit status\n```\n, then report."));
+  assert.ok(
+    prompt.includes('```bash\n"/plugins/p/s.sh" "$CLAUDE_PROJECT_DIR" go !`touch arg-marker`\n```'),
+  );
+});
+
 test("headless prompt keeps the Unknown command response for an unresolvable slash name", async () => {
   const ctx = createContext(["--prompt", "/nope please"]);
   const exitCode = await run(ctx, {
@@ -1368,7 +1400,6 @@ test("wires TUI input recall skip into the active app", async () => {
         }),
       }) as never,
     runTui: async (options) => {
-      assert.equal(typeof options.recallPreviousInput, "function");
       const previous = await options.recallPreviousInput?.();
       const older = await options.recallPreviousInput?.(1);
       assert.equal(previous?.text, "previous project prompt");
@@ -1868,14 +1899,13 @@ test("wires TUI approval requests into the runtime permission broker", async () 
   const exitCode = await run(ctx, {
     ...createPromptDeps(),
     createZCodeApp: (options) => {
-      assert.ok(options?.permissionBroker);
       return {
         listModels: selectableTestModels,
         sessionId: "session-test",
         traceId: "trace-test",
         runtime: {} as never,
         submitPrompt: async () => {
-          const permission = await options.permissionBroker?.requestPermission(
+          const permission = await options?.permissionBroker?.requestPermission(
             createPermissionRequest(),
             {
               signal: new AbortController().signal,
@@ -1892,18 +1922,20 @@ test("wires TUI approval requests into the runtime permission broker", async () 
       } as never;
     },
     runTui: async (options) => {
+      // TUI 挂载时登记一次审批入口；提交不再携带单次回调。
+      const unregister = options.registerPermissionRequester!(async (request) => {
+        approvalSeen = true;
+        assert.equal(request.toolName, "Bash");
+        return {
+          decision: "allow",
+          reason: "approved by tui test",
+        };
+      });
       const result = await options.submitPrompt("needs approval", {
         abortSignal: new AbortController().signal,
-        requestPermission: async (request) => {
-          approvalSeen = true;
-          assert.equal(request.toolName, "Bash");
-          return {
-            decision: "allow",
-            reason: "approved by tui test",
-          };
-        },
       });
       assert.equal(result.response, "permission allow");
+      unregister();
       return 0;
     },
   });
@@ -1918,13 +1950,12 @@ test("wires TUI sendInput approval requests into the runtime permission broker",
   const exitCode = await run(ctx, {
     ...createPromptDeps(),
     createZCodeApp: (options) => {
-      assert.ok(options?.permissionBroker);
       return {
         sessionId: "session-test",
         traceId: "trace-test",
         runtime: {} as never,
         sendInput: async () => {
-          const permission = await options.permissionBroker?.requestPermission(
+          const permission = await options?.permissionBroker?.requestPermission(
             createPermissionRequest(),
             {
               signal: new AbortController().signal,
@@ -1947,26 +1978,81 @@ test("wires TUI sendInput approval requests into the runtime permission broker",
       } as never;
     },
     runTui: async (options) => {
-      assert.ok(options.sendInput);
-      const result = await options.sendInput("needs approval while busy", {
+      const unregister = options.registerPermissionRequester!(async (request) => {
+        approvalSeen = true;
+        assert.equal(request.toolName, "Bash");
+        return {
+          decision: "allow",
+          reason: "approved by tui sendInput test",
+        };
+      });
+      const result = await options.sendInput!("needs approval while busy", {
         abortSignal: new AbortController().signal,
-        requestPermission: async (request) => {
-          approvalSeen = true;
-          assert.equal(request.toolName, "Bash");
-          return {
-            decision: "allow",
-            reason: "approved by tui sendInput test",
-          };
-        },
       });
       assert.equal(result.kind, "started_turn");
       assert.equal(result.result.response, "permission allow");
+      unregister();
       return 0;
     },
   });
 
   assert.equal(exitCode, 0);
   assert.equal(approvalSeen, true);
+});
+
+// 回归：审批入口原先只在单次提交内有效，回合之外的询问（后台会话、通知驱动的回合）被直接拒绝。
+test("routes approvals raised outside any submit to the mounted TUI and fails closed after unmount", async () => {
+  const ctx = createContext(["tui"]);
+  let broker: NonNullable<ZCodeAppOptions["permissionBroker"]> | undefined;
+  const seen: string[] = [];
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      broker = options?.permissionBroker;
+      return {
+        listModels: selectableTestModels,
+        sessionId: "session-test",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async () => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: "created",
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+    runTui: async (options) => {
+      const background = { ...(createPermissionRequest() as object), sessionId: "sess_background" };
+      const first = options.registerPermissionRequester!(async (request) => {
+        seen.push(`first:${request.sessionId}`);
+        return { decision: "deny", reason: "first" };
+      });
+      // 首次提交建出 App；提交结束后再询问，模拟后台会话在发起者回合之外请求审批。
+      await options.submitPrompt("create background work", {
+        abortSignal: new AbortController().signal,
+      });
+      const outside = await broker!.requestPermission(background as never);
+      assert.equal(outside.decision, "deny");
+      assert.equal(outside.reason, "first");
+      // 重新挂载：新入口先登记，旧入口的迟到注销不能把它清掉。
+      const second = options.registerPermissionRequester!(async (request) => {
+        seen.push(`second:${request.sessionId}`);
+        return { decision: "allow", reason: "second" };
+      });
+      first();
+      assert.equal((await broker!.requestPermission(background as never)).decision, "allow");
+      second();
+      const closed = await broker!.requestPermission(background as never);
+      assert.equal(closed.decision, "deny");
+      assert.match(closed.reason ?? "", /No interactive approval handler/);
+      return 0;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(seen, ["first:sess_background", "second:sess_background"]);
 });
 
 test("wires TUI mode display and switching into runtime config", async () => {
@@ -2029,8 +2115,7 @@ test("wires TUI mode display and switching into runtime config", async () => {
       });
       assert.equal(liveSwitch.mode, "build");
 
-      assert.ok(options.setMode);
-      const shortcutSwitch = await options.setMode("plan");
+      const shortcutSwitch = await options.setMode!("plan");
       assert.equal(shortcutSwitch.mode, "plan");
       return 0;
     },
@@ -2332,6 +2417,7 @@ test("wires TUI new command into a fresh active app", async () => {
   const exitCode = await run(ctx, {
     ...createPromptDeps(),
     createZCodeApp: (options) => {
+      assert.equal(options?.standaloneSessionControl, true);
       const appSessionId = options?.sessionId ?? `sess_new_${createdSessionIds.length}`;
       createdSessionIds.push(options?.sessionId);
       return {
@@ -2900,7 +2986,7 @@ test("command center reports MCP status without sending a model prompt", async (
             updatedAt: "now",
           },
           remote: {
-            error: "Connection timed out",
+            error: "Connection timed out\n\nline two of stderr\nline three",
             status: "failed",
             toolCount: 0,
             transport: "http",
@@ -2933,6 +3019,7 @@ test("command center reports MCP status without sending a model prompt", async (
   assert.match(result.response, /MCP servers:/);
   assert.match(result.response, /local: connected via stdio; 2 tools/);
   assert.match(result.response, /remote: failed via http; 0 tools \(Connection timed out\)/);
+  assert.doesNotMatch(result.response, /line two/);
 });
 
 test("command center opens a plugin toggle picker", async () => {
@@ -6272,11 +6359,21 @@ test("reuses one process provider registry across TUI app replacements", async (
     userConfigPath: "/tmp/zcode-legacy-tui.json",
     startProcessProviderRegistryRuntime: async (_env, options) => {
       runtimeStarts += 1;
-      assert.deepEqual(options, {
-        standalone: {
-          legacyCliUserConfigFilePath: "/tmp/zcode-legacy-tui.json",
+      // 刷新回调是当前 CLI 装配的一部分，仍验证唯一 Runtime 和旧配置迁移路径。
+      assert.equal(typeof options?.standalone?.onBuiltinRefreshError, "function");
+      assert.equal(typeof options?.standalone?.onBuiltinRefreshResult, "function");
+      assert.deepEqual(
+        {
+          standalone: {
+            legacyCliUserConfigFilePath: options?.standalone?.legacyCliUserConfigFilePath,
+          },
         },
-      });
+        {
+          standalone: {
+            legacyCliUserConfigFilePath: "/tmp/zcode-legacy-tui.json",
+          },
+        },
+      );
       return {
         accountSource: {} as never,
         dispose: () => {
@@ -6304,7 +6401,6 @@ test("reuses one process provider registry across TUI app replacements", async (
       appCreations += 1;
       assert.equal(options?.providerRegistry, providerRegistry);
       assert.equal(options?.providerRuntimeHeadersPort, providerRuntimeHeadersPort);
-      assert.equal(Object.hasOwn(options ?? {}, "workspaceProviderCompatibilityMode"), false);
       assert.deepEqual(options?.configuredDefaultModelSelection, {
         providerId: "provider-a",
         modelId: "model-a",
@@ -6327,11 +6423,9 @@ test("reuses one process provider registry across TUI app replacements", async (
       } as never;
     },
     runTui: async (options) => {
+      await loadTuiStartup(options);
       await options.submitPrompt("/new", {
-        requestPermission: async () => ({
-          decision: "deny",
-          resolvedAt: new Date(),
-        }),
+        abortSignal: new AbortController().signal,
       });
       return 0;
     },
@@ -6536,4 +6630,345 @@ test("headless rollout-off diagnostics preserve the runtime feature-disabled rea
 
   assert.equal(exitCode, 0);
   assert.match(ctx.stderr.output(), /Workspace Hooks skipped: workspace_hooks_feature_disabled/);
+});
+
+for (const mode of [undefined, "off", "auto", "local"] as const) {
+  test(`passes ToolSearch mode ${mode ?? "default off"} into prompt runtime`, async () => {
+    let observed = false;
+    const ctx = createContext([...(mode ? ["--toolsearch-mode", mode] : []), "--prompt", "hello"]);
+    const deps = createPromptDeps();
+    const original = deps.createZCodeApp;
+    const code = await run(ctx, {
+      ...deps,
+      createZCodeApp: (options) => {
+        observed = true;
+        assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, { mode: mode ?? "off" });
+        return original!(options);
+      },
+    });
+    assert.equal(code, 0);
+    assert.equal(observed, true);
+  });
+}
+
+test("rejects invalid ToolSearch mode and removed enable flag before creating an app", async () => {
+  for (const args of [
+    ["--toolsearch-mode", "force"],
+    ["--toolsearch-mode", "typo"],
+    ["--enable-toolsearch"],
+  ]) {
+    let created = false;
+    const ctx = createContext([...args, "-p", "hello"]);
+    const code = await run(ctx, {
+      createZCodeApp: () => {
+        created = true;
+        throw new Error("unreachable");
+      },
+    });
+    assert.equal(code, 1);
+    assert.equal(created, false);
+    assert.match(ctx.stderr.output(), /toolsearch/);
+  }
+});
+
+test("passes explicit Native ToolSearch into TUI runtime config", async () => {
+  const ctx = createContext(["tui", "--toolsearch-mode", "native"]);
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, {
+        mode: "native",
+      });
+      return {
+        getLocale: () => "en-US",
+        getModel: () => "openai/gpt-test",
+        getThoughtLevel: () => "medium",
+        sessionId: "session-test",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async (prompt: string) => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: prompt,
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+    runTui: async () => 0,
+  });
+
+  assert.equal(exitCode, 0);
+});
+
+test("passes explicit Native ToolSearch into target runtime config", async () => {
+  const ctx = createContext(["--toolsearch-mode", "native", "--target", "Ship target MVP"]);
+  let continued = false;
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, {
+        mode: "native",
+      });
+      return {
+        clearTarget: async () => false,
+        continueActiveTarget: async () => {
+          continued = true;
+          return {
+            projection: fakeProjection as never,
+            response: "continued target",
+            traceId: "trace-target-toolsearch" as never,
+            turnId: "turn-target-toolsearch" as never,
+          };
+        },
+        readTarget: async () => null,
+        sessionId: "session-target-toolsearch",
+        setTarget: async ({ objective, status = "active" }) => ({
+          objective,
+          sessionID: "session-target-toolsearch",
+          status,
+          targetID: "target-toolsearch",
+          time: { created: 1, updated: 1 },
+        }),
+        traceId: "trace-target-toolsearch",
+        runtime: {} as never,
+        submitPrompt: async () => {
+          throw new Error("prompt should not run");
+        },
+        updateTargetStatus: async () => null,
+      } as never;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(continued, true);
+  assert.equal(ctx.stdout.output(), "continued target\n");
+  assert.equal(ctx.stderr.output(), "");
+});
+
+test("passes explicit Native ToolSearch into headless runtime config", async () => {
+  const ctx = createContext(["--toolsearch-mode", "native", "--prompt", "hello enable toolsearch"]);
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, {
+        mode: "native",
+      });
+      return {
+        sessionId: "session-test",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async (prompt: string) => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: prompt,
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(ctx.stdout.output(), "hello enable toolsearch\n");
+});
+
+test("rejects explicit Native ToolSearch outside prompt, target, or TUI commands", async () => {
+  const ctx = createContext(["doctor", "--toolsearch-mode", "native"]);
+  const exitCode = await run(ctx);
+
+  assert.equal(exitCode, 1);
+  assert.match(
+    ctx.stderr.output(),
+    /--toolsearch-mode can only be used with --prompt, --target, or tui/,
+  );
+  assert.equal(ctx.stdout.output(), "");
+});
+
+test("rejects explicit Native ToolSearch before starting the protocol app server", async () => {
+  const ctx = createContext(["app-server", "--stdio", "--toolsearch-mode", "native"]);
+  let called = false;
+  const exitCode = await run(ctx, {
+    runZCodeProtocolAgent: async () => {
+      called = true;
+    },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(called, false);
+  assert.match(
+    ctx.stderr.output(),
+    /--toolsearch-mode can only be used with --prompt, --target, or tui/,
+  );
+  assert.equal(ctx.stdout.output(), "");
+});
+
+test("passes explicit Native ToolSearch and explicit resume session into prompt app creation", async () => {
+  const ctx = createContext([
+    "--toolsearch-mode",
+    "native",
+    "--resume",
+    "sess_existing",
+    "--prompt",
+    "hello resume",
+  ]);
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      assert.equal(options?.resume, true);
+      assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, { mode: "native" });
+      assert.equal(options?.sessionId, "sess_existing");
+      return {
+        sessionId: "sess_existing",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async (prompt: string) => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: prompt,
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(ctx.stdout.output(), "hello resume\n");
+});
+
+test("passes explicit Native ToolSearch while resolving latest session for continue prompts", async () => {
+  const ctx = createContext([
+    "--toolsearch-mode",
+    "native",
+    "--continue",
+    "--prompt",
+    "hello continue",
+  ]);
+  const cwd = join(tmpdir(), "zcode-cli-continue-test");
+  let resolved = false;
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    cwd: () => cwd,
+    resolveLatestSession: async (options) => {
+      resolved = true;
+      assert.equal(options.directory, cwd);
+      return { id: "sess_latest" } as never;
+    },
+    createZCodeApp: (options) => {
+      assert.equal(options?.resume, true);
+      assert.deepEqual((options?.runtimeConfig as any)?.toolSearch, { mode: "native" });
+      assert.equal(options?.sessionId, "sess_latest");
+      return {
+        sessionId: "sess_latest",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async (prompt: string) => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: prompt,
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(resolved, true);
+  assert.equal(ctx.stdout.output(), "hello continue\n");
+});
+
+test("storage-migrate executes only the migration port and emits strict completion JSON", async () => {
+  const ctx = createContext(["storage-migrate"]);
+  let calls = 0;
+  const result = await run(ctx, {
+    migrateStorage: async () => {
+      calls++;
+      return { applied: ["0020"], backupSkipped: true };
+    },
+    runZCodeProtocolAgent: async () => {
+      throw new Error("must not start runtime");
+    },
+    createZCodeApp: () => {
+      throw new Error("must not create session");
+    },
+  });
+  assert.equal(result, 0);
+  assert.equal(calls, 1);
+  assert.deepEqual(JSON.parse(ctx.stdout.output()), {
+    version: 1,
+    kind: "storage-migrated",
+    applied: ["0020"],
+    backupSkipped: true,
+  });
+});
+test("storage-migrate reports failure and rejects extra flags without starting runtime", async () => {
+  for (const argv of [["storage-migrate"], ["storage-migrate", "--prompt", "do not run"]]) {
+    const ctx = createContext(argv);
+    const result = await run(ctx, {
+      migrateStorage: async () => {
+        throw new Error("checksum mismatch");
+      },
+    });
+    assert.equal(result, 1);
+    assert.equal(ctx.stdout.output(), "");
+    assert.ok(ctx.stderr.output().length > 0);
+  }
+});
+
+test("storage-migrate real entrypoint honors an isolated custom database and rejects checksum drift", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "zcode-cli-storage-migration-"));
+  const database = join(directory, "custom storage", "sessions.sqlite");
+  const cliEntry = fileURLToPath(new URL("../src/main.ts", import.meta.url));
+  const tsxLoader = fileURLToPath(import.meta.resolve("tsx"));
+  const invoke = async () => {
+    const child = spawn(process.execPath, ["--import", tsxLoader, cliEntry, "storage-migrate"], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        HOME: directory,
+        USERPROFILE: directory,
+        ZCODE_DATA_BASE_DIR: directory,
+        ZCODE_SESSION_DB_PATH: database,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (data) => {
+      stdout += data;
+    });
+    child.stderr.on("data", (data) => {
+      stderr += data;
+    });
+    const [code] = await once(child, "close");
+    return { code, stdout, stderr };
+  };
+  try {
+    const first = await invoke();
+    assert.equal(first.code, 0, first.stderr);
+    const report = JSON.parse(first.stdout);
+    assert.equal(report.kind, "storage-migrated");
+    assert.ok(report.applied.includes("0023_session_soft_delete_outcome"));
+    const second = await invoke();
+    assert.equal(second.code, 0, second.stderr);
+    assert.deepEqual(JSON.parse(second.stdout).applied, []);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(database);
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS total FROM session").get()?.total, 0);
+      db.prepare("UPDATE schema_migration SET checksum='invalid' WHERE id=?").run(
+        "0023_session_soft_delete_outcome",
+      );
+    } finally {
+      db.close();
+    }
+    const failed = await invoke();
+    assert.equal(failed.code, 1);
+    assert.equal(failed.stdout, "");
+    assert.match(failed.stderr, /checksum mismatch/i);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

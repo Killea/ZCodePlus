@@ -36,7 +36,8 @@ export interface AppSlashCommand {
   /** 额外搜索关键词；应同时包含中英文别名，保证两种输入习惯都能搜到。 */
   keywords?: readonly string[];
   /** 选中命令后立即执行的 UI 行为。 */
-  run: () => void;
+  recovery?: boolean;
+  run: () => void | Promise<boolean>;
 }
 
 const APP_SLASH_SUGGESTION_ID_PREFIX = "app-slash:";
@@ -90,10 +91,9 @@ export function normalizeSlashCommandValue(name: string): string {
 export function buildSlashSuggestions(commands: ZCodeSlashCommand[]): PromptInputSuggestionItem[] {
   return commands.flatMap((command) => {
     const value = normalizeSlashCommandValue(command.name);
-    // UI 曾同时维护内建白名单、GLM `/goal` fallback 和 v4 追加目录，
-    // CLI catalog 丢失时仍会显示部分命令，掩盖 `/init` 与自定义命令缺失。命令发现
-    // 统一以 CLI protocol catalog 为权威，UI 不再追加命令或维护内建白名单。
-    if (!value) {
+    // Plan 是 Composer 本地操作。旧 Agent 仍可能广播同名命令，不能让它重新
+    // 变成插入文本、等到发送时才切模式的旧入口；其余命令仍以 CLI catalog 为准。
+    if (!value || value.toLowerCase() === "plan") {
       return [];
     }
     return [

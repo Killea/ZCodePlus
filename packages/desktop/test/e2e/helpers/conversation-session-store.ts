@@ -33,6 +33,7 @@ export interface TaskStoreSnapshot {
 }
 
 export interface V4ComposerDraftScopeSnapshot {
+  editorStateJson: string | null;
   exists: boolean;
   mode: string | null;
   modelSelection: {
@@ -74,7 +75,20 @@ export function getV4ComposerDraftScopeSnapshot(
     (workspacePathArg, taskIdArg, workspaceIdentityArg) => {
       const scopeId = taskIdArg ?? "__draft__";
       const workspaceKey = workspaceIdentityArg?.trim() || workspacePathArg;
-      const storageKey = `zcode-v4-composer-drafts:v1:${encodeURIComponent(workspaceKey)}`;
+      const intentRaw = window.localStorage.getItem(
+        `zcode-composer-workspace-scope:v1:${JSON.stringify(["desktop", workspaceKey])}`,
+      );
+      const intent = intentRaw
+        ? (JSON.parse(intentRaw) as {
+            clientNamespace: string;
+            hostId: string;
+            projectId: string | null;
+          })
+        : null;
+      const storageKey =
+        taskIdArg === null && intent
+          ? `zcode-v4-composer-project-drafts:v1:${JSON.stringify([intent.clientNamespace, intent.hostId, intent.projectId])}`
+          : `zcode-v4-composer-drafts:v1:${encodeURIComponent(workspaceKey)}`;
       let draft: Record<string, unknown> | null = null;
       try {
         const raw = window.localStorage.getItem(storageKey);
@@ -102,6 +116,7 @@ export function getV4ComposerDraftScopeSnapshot(
       const providerId = typeof selection?.providerId === "string" ? selection.providerId : null;
       const modelId = typeof selection?.modelId === "string" ? selection.modelId : null;
       return {
+        editorStateJson: typeof draft?.editorStateJson === "string" ? draft.editorStateJson : null,
         exists: draft !== null,
         mode: typeof draft?.mode === "string" ? draft.mode : null,
         modelSelection:

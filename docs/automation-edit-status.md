@@ -4,6 +4,10 @@
 
 定时任务进入编辑页后，`Settings` tab 需要在表单顶部展示当前任务状态，方便用户在修改标题、计划和指令前确认任务是否仍在运行。
 
+月度间隔和年度月/日选择器 E2E 使用本地 Personal Provider，不依赖账号权益。
+这两条用例不得播种假 OAuth 身份，避免真实控制面拒绝假 Token 后用登录过期弹窗遮挡
+表单。测试仍通过真实 WebDriver 点击控件，不绕过弹窗或放宽可点击断言。
+
 ## 创建页默认标题的语言同步
 
 新建定时任务且未携带模板草稿时，Task title 使用当前界面的本地化默认标题。用户在创建页
@@ -367,16 +371,19 @@ Host admission
       +-- automationId / automation run id present
       |       -> automation turn
       |       -> deny CronCreate + CronUpdate + CronDelete
+      |       -> keep CronList + CronPauseSelf (current automationId only)
       |
       +-- no current-turn automation fact
               -> explicit user turn
+              -> hide CronPauseSelf
               -> do not query task metadata
               -> do not inherit historical cronAutomationId permissions
 
 Cron mutation tool execution
-      -> executor marks current automation turn
+      -> executor marks current automation turn + passes loop automationId
       -> CronCreate / CronUpdate / CronDelete handler: reject
       -> CronList handler: allow
+      -> CronPauseSelf handler: pause context.automationId only; reject when absent
       -> otherwise CronCreate additionally checks bound session
              -> automation/checkTaskBinding(targetTaskId)
                     -> workspace-scoped EXISTS query
@@ -393,6 +400,8 @@ Cron mutation tool execution
 - 三种写工具有两层独立 guard：provider 请求先隐藏 `CronCreate` / `CronUpdate` / `CronDelete`；即使
   旧入口或异常 provider 绕过可见性过滤，tool executor 仍把本轮 automation 事实传给 handler，三个
   handler 都必须在调用 `AutomationPort` 前拒绝。`CronList` 是只读查询，automation turn 仍可调用。
+  `CronPauseSelf` 只能暂停本轮所属任务，规则见
+  [automation 执行轮自暂停 CronPauseSelf](#automation-执行轮自暂停-cronpauseself)。
 - 普通 turn 的 `CronCreate` 另由 `AutomationPort` 通过专用的
   `automation/checkTaskBinding` 校验当前 session 是否已绑定任务。Host 只在当前 workspaceKey 内执行
   `target_task_id` 存在性查询，不读取或序列化完整 automation 列表；因此历史任务的标题、模型、权限
@@ -458,13 +467,17 @@ scheduled / manual automation turn
       |
       v
 tool denylist: CronCreate + CronUpdate + CronDelete
+kept tools   : CronList + CronPauseSelf
 ```
 
 - 工具 `description`、`modelInstructions` 和 prompt 字段 description 使用一致语义，明确禁止二阶调度。
+- 用户给出停止条件时（例如“发布成功后就不用再检查”），`CronCreate` 的 `modelInstructions` 要求模型
+  把停止条件写进 prompt，并写明“条件满足时调用 `CronPauseSelf`”。执行轮据此自行暂停，不需要
+  `CronUpdate` / `CronDelete`。
 - 不维护中英文关键词表，不因 prompt 出现 `CronCreate` 或“定时任务”等名词做运行时拒绝，避免误判
   诊断、文档和结果汇总任务。
 - 真正阻止 automation 执行轮修改任务定义的硬边界仍是 turn-scoped mutation tool denylist；
-  不能把模型描述当作权限边界。
+  不能把模型描述当作权限边界。`CronPauseSelf` 只能暂停本轮所属任务，不能修改定义。
 - 该约束不新增 desktop main、relay 或 Host 业务状态；桌面端继续使用 `desktop-continuous`，
   手机 `/remote` 继续使用 shared-host attachment 与 `web-remote-replayable` 恢复链路。
 
@@ -499,7 +512,7 @@ conversation CronUpdate
 - 任务必须属于当前 workspace；Host 使用
   `workspaceKey = workspaceIdentity?.trim() || workspacePath` 校验归属，找不到时返回错误。
 - 更新不改变 `automationId`、`targetTaskId`、workspace、session、model/provider/mode/Think、
-  `runCount` 或运行历史，也不负责暂停/恢复。
+  `runCount` 或运行历史，也不负责暂停/恢复。执行轮内的自暂停由 `CronPauseSelf` 负责。
 - cron、有限次数和生命周期重算继续由 `AutomationService.update` 负责；Agent 不复制领域逻辑。
 - 只切换 `recurring=true` 时只清理旧 `maxRuns`；若没有提交 `cron` / `scheduleRule`，必须保留既有
   `scheduleRule`（包括大于 12 个月的权威间隔），不能退化为候选日历 cron。
@@ -523,11 +536,13 @@ CronUpdate recurrence patch
 - 卡片已经是更新结果的权威 UI 摘要；模型成功调用 `CronUpdate` 后只做简短文字确认，不得再用
   `text` fenced code block 或伪文件卡片重复输出标题、时间、内容和状态。
 - automation 自己触发的执行轮不得管理任务定义；该轮必须隐藏
-  `CronCreate`、`CronUpdate`、`CronDelete`，只保留只读 `CronList`，避免任务自改、自删或递归创建。
+  `CronCreate`、`CronUpdate`、`CronDelete`，只保留只读 `CronList` 与只作用于本轮 automation 的
+  `CronPauseSelf`，避免任务自改、自删或递归创建。
   隔离范围必须以本轮携带的 `automationId` 或 automation run id 为准，不能因为 task metadata
   持久保存了 `cronAutomationId` 就把整个绑定会话永久降级为只读。
 - 用户在同一绑定会话中主动发起的新一轮属于普通用户轮，必须重新暴露 `CronUpdate` /
-  `CronDelete`，允许通过领域服务修改任务；`cronAutomationId` 只用于归属和展示，不能兼任工具权限。
+  `CronDelete`，并隐藏 `CronPauseSelf`，允许通过领域服务修改任务；`cronAutomationId` 只用于归属和
+  展示，不能兼任工具权限。
 - automation 定义的受支持修改路径是 `CronList` / `CronUpdate` / `CronDelete` 和
   `AutomationService`，由领域服务确保 cron、`scheduleRule`、`nextRunAt`、retry 与生命周期原子重算。
   Bash 直改 `~/.zcode/v2/tasks-index.sqlite` 属于不受支持的行为，但本版本不在 Bash handler 中用命令
@@ -539,16 +554,193 @@ same bound session
       +-- scheduled/manual dispatch turn
       |     automationId/runId present
       |       -> hide CronCreate/CronUpdate/CronDelete
+      |       -> keep CronList + CronPauseSelf
       |
       +-- later explicit user turn
             no automationId/runId
               -> expose CronUpdate/CronDelete
+              -> hide CronPauseSelf
               -> update through AutomationService
               -> supported path does not write tasks-index.sqlite from Bash
 ```
 
 - 该工具只增加会话中的写入能力，不改变 desktop `desktop-continuous` 与手机
   `web-remote-replayable` 的消息流、snapshot、queue 或 owner 语义。
+
+## 会话归档时暂停绑定任务
+
+状态：已实现归档联动。具体运行覆盖与未验证项见 [AAP 验收记录](testing/conversation-session-e2e-coverage-matrix.md#归档暂停定时任务aap2026-11-10)。
+
+归档会话时，原 Source 在同一 SQLite 事务内更新归档标记并暂停关联定时任务。用户之后可以主动开启任务，继续在原会话执行。
+
+### 关联范围与状态变更
+
+- 关联以原 Source、完整 `workspaceKey` 和 `targetTaskId` 为准。`workspaceKey = workspaceIdentity?.trim() || workspacePath`；不能只按任务 ID、目录、项目分组或会话展示用的单个 `cronAutomationId` 匹配。
+- 暂停该会话绑定的全部 `lifecycleStatus = active` 且 `enabled = true` 的定时任务，写为 `enabled = false`、`lifecycleStatus = paused`。已暂停、已完成、失败和已删除的任务不改变状态。
+- 暂停本身保留计划、`nextRunAt`、运行计数、会话绑定和运行历史。不删除定时任务，也不影响未绑定该会话的独立任务或其他工作区的同名、同 ID 任务。
+- 手动单条、批量、后台自动归档和现有工具、远控入口使用同一规则。保持各入口现有的归档准入、候选筛选和失败语义；后台自动归档不因存在绑定任务而排除会话。
+- 只有会话从未归档变为已归档时触发暂停。重复归档请求、列表读取、应用重启和后台再次扫描已归档会话，不得再次暂停用户主动开启的任务。只处理功能生效后的归档，不扫描或迁移历史已归档会话。
+
+```mermaid
+stateDiagram-v2
+    state "未归档 / 定时任务启用" as Active
+    state "已归档 / 定时任务暂停" as ArchivedPaused
+    state "已归档 / 定时任务启用" as ArchivedActive
+    state "未归档 / 定时任务暂停" as RestoredPaused
+    Active --> ArchivedPaused: 归档
+    ArchivedPaused --> ArchivedActive: 用户手动开启定时任务
+    ArchivedPaused --> RestoredPaused: 取消归档
+    RestoredPaused --> Active: 用户手动开启定时任务
+    ArchivedActive --> Active: 取消归档
+```
+
+取消归档不改变任何关联定时任务的启停状态。用户在自动化管理中手动开启任务后，即使原会话仍已归档，也允许继续调度；会话保持归档，不自动回到主页。取消归档后再次归档，会再次暂停当时符合条件的绑定任务。
+
+### 提交与在途执行边界
+
+归档联动由写入归档事实的权威端完成，不由 UI 先归档再逐个暂停。单个会话的归档标记与关联暂停须原子提交，全部持久化后才算成功；失败不留下「已归档但关联任务未暂停」的半完成状态。批量操作仍逐项返回结果，不扩大到其他 Source 或工作区。调度的启停依据继续是定时任务自身状态，不新增「已归档即禁止执行」的长期门禁，也不新增轮询补偿或暂停原因状态。
+
+暂停只阻止后续认领，不撤回已认领、已进入会话队列或正在执行的轮次。每个已认领轮次仍可按原路径执行，不因归档额外复制或重发；这不承诺归档后立即停止所有执行。
+
+```mermaid
+sequenceDiagram
+    participant S as 调度器
+    participant A as 归档权威端
+    participant C as 原会话
+    S->>S: 认领到期任务
+    A->>A: 持久化归档与关联暂停
+    S->>C: 已认领轮次仍可送达
+    S->>S: 后续扫描不再认领已暂停任务
+```
+
+在途轮次的派发回写继续记录实际计数和时间，但不得把已暂停任务重新启用。若该轮耗尽有限次数或到达结束条件，仍按既有规则收口为 `completed`，见[与 scheduler 回写的竞态](#与-scheduler-回写的竞态)。
+
+### 验收清单
+
+以下场景的实际覆盖以 AAP 验收记录为准。竞态使用显式调用顺序控制认领、归档提交和派发，不依赖固定等待时间。
+
+| 场景                                                         | 预期结果                                                                                      |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| 单条会话绑定多条启用任务，同时存在暂停、完成、失败和独立任务 | 归档后，全部匹配的启用任务变为暂停；配置、绑定和历史保留，非目标任务不变                      |
+| 取消归档、手动开启、再次归档                                 | 取消归档保持暂停；手动开启后可调度；再次归档重新暂停                                          |
+| 会话已归档时手动开启任务，再重复归档请求、扫描或重启         | 会话仍已归档，任务保持用户开启状态，不重复施加暂停                                            |
+| 功能生效前已归档的会话仍有启用任务                           | 启动、刷新和自动扫描不追溯暂停；取消归档后再次归档才按新规则处理                              |
+| 手动、批量、工具及后台自动归档                               | 都在新归档成功时暂停匹配任务；保持现有运行中归档限制、候选范围和逐项结果                      |
+| 本地与在线远端存在相同任务 ID、相同目录或不同工作区身份      | 仅原 Source 内完整身份匹配的绑定任务变化；远控继续走既有 attachment，离线不改写本机同 ID 任务 |
+| 先归档提交、后调度认领                                       | 未被认领的暂停任务不再触发                                                                    |
+| 先认领、后归档，再派发；以及输入已排队或正在执行             | 已认领轮次可完成，后续不再认领；回写不重新启用任务，有限任务耗尽后可转为完成                  |
+| 归档或关联暂停持久化失败、批量部分失败                       | 单个会话的归档与暂停一同回滚；不误改非目标任务，批量结果准确反映各项成功或失败                |
+
+已有暂停、自暂停和运行中禁止归档的覆盖不能代替上述联动验收。联动验收扩展现有归档 E2E，保留桌面与手机各自的 continuous/replayable 边界，不新增 App 业务单测。
+
+本次不改变会话删除规则，也不新增执行通知、蓝点或自动化管理界面。归档入口及路由约束见[归档管理](superpowers/specs/2026-09-11-archive-management.md)。
+
+## automation 执行轮自暂停 CronPauseSelf
+
+用户创建定时任务时常给出停止条件，例如“发布成功后就不用再检查”。automation 执行轮看不到
+`CronUpdate` / `CronDelete`，因此提供只作用于本轮所属任务的暂停工具 `CronPauseSelf`：执行轮判断
+停止条件已满足时调用它，任务停止按计划派发；任务定义与运行历史保留，用户可在列表页恢复。
+
+```text
+CronPauseSelf
+  input  : {}            strict；模型不能传 id，也不能指定其它任务
+  target : ToolExecutionContext.automationId
+             <- core RegularTurnLoopState.automationId
+             <- Host admission（显式 automationId；busy queue 提升时由 run id 前缀还原）
+  output : { paused, id, message }
+  policy : automation.pause / riskLevel low / 无需审批 / sideEffectScope workspace / deferred
+```
+
+- Host 先使用显式 `automationId`；载荷没有该字段时，只能从 canonical automation run `inputId`
+  的首段恢复。Host 必须把解析后的 `activeAutomationId` 传给 Core。busy queue 只保存该 canonical
+  `inputId` 为 `sourceCommandId`，提升后重新经过同一个解析函数；pending event/projection 不新增第二套
+  automation 身份状态。普通用户轮不得根据历史 metadata 恢复该身份。
+- 目标身份只有一个来源：本轮 loop state 的 `automationId`。executor 把它传入 handler context；
+  handler 读不到时返回 PermissionDenied，不调用 `AutomationPort`。不从 task metadata、会话历史的
+  `cronAutomationId`、queryId 前缀或 denylist 兜底信号推断目标。
+- 工具只暂停，不删除，也不修改定义。暂停无需审批：它只影响本轮所属任务，用户可在列表页恢复。
+
+### 可见性
+
+| 本轮类型                                        | loop `automationId`    | `CronPauseSelf`          | `CronCreate/Update/Delete` |
+| ----------------------------------------------- | ---------------------- | ------------------------ | -------------------------- |
+| 定时触发 run                                    | 有                     | 暴露                     | 隐藏                       |
+| 立即运行 manual run                             | 有                     | 暴露                     | 隐藏                       |
+| 绑定会话中的普通用户轮                          | 无                     | 隐藏                     | 暴露                       |
+| 只有 queryId 前缀或 denylist 兜底信号的轮       | 无                     | 隐藏                     | 隐藏                       |
+| automation 输入 guide 合并进正在运行的用户 loop | 无（沿用 active loop） | 隐藏                     | 隐藏                       |
+| subagent                                        | 无                     | 隐藏                     | 按原规则                   |
+| remote workspace                                | —                      | 隐藏（session denylist） | 隐藏                       |
+
+- 可见性只是第一层；handler 的 `automationId` 校验是硬边界。
+- `CronPauseSelf` 不加入 automation mutation tool 名单（core、bootstrap、Host 三处）。该名单在执行轮
+  整体隐藏，core 还用“名单全部在 denylist 中”作为 automation 轮的兜底判据；加入后执行轮看不到暂停
+  工具，旧 Host 下发的三项 denylist 也无法再触发兜底。
+- remote workspace 的 Cron 工具统一由 session denylist 隐藏，`CronPauseSelf` 同样加入该名单。
+
+### 条件暂停
+
+```text
+automation/pause { automationId }        workspace 由 Host 按 session 注入
+  -> AutomationService.pause(automationId, scope)
+  -> UPDATE automations
+       SET enabled = 0, lifecycle_status = 'paused'
+       WHERE automation_id = ? AND workspace_key = ?
+         AND lifecycle_status = 'active' AND enabled = 1
+  -> changes > 0 ? { paused: true } : { paused: false }
+```
+
+- 只有 active 且 enabled 的任务会被暂停。已暂停、completed、failed、已删除或不属于当前 workspace
+  的任务返回 `paused: false`，不改任何字段，不能把终态改成 paused。
+- 暂停保留 `nextRunAt`、`runCount`、schedule 派发计数、`targetTaskId` 与运行历史，与列表页暂停一致；
+  恢复沿用列表页的 `setEnabled(true)`。列表页 `setEnabled` 保持原语义，不改为条件写。
+- 暂停不取消正在执行的本轮。工具返回后，模型简短说明暂停原因。
+
+### 与 scheduler 回写的竞态
+
+scheduler 在独立 utilityProcess 中用自己的数据库连接回写派发结果；Host 的暂停写入走另一条连接。
+本轮在 admission 时就开始执行，所以 `CronPauseSelf`（或用户在列表页点暂停）可能先于 scheduler 的
+`markDispatched` 落库：
+
+```text
+scheduler (conn A)          Host (conn B)                    agent turn
+claimDue: running=1
+dispatch request ---------> CronRun -> sendPrompt ---------> admission, turn starts
+                            <- admission resolved
+<-- CronRunResult
+markRunDispatch                                              model calls CronPauseSelf
+repo.get / compute next     automation/pause <--------------
+                            enabled=0, paused
+markDispatched
+  旧：无条件写 active + enabled=1   => 任务被复活
+  新：同一条 UPDATE 内按当前行决定   => 保持 paused
+```
+
+`markDispatched` 的启停字段在同一条 UPDATE 内读取当前行，不依赖之前 `getRow` 的快照：
+
+```text
+lifecycle_status = 'completed'      if this dispatch reached maxRuns / endAt
+                 = keep current     if enabled = 0
+                 = 'active'         otherwise
+enabled          = 0 if completed, otherwise keep current
+next_run_at      = NULL if completed, otherwise the computed next run
+```
+
+- completed 优先于 paused：本次派发已用完有限次数或越过结束时间时，任务仍收口为 completed。
+- 已暂停的任务仍记录本次派发：`runCount`、schedule 派发计数、`lastRunAt`、`nextRunAt` 照常推进，
+  `running` 照常释放。
+- manual run 的回写不改启停字段，不需要调整。
+
+### 兼容与展示
+
+- 新 CLI 连接旧 Host 时，`automation/pause` 返回 JSON-RPC `-32601`；工具按普通错误返回模型，不回退到
+  其它写接口。
+- 暂停不推送列表变化：列表页在挂载和手动刷新时读取最新状态，与 `CronUpdate` / `CronDelete` 一致。
+  会话中只展示通用工具行，不新增结果卡片。
+- 已知限制：scheduler 在 admission 后释放 `running`。执行轮耗时超过调度间隔时，下一次 run 可能已经
+  进入同一会话的队列；之后的暂停不撤回这条已排队输入，它仍会执行一次。列表页暂停有同样的限制。
+- 不新增 desktop main、relay 或 Host 业务状态；桌面 `desktop-continuous` 与手机
+  `web-remote-replayable` 的消息流、snapshot、queue 和 owner 语义不变。
 
 ## 一次性日历任务错过目标分钟
 

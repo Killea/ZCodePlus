@@ -32,15 +32,21 @@ export type SeedReplayProviderModel =
       readonly id: string;
       readonly limit?: { readonly output?: number };
       readonly maxOutputTokens?: number;
+      readonly reasoningLevel?: PersonalModelConfigSeed["reasoningLevel"];
     };
 
 export interface PersonalModelConfigSeed {
+  readonly enabled?: boolean;
+  readonly reasoningLevel?: NonNullable<
+    ConstructorParameters<typeof ModelOptionSpecsConfig>[0]
+  >["reasoningLevel"];
   readonly contextWindow?: number;
   readonly id: string;
   readonly inputModalities?: readonly ("text" | "image" | "pdf" | "video")[];
   readonly maxOutputTokens?: number;
   readonly supportsJsonSchemaOutput?: boolean;
   readonly supportsToolCall?: boolean;
+  readonly supportsMidConversationSystem?: boolean;
 }
 
 export interface PersonalProviderConfigSeed {
@@ -97,7 +103,11 @@ export async function seedPersonalProviderConfig(
       }),
       models: provider.models.reduce(
         (rules, model) =>
-          rules.setExact(provider.id, model.id, modelConfigFromSeed(model, provider.apiFormat)),
+          rules.setExact(
+            provider.id,
+            model.id,
+            modelConfigFromSeed(model, provider.apiFormat, provider.enabled ?? true),
+          ),
         current.models.deleteExactForProvider(provider.id),
       ),
     }));
@@ -109,10 +119,14 @@ export async function seedPersonalProviderConfig(
 function modelConfigFromSeed(
   model: PersonalModelConfigSeed,
   apiFormat: ProviderApiType,
+  enabled: boolean,
 ): ModelConfig {
   const inputs = new Set(model.inputModalities ?? ["text"]);
   const maxOutputTokens = model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   return new ModelConfig({
+    // SSH 目标保留自己的 Built-in；通用 fixture 必须自行提供完整执行事实，不能靠本机补全。
+    // 模型禁用必须写正式 enabled；旧 visibility 字段会被 schema 丢弃，让过滤用例误测可用模型。
+    enabled: enabled && model.enabled !== false,
     properties: new ModelPropertiesConfig({
       requiresMfjsToolSchema: false,
       contextWindow: model.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
@@ -127,9 +141,10 @@ function modelConfigFromSeed(
       supportsToolCall: model.supportsToolCall ?? true,
       supportsJsonSchemaOutput: model.supportsJsonSchemaOutput ?? false,
       supportsNativeWebSearch: false,
-      supportsMidConversationSystem: false,
+      supportsMidConversationSystem: model.supportsMidConversationSystem ?? false,
     }),
     optionSpecs: new ModelOptionSpecsConfig({
+      reasoningLevel: model.reasoningLevel ?? { values: ["disabled"], map: "{}" },
       maxOutputTokens: {
         max: maxOutputTokens,
         map: maxOutputTokensMap(apiFormat),

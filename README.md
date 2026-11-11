@@ -9,7 +9,7 @@
 
 **ZCodePlus** 是 [ZCode](https://zcode.z.ai) 开源项目的社区增强版。ZCode 是 AI 编程工作台，提供桌面应用、浏览器界面和终端 Agent；ZCodePlus 在保留官方完整功能（客户端、后端服务、共享 UI、Agent CLI 与运行时源码）的基础上，叠加了一批面向**自托管 / 本地推理模型**场景与 macOS 桌面体验的改进。
 
-> 基线说明：本仓库基于官方 ZCode 开源代码（初始基线 commit `872ad96`，"feat: open source"）构建，并已跟进上游 `zai-org/ZCode` 至 v3.15.1（commit `aac4755`）。相对官方版本的全部改动见下文「[与官方 ZCode 的区别](#与官方-zcode-的区别)」。应用与 CLI 的产品名（ZCode / ZCode Preview / `zcode` 命令）保持不变，ZCodePlus 仅指本仓库这一工程。
+> 基线说明：本仓库基于官方 ZCode 开源代码（初始基线 commit `872ad96`，"feat: open source"）构建，并已跟进上游 `zai-org/ZCode` 至 v3.18.0（commit `b95ebaf`）。相对官方版本的全部改动见下文「[与官方 ZCode 的区别](#与官方-zcode-的区别)」。应用与 CLI 的产品名（ZCode / ZCode Preview / `zcode` 命令）保持不变，ZCodePlus 仅指本仓库这一工程。
 
 ## 与官方 ZCode 的区别
 
@@ -45,6 +45,13 @@
 
 ## 更新
 
+- **2026-11-11**：更新至 ZCode v3.18.0 版本。
+- 2026-11-03：更新至 ZCode v3.17.2 版本。
+- 2026-10-30：更新至 ZCode v3.17.1 版本。
+- 2026-10-29：更新至 ZCode v3.17.0 版本。
+- 2026-10-19：更新至 ZCode v3.16.2 版本。
+- 2026-10-16：更新至 ZCode v3.16.1 版本。
+- 2026-10-16：更新至 ZCode v3.15.4 版本。
 - 2026-10-10：更新至 ZCode v3.15.1 版本。
 - 2026-9-23：更新至 ZCode v3.14.3 版本。
 
@@ -136,6 +143,8 @@ Web 模式默认工作目录为当前目录，监听 `127.0.0.1`，默认不启�
 构建方式见下方打包章节。`pnpm build:zcode` 只生成发行包，不会替换 `PATH` 中已有的 `zcode`。如果命令仍指向旧安装或其他源码目录，macOS / Linux 可用 `command -v zcode` 检查，Windows 可用 `where.exe zcode` 检查。
 
 ### CLI 源码开发
+
+CLI 的模型配置、非交互调用、工具与扩展、批量评测和轨迹记录见 [CLI 使用指南](apps/zcode-cli/docs/usage/README.md)。
 
 直接开发 TUI 或 Agent 时，运行源码入口：
 

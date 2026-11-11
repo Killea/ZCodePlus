@@ -1,13 +1,20 @@
 {
   "version": 1,
   "caseName": "conversation-session-ask-user-question-custom-enter-multi-question",
-  "spec": "./test/e2e/conversation-session/conversation-session-ask-user-question-custom-enter-multi-question.test.ts",
+  "spec": "./test/e2e/conversation-session/permissions/conversation-session-ask-user-question-custom-enter-multi-question.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-ask-user-question-custom-enter-multi-question.json"
   ],
   "fileFixtures": [],
   "requests": [
+    {
+      "id": "conversation-session-ask-user-question-custom-enter-multi-question-title-sidecar",
+      "kind": "common",
+      "source": "synthetic",
+      "timingPolicy": "fast-text",
+      "syntheticReason": "隔离回放抓包确认标题旁路缺少响应；为本例提供非流式 JSON 标题，避免 Missing Fixture 或依赖共享旧池。"
+    },
     {
       "id": "upstream-conversation-ask-user-question-custom-enter-multi-question-call",
       "kind": "main",

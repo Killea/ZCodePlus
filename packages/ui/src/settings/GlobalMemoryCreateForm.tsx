@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { TID_SETTINGS_GLOBAL_MEMORY_CREATE } from "@zcode/shared";
+import { TID_SETTINGS_GLOBAL_MEMORY_CREATE } from "@zcode/shared/test-ids";
 import { Button } from "@/components/ui/button.js";
 import { Input } from "@/components/ui/input.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";

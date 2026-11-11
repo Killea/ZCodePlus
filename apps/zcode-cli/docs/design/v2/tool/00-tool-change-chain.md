@@ -1,10 +1,689 @@
 # Tool Change Chain Spec
 
+工具 schema、顺序与描述是固定字节（tools 段字节进入缓存前缀）：`toToolJsonSchema` 按
+zod v4 toJSONSchema 的 key 顺序输出——`$schema` 在最前，`description`、`default` 在 `type` 前，
+数组的 `minItems`/`maxItems` 在 `type` 前，属性声明顺序不变；ToolSearch 输入 schema 走同一入口。
+SendMessage、ToolSearch 进入按名字排序的工具名单；名单外的工具按注册顺序排在名单之后；
+MCP 工具（名称以 `mcp__` 开头）按名字排序排在最后，顺序与 server 连接顺序无关。名字一律按 en-US 规则比较，
+顺序与进程的语言设置无关（同一会话换语言设置恢复时 tools 段字节不变）。WebSearch
+描述不写真实月份。Bash/Read/Skill/WebFetch/Agent 描述为固定文本，只说明已支持的能力
+（fork/后台/目录作用域 skill、署名行、Jupyter、teammate/cross-session、worktree 等未支持，不出现在描述里）。
+只改请求投影，不改变执行、权限或持久化；升级后第一个请求的 tools 段缓存失效一次。
+
+工具结果文本（2026-10-18）：Read 去重只比较该文件最近一次 Read 视图；空内容警告按读取结果区分；
+部分视图的页长按比例估算，提示改为 `read_truncation_notice` 附件，排在该批 tool result 之后；
+未知工具名统一为 `<tool_use_error>Error: No such tool available: X</tool_use_error>`；
+其他工具错误给模型原文（保留换行，超过 1 万字符保留头尾）；Bash 失败结果头尾截断、不落盘，
+超时转后台的文案说明超时秒数。只改模型可见文本和投影，工具 schema、权限、事件与 UI 不变；
+已发送的历史不改写，只有新产生的结果使用新文本。细节见 01-read.md、04-bash.md。
+SendMessage 的 summary 改为可选、超长截断；Agent 描述的后台一行补上 "Never fabricate or predict a pending agent's results…" 一句
+（ZCode 默认前台运行，后台说明只写这一行）。tools 段升级后缓存失效一次；细节见 07-subagent.md。
+后台 agent 终态通知的文本与 `originMeta.subagentResult` 结构化结果见 07-subagent.md；App 不解析 summary 文本，
+Agent 卡片的“执行失败”hover 仍只显示原文；只影响新产生的通知，已发送的历史不改写。
+
+- 胶囊单项停止 Agent：模型可见 `Agent`/`TaskStop` schema 不变；runner 在子任务启动事件中
+  提供真实 task 与本次执行身份，V4 `subagents.running.stopControl` 只投影当前 runtime 可操作
+  能力，冷恢复不得从历史 agentId 补造。App 的 `stopSubagent` 命令由父会话 runtime 校验归属、
+  执行身份和运行态，调用原 `SubagentPort.stopTask`；前台回原工具调用停止结果、不发后台通知，
+  后台保留 killed 通知。迟到 Stop 不能停止同一 agentId 的 SendMessage 新执行，完成/停止只提交
+  一个终态。停止产物写入失败不得阻断目标取消与终态事件，事件收口后仍向调用方报告原始
+  文件错误。UI 只显示明确能力，不再从 backgroundWorks 猜测；详情目录不加停止入口。
+  端到端行为见根目录 `docs/subagent-session-directory.md`。
+  运行时校验（2026-10-20）：Bash 超时转后台的 `timedOutAfterMs` 与输入 `timeout` 一样允许小数；
+  SendMessage 只有空白的 message 在 hook 与权限之前判为输入错误（child 只收到 message），模型收到 `<tool_use_error>message must not be empty</tool_use_error>`。provider schema 与 tools 段字节不变。
+  工具 Hook 上下文（2026-10-21）：`PreToolUse` / `PostToolUse` / `PostToolUseFailure` 返回的 additionalContext
+  不再拼进 tool_result。executor 把每条 context 写成 `<Event>:<ToolName> hook additional context: <context>`
+  （例如 `PreToolUse:Bash hook additional context: …`），放进 `ToolExecutionResult.hookAdditionalContexts`；
+  结算把每条写成一个 `tool_hook_context` 附件，排在这批 tool result 之后、其他批次提示之前，按 tool result 的顺序分组，
+  同一工具 Pre 在前，多个 Hook 不合并、多行原样保留。tool_result 只放工具原文：失败时与没有 Hook 时是同一段错误原文，
+  Hook 文本也不占 tool result 预算。MCS 下这些附件和同批其他附件合成同一条 system；非 MCS 下按普通 user 侧提醒投影。
+  附件持久化，resume 后位置不变。`tool_call_result` 事件和 App 工具卡不再含 Hook 文本；官方 CUA 帧凭据过滤保留。
+  Memory 后台循环（Extraction、Dream）用同一个 `toolBatchModelEntries` 生成这批 entries，批次提示照常送达；
+  它的 executor 不配置 hooks，所以没有 Hook 上下文（见 [Memory](../memory/README.md)）。
+  单条 context 超过 10000 字符时先落盘，附件里只放 `<persisted-output>` 外壳；落盘失败时截到 10000 字符并附原因
+  （规则见 hooks.md「聚合规则」）。
+
+## Agent 同步失败附部分报告与 agentId（2026-11-09）
+
+child 事件 → `runExploreAgent` 请求的 `onEvent` → runner 收集本次运行、本 child session 的 `ModelComplete` 与 `model_request_failed` → child turn 报错、task 记 failed
+→ 抛出的错误带 `AgentFailureHandback`（contracts `tools/agent.ts`，不可枚举属性，不在 `context` 里）→ executor handler 失败分支调用
+`ToolEntry.formatErrorModelContent`，经 `createErrorResult` 的 `modelNote` 接在模型可见原文之后 → `ToolExecutionResult.modelContent`
+→ tool part `metadata.modelContent` 持久化，冷恢复重放。
+原来父模型只收到 provider 原文（如 429），拿不到 agentId，已经跑了几十步的子代理无法用 SendMessage 续接：runner 只把 agentId 写在
+wrapper 的 `context` 里，executor 不把 `context` 给模型；子 turn 的错误本身是 CoreError 时还直接透传，连 wrapper 都没有。现在只给模型的文本
+在原文后追加截断说明与部分报告（本次运行有正文时；取正文规则与"同步报告"相同）、`agentId` 行和 `<usage>`。交接数据作为不可枚举属性
+直接加在原错误上，不复制错误、不加 wrapper 层，错误身份与 stack 不变（复制会丢 stack：Node 的 `stack` 是读原对象内部槽的 accessor），
+所以 `error.message` / `code` / `detail` / `stack`、`tool_call_error` 事件、Agent 卡片的
+"执行失败"与 hover 都不变；部分报告不进 `context`，日志里没有它；`message-mapper` 发给 App 前剥掉 `modelContent`。工具 schema、描述、
+权限、registry / metadata / `SubagentStopped` 的 failed 状态都不变；只影响新产生的结果。回归覆盖：子代理写过正文后模型请求失败，
+父模型看到原文、截断说明、部分报告和 `agentId` 行，UI 摘要只有原文；没有正文时只追加 `agentId` 行和 `<usage>`；CoreError 透传时错误对象与
+stack 不变、wrapper 分支同样带交接；watchdog 超时追加且类型仍是超时；启动前失败与用户停止不追加；父模型用拿到的 agentId 经 SendMessage
+续接子代理；用量计入已计费的失败请求，其他 session 的事件不算。规则见 07-subagent.md「同步失败」。
+
+后台运行（显式后台、前台转后台、SendMessage 续接）失败时用同一个收集器：`finalizeBackgroundFailure` 取本次运行最近一段非空 step 正文写进
+失败通知的 `<result>`，不套框架、不加截断说明，没有正文时不写；`task-id` 就是 agentId。原来失败通知不带 `<result>`，后台子代理跑了很多步后
+失败，父模型拿不到已写出的正文。App 侧共享解析器 `parseZCodeBackgroundTaskNotifications`（`packages/shared`）对 failed 且带 `<note>` 的块
+丢弃 `<result>`：只有 local agent 通知带 `<note>`；合并轮没有结构化 error，App 的失败原因会依次退到 `result`，不丢弃时 hover 显示的是半截正文
+而不是失败原因。workflow 失败通知不带 `<note>`，它的 `<result>` 照常读取。回归覆盖：core 后台失败通知带部分报告、没有正文时不带；BG26 合并
+通知用例里先写正文再 429 的子代理，父模型收到的通知带这段 `<result>`，失败 hover 不出现它。规则见 07-subagent.md「后台终态通知」。
+
+## Agent 空报告回退到最近一段正文（2026-11-09）
+
+child turn → `runAgentToCompletion` → `AgentCompletedOutput.content` → Agent 工具结果 / 后台 task-notification：
+报告原来只取 `TurnResult.response`，即最后一个模型 step 的正文。报告写在带工具调用的 step、最后一步只回空
+正文时，父会话收到 "(Subagent completed but returned no output.)"，只能再用 SendMessage 唤醒补发。现在
+最后一步正文为空时，从本次运行的 `ModelComplete` 事件倒序取最近一个非空 `content`，与 usage 汇总读同一份事件；
+只认子代理主循环的 step（`querySource: "subagent"`，与 `querySourceForTask` 共用 `SUBAGENT_QUERY_SOURCE`），
+轮中压缩等 sidecar 请求写的 `ModelComplete` 不算，压缩摘要不会被当成报告，压缩前的报告仍能取到。
+只取正文，不取 reasoning。全部为空时仍用原空报告文案。首次运行与 SendMessage 恢复走同一入口；前台工具结果、
+后台通知 `<result>`（App 用它更新后台 Agent 工具卡内容）与输出文件读同一份报告。取消与报错仍由 `executeTurn`
+抛错，不经过回退。工具 schema、描述、权限、事件与 App 协议不变；只影响新产生的结果。回归覆盖子代理先写报告再调用工具、最后一步空正文时
+父会话拿到该报告，以及轮中自动压缩后最后一步为空时拿到压缩前的报告而不是摘要。规则见 07-subagent.md「同步报告」。
+
+## SendMessage 声明为只读（2026-11-09）
+
+`sendMessageToolEntry.metadata.readOnly` → `PermissionService.resolveCapability` → Plan 闸门：`SendMessage` 改为
+`readOnly: true`，与 `Agent` 一致，Plan 下由 `mode.plan.readOnly` 放行。原来被 `mode.plan.nonReadOnly` 拒绝，父会话
+在 Plan 下无法唤醒已结束的子代理补发报告，07-subagent.md 里"恢复的子会话进入 Plan"的路径从模型侧到达不了。
+恢复已结束的子代理时子会话模式按父会话当前状态重算；给运行中的子代理发消息只投递消息，该子代理仍按启动时的
+模式执行，Plan 不约束它（已接受的行为变化）。其他模式的判定
+结果不变（原来经 `mode.build.sessionState` 放行，现在经 `mode.build.readOnly`）；调度仍由 `concurrentSafe`
+决定；流式提前执行要求 `sideEffectScope: "none"`，SendMessage 是 `"session"`，不受影响。`readOnly` 不进入
+provider 请求，tools 段字节不变；工具名、schema、描述、`permission` 声明与 App 协议不变。`ToolCallStarted`
+载荷（来自 executor 的 `resolveToolCallCapabilityFlags`）与工具用量遥测（turn-tool-usage / usage-observability）里 SendMessage 的
+`readOnly` 随之变为 `true`，`sideEffectScope` 仍是 `"session"`；bootstrap session-mapper 发给 App 前剥掉这两个
+字段，App 收到的事件不变；动态工作流按 scope 判定，也不受影响。回归覆盖 Plan 父会话
+经模型调用 SendMessage 恢复已结束的子代理：调用放行，子会话在 Plan 下拒绝写命令。规则见根目录
+`docs/plan-mode-approval-boundary.md`。
+
+## 工具 part 的块顺序（2026-11-03）
+
+ToolPart 新增可选 `blockIndex`，与 text / reasoning part 共用一次模型响应里的块到达序号。pending、
+running、completed / error 每次写入都必须带上调用对象的 `blockIndex`：`savePart` 的冲突更新整体替换
+`data`，漏写一次整条消息就按旧消息处理，排序回到改动前的布局，而且不报错、不打日志。新增 tool part
+写入点时按这一条检查。`declarationIndex` 不再写入，只在旧数据里读取。session-store 读取时对有序消息
+按 `blockIndex` 重排块 part；冷恢复按 `blockIndex` 恢复工具调用和结果的顺序；live 在
+`executeToolCallsForModelStep` 按同一个 `blockIndex` 顺序调度、执行并提交结果；浏览器轮尾截图 tool part
+不进入模型历史。工具 schema、权限、事件和 V4 协议字段不变。详见
+[Assistant 内容块顺序](../model/assistant-block-order.md)。
+
+## CMD 自动授权收紧（2026-11-09）
+
+session 固定的 `bashShellSelection` → Bash runtime capability / command permission policy →
+既有审批 → ExecutionPort。明确选择 `cmd` 或 `legacy-shell` 时，不再用 Bash AST 授予只读免审批，
+也不通过其 prefix/wildcard 推导自动 allow；授权建议只保留完整命令。根因是 Bash 会将 `#` 后的
+CMD 命令当成注释，使审批看到的操作少于实际执行的操作。能力事件也传递同一 shell 选择。
+Build/Edit 无明确授权时请求审批，Plan 拒绝；完整命令授权、工具级显式授权及 yolo/guarded
+的既有模式语义保持不变。deny/ask 的既有规则匹配保留，本次不扩展 CMD 解析器，不能据此宣称
+已支持完整 CMD 子命令 deny 匹配。POSIX/Git Bash 和未传 selection 的旧内部调用沿用原行为。
+不改工具 schema、命令执行、权限事件字段或桌面/手机投影。回归覆盖截图形式的命令、普通只读
+CMD、前缀/通配授权不放行、完整授权、Plan 拒绝、审批拒绝前执行端零调用以及能力事件。
+细节见 [Bash](04-bash.md#权限模型)。
+
+## Bash 注入会话上下文环境变量（2026-11-01）
+
+Bash handler → `createExecutionRequest` → `ExecutionRequest.env.set`：每次 Bash 调用（前台、显式后台、
+超时转后台）都设置 `CLAUDE_CODE_SESSION_ID` / `CLAUDE_SESSION_ID` / `ZCODE_SESSION_ID`（当前会话 ID）与
+`CLAUDE_PROJECT_DIR` / `ZCODE_PROJECT_DIR`（会话工作区根目录 `workspaceRoot`），其余变量仍按 adapter 默认
+继承。原因：自定义命令的 `!` 块改为转交模型经 Bash 执行（[custom-commands.md](../custom-commands.md)
+「Dynamic expansion」），原来只由命令解析阶段的 shell 执行器提供这组变量；插件脚本（例如在自身进程里
+读取会话 ID 区分会话的 stop hook 状态文件）需要在 Bash 里拿到同样的值。变量名与值与 hooks 的
+`createPluginEnvOverlay` 一致。工具名单、schema、描述、权限判定与 App 协议不变。回归覆盖 Bash 请求带上
+这组变量，以及桌面 E2E 中转交执行的命令读到当前会话 ID 与工作区路径。
+
+## 内置 Explore 继承父会话权限（2026-10-31）
+
+Agent 工具 → runner → `resolveSubagentPermissionMode`：内置 Explore 不再固定 yolo，与其他 profile 一样
+继承父会话模式与 Plan 状态；子会话改用父会话的 `PermissionService`（allowedTools、disallowedTools、
+会话内授权随之生效），不再新建默认配置的实例。Explore 的 Bash 由 shell AST 判定只读：只读命令放行，
+非只读命令在父会话 build/edit 下请求审批并代理回父会话，在 Plan 下拒绝，在 yolo 下放行，在 guarded 下
+命中危险命令规则时单次确认、其余放行；WebFetch
+同样按父会话模式判定。修复原因：Explore 只靠 prompt 约束只读，提示注入后模型可经 `Agent(Explore)`
+在 build 或 Plan 父会话下免审批执行任意 Bash。工具名单、schema、描述与 App 协议不变。回归覆盖父会话
+build、build + Plan、yolo 下 Explore 的 Bash/WebFetch 判定与是否执行，以及父会话审批卡片的 E2E。
+
+`SendMessage` 恢复已结束的子会话时同样按父会话当前的模式与 Plan 状态重算子会话模式：子 runtime 以新算的
+`{ mode, planEnabled }` 调用 `resumeFromStore`（`executionStateOverride`），覆盖落盘的执行状态。恢复路径曾沿用
+落盘模式，父会话从 yolo 改为 build 后，恢复的子会话（含升级前落盘为 yolo 的 Explore）仍免审批执行命令。
+回归覆盖 yolo→build、build→Plan 与 Explore 的恢复。
+
+## Plan 模式只在原模式之上收紧（2026-10-31）
+
+tool executor → `checkStaticToolPermission` → `PermissionService.checkPermission`：disallowedTools、
+项目 deny/ask 之后，`planEnabled` 先过 Plan 闸门，再走原模式判定。闸门只直接放行只读免审批工具
+与声明 `allowedInPlanMode` 的会话控制工具；需审批的只读工具（WebFetch、`readOnlyHint` MCP）交给
+原模式；非只读、非 destructive 的 MCP 在原模式 yolo/guarded 下交给原模式，其余原模式下返回
+`mode.plan.mcp` 询问并带 `optionsPolicy: "no-always-allow"`，排在 allow 规则之前；其他非只读工具
+与 destructive MCP 仍为 `mode.plan.nonReadOnly` 拒绝。闸门没拒绝时，guarded 的危险命令单次确认
+（`userApprovalRule`）在原模式判定前生效，不被 Plan 跳过。executor 把判定里的 `optionsPolicy` 合并进
+审批请求，v3/v4 投影据此去掉"始终允许"与"完全访问"。原实现在 Plan 下替换原模式且不看
+`needsApproval`，WebFetch 与 MCP（含宿主 `node_repl` 的 `js`）在 Plan 下比 build 更宽。
+工具 schema、描述、注册、App 协议字段不变。回归覆盖 Plan×原模式判定矩阵、allow 规则不能跳过
+MCP 询问、审批请求不带始终允许，以及 `EnterPlanMode` 后调用 MCP 先请求审批。
+规则见 [Plan Mode Approval Boundary](../../../../../../docs/plan-mode-approval-boundary.md)。
+
+## 插件 Agent 权限模式只能收紧（2026-10-31）
+
+插件 agent 文件（默认 `agents/` 与 manifest `agents` 声明的目录）→ `loadPluginAgentTemplates` 保留 frontmatter `permissionMode` 并标记
+`permissionModeRestrictOnly` → 名称空间与裸名别名（同一 profile 展开）→ Agent 工具 runner
+→ `resolveSubagentPermissionMode` 先按声明映射子会话模式，再由 `restrictPermissionMode`
+与父会话模式比较，取更严格的一个。严格程度从严到宽为 plan、build、edit、guarded、yolo；
+`bypassPermissions`、`dontAsk` 对应 yolo，因此插件声明不能放宽；`auto` 未实现，按继承处理。
+官方与第三方插件同一规则。用户级 profile 按声明生效，项目级 profile 仍在解析时剥离。
+标记只存在于 CLI 进程内的 `AgentProfile`，不进入 Host→CLI 的 `agentProfileSchema`。
+工具 schema、描述、App 协议和 UI 投影不变。回归覆盖严格度矩阵，官方/第三方插件的
+`bypassPermissions`、`dontAsk`、`acceptEdits`、`plan`、`auto` 五种声明值与两种调用名，以及父会话 build 时插件 `bypassPermissions` 子会话的 Bash 仍请求审批。
+规则见 [项目配置信任边界](../../../../../../docs/security/deep-link-project-trust-boundary.md)。
+
+## 官方命令环境包装保留 Bash 后台能力（2026-10-28）
+
+Bash handler → `withOfficialCommandEnv` 注入会话环境 → 原执行器
+`runBashWithBackgroundLifecycle` → 原有后台任务登记、输出与完成通知。
+包装层复用 core 公开的能力接口与检测函数，只在底层支持时暴露对应方法；显式后台和超时转后台
+均保留原模式、取消信号、事件回调、结果与错误。后台状态仍由原执行器唯一管理。
+`ExecutionPort` 接口之外的能力有两个，`runBashWithBackgroundLifecycle` 与
+`waitForBackgroundTask`，两者都必须透传：后者缺失时后台追踪退回 1 秒轮询，
+Bash 完成通知会晚于同一轮 tool-loop 的下一次模型请求。
+`env.base: "empty"` 不注入，端点不可用时沿用既有执行策略。
+回归覆盖包装后的真实生命周期入口与后台等待入口。桌面 E2E 复跑：background 26/26 通过，
+background-bash-output 7/7 通过，bash-direct-output 6/8 通过——`BDO05` 的前台与后台 5 GiB
+边界因可用磁盘低于 12 GiB 的前置条件未执行，其中后台变体会经过本链路，仍待在空间充足的机器上补跑。
+日志证据是 Bash 的 `background_task.tracking.started` 恢复为 `hasDirectWaiter: true`。
+不改变工具 schema、权限、模型结果格式或 App 协议。
+
+## Bash sed 只读权限收口（2026-10-28）
+
+`sed` 脚本可执行外部命令或写文件，shell AST 与参数白名单不能单独证明其只读。共享 readonly
+policy 只开放数字行号打印和标准输入替换两个完整脚本子集；复用 AST argv，不重新解析 shell 文本。
+参数、完整脚本和文件参数同时通过白名单后，才授予 `readOnly`、`concurrentSafe` 和免审批能力。
+链路仍为 Bash AST → readonly policy → runtime capability → PermissionService → executor：
+Plan（旧 `mode=plan` 与独立 `planEnabled=true`）按既有规则拒绝非只读 Bash；普通 Build
+默认请求审批，Plan 关闭后的其他模式和显式授权继续遵循原权限规则。管道、命令链和已支持
+wrapper 中的 sed 也必须通过同一白名单，项目 allow 不能解除 Plan 对非只读 Bash 的限制。
+`-e`/`-f`/`-i`、未知参数、执行/写入脚本和脚本后的 option 形参数不自动放行；保留展示层的原地修改识别。
+不改 Bash schema、执行命令、权限事件结构或桌面/手机投影；Plan 拒绝时沿用 PermissionDenied，
+不发 PermissionRequested、不调用 ExecutionPort。文件查看继续优先用 Read。
+回归覆盖安全打印/替换、脚本执行/写入、参数与转义边界、独立 Plan、显式 allow、Build 审批及 cat/grep 放行，
+并通过真实 executor 验证拒绝事件和执行端零调用。运行时验收在临时目录检查文件副作用。
+完整边界见 [Bash](04-bash.md) 与 [AST 权限语义](../../../bash-tool-ast-permission-semantics.md)。
+
+## 动态工作流子代理的 WebSearch 预算（2026-11-02）
+
+dwf 子代理每个 ask 的 `WebSearch` 调用次数有上限：默认 128，persona 的 `budget.webSearch` 可设 0–1024
+（编译期 9013 检查）。链路：facade `AgentPersona.budget` → 引擎 `normalizePersona` 保留合法值、
+`personaIdentity` 不计入缓存身份 → driver 建会话时读上限、`startAsk` 归零计数 → runtime factory 注入
+`WorkflowWebSearchBudgetPort` → runtime deps → executor → tool context → WebSearch handler 在发请求前 `charge()`。
+超额时 handler 回 `ToolHandlerFailure`，不发内部请求。工具 schema、描述、权限、tools 段字节、协议与 UI 不变；
+没有端口的会话行为不变。规格见 `13-websearch.md`、根目录 `docs/dynamic-workflow/authoring.md`
+「A subagent's search budget」与 `packages/dynamic-workflow/docs/execution-engine.md`「Search budget」。
+
+## 别的进程持有的工作流 run（2026-11-01）
+
+`FillWorkflowHole` 与 `AmendWorkflow` 在 `resolveInput` 读快照新增的 `liveInThisProcess`：run 未终态而引擎不在本进程时，
+不开确认窗，分别回 `hole_not_waiting` 与 `workflow_run_held_elsewhere`（日志码 30）。此前窗照开，用户批准后才失败。
+工具 schema、描述与 tools 段字节不变；只改权限之前的结果。已结束的 run 仍可从别的会话修订，经确认窗。
+规格见 `docs/dynamic-workflow/launch.md`「Approval」「Amending this session's runs」。
+
+## 会话 ID 兼容（2026-10-28）
+
+普通新建恢复 `sess_${crypto.randomUUID()}`（UUID v4）；已持久化的 `session_` 身份不变。
+Composer session mention → runtime reference reminder → `ReadSession`（`sessionId` 写法）
+→ 原 ID 的会话库查询 → 原 ID 的工具结果，兼容两种前缀。2026-11-03 起提醒不再指向已删除的 ReadSessionContext。
+邮箱目录仍按原 ID 隔离；保留路径安全校验、权限、工具超时与返回结构。
+回归覆盖两种历史后缀、混合引用去重、非法 ID 拒绝、准确读取及完整重启后继续对话。
+完整规格见根目录 `docs/session-context-tool.md` 的 Session identity compatibility。
+
+## 删除 ReadSessionContext，新增 ReadTopicResource（2026-11-03）
+
+设计见根目录 [会话工具设计](../../../../../../docs/architecture/zcode-app-control-design.md) 0.8。
+
+- 删除：`contracts/tools/read-session-context.ts`、core handler、`session-context` 中只服务于该工具的抽取与话题原文模块、`read_session_context_*` 模型调用遥测、对应 CLI 测试与 E2E（O07、工具交叉矩阵该项）。`#sess_*` 提醒改为指向 `ReadSession` 的 `sessionId` 写法。
+- 新增 `ReadTopicResource`：受管模块 `topic-resource-tool`（`core/src/tool/topic-resource/`，含 schema、资源读取实现与 CONTRACT.md；handler 在 `tool/handlers/read-topic-resource.ts`）。`contract.ts` 定义输入 `{ inputId?, messageId, index? }` 与输出 `{ status, path, fileName, mime, bytes, messageId, index }`；core handler 复用原话题资源授权与托管落盘；仅在运行时注入 `topicResourcePort` 时注册（App 托管会话），不属于动态工作流灰度门，`shouldDefer: true`；`readOnly: false`、`sideEffectScope: "session"`、无需审批；权限名 `session.topic_resource.read`；workflow actor 禁用。
+- 链路：模型调用 → schema 校验 → 权限 → handler（会话库读可信输入意图 → 资源索引校验 → Host 端口按授权读取 → artifact store 托管二进制）→ tool result 只含路径与元数据 → UI 走通用工具卡片。旧会话中的 ReadSessionContext 调用仍由 App 原只读渲染器显示。
+- 验证：core handler 测试（授权、索引、端口缺失、大小与编码校验）、注册条件测试、bots E2E BOT-E2E-TP-05 改走新工具。
+
+## 共享 CLI 的工具请求归属（2026-10-27）
+
+定时、闲时工具沿用模型输入、权限、结果和持久化契约。协议 port 从自身 session record
+取得 workspace，经协商的 `sessionWorkspaceRouting` 能力附加到 Host 请求；列表、删除、
+更新和自暂停也必须携带归属，不能使用物理连接首次绑定的目录。缺少自身 workspace 时
+明确失败；旧 Host 未协商能力时保持原参数。Host 用已登记的 session/workspace 校验路由，
+不接受共享连接中的未知归属。工具执行与桌面 continuous、手机 replayable 投影 owner 不变。
+回归包含两类 port 的新旧协议、共享 CLI 的独立审批和真实 Bash cwd 写入；完整设计见
+[共享 CLI](../../../../../../docs/shared-task-cli.md)。
+
+## Read 读取状态与 compaction 文件恢复（2026-10-22）
+
+Read 返回 `file_unchanged` 时不再记录读取状态快照；hydrator 跳过这类结果（含旧数据里已存的快照），
+由之前那次真实读取恢复视图。compaction 文件恢复改为在 summary 之后重读整个当前文件：只选 Read / Write /
+Edit 的记录，不走工具调用流程（无 hook、无工具事件、不弹窗），只跳过读权限 deny 规则：执行器新增
+`areReadsDeniedWithoutPrompt`，与工具调用共用同一个模式与规则判定（`checkStaticToolPermission`），一批文件只加载
+一次规则。规则按原始字符串匹配，所以读取状态另记工具输入的原始写法（`requestedPath`，Read / Write /
+Edit 写读取状态时记下；冷恢复取自 tool part 的输入，不写进快照），补回时它和规范化路径各判定一次，任一命中 deny 就跳过。补回结果写入 live 读取状态表，不落盘。Read 的 schema、权限声明、模型可见结果文本和 UI/V4 投影不变；compaction 后补回附件
+的内容变为文件当前内容，只影响新产生的 compaction，已持久化的不改写。规则见
+[rewind-compact.md](../rewind-compact.md) 与 [17-read-file-state-resume.md](17-read-file-state-resume.md)。
+
+## Agent 历史名称恢复（2026-10-27）
+
+持久化 Agent/Task tool input 的 `subagent_type` → transcript hydration 的 agentType →
+SubagentSpawned/Completed → V4 subagent row → App 摘要名称。输出和 metadata 的显式 agentType
+继续优先；input 读取 subagent_type 后兼容 agent / agentType，缺失时保留原 subagent 回退。
+不修改持久化数据、工具 schema、权限或执行行为。回归覆盖纯文本 output 与输出名称优先级。
+
+## MCP 手动信任（2026-10-23）
+
+工作区直接 MCP 声明 → bootstrap 当前声明快照 → 用户域逐条信任 → MCP port 准入 →
+连接池/stdio/HTTP/SSE → 工具与资源。未信任不连接、不发凭据、不注册可调用工具；
+每次连接准入重读声明和信任；连接内调用只查 gate 内存。会话内自动重连沿用原授权，撤销或配置变化在新建/重启会话的连接准入时生效。
+桌面和手机设置经同一目标 Host 发送精确摘要，不新增模型可调用授权工具。
+完整合同见根目录 `docs/runtime-tools/mcp-status-list-control-plane.md`「手动信任」。
+显式 default/connect 工作区切换先使旧设置 gate 失效；只读 status 不切换 gate，不清理其他工作区连接。命令、环境变量与隔离字段在审核和执行之间保持一致。
+坏声明逐条拒绝，空 `.zcode` map 沿用 `.agents` fallback；订阅释放不经过执行授权，用户来源由装配层保留。
+工作区 MCP 准入沿用 Hooks 的会话内非阻断提示：gate 重读当前声明 → 会话事件 → V4 快照 → composer 图标弹层；
+设置授权后只刷新同 workspace 的待审核投影，不自动连接。展示与忽略不改变工具执行授权。
+提示读取只在初始化、新用户输入消费、恢复和显式授权变化时发生；普通模型续步与内部续跑不读取提示配置。
+新用户输入包含用户 guide/steer；首输入复用初始化读取。配置加载器保留；提示刷新不改变现有连接的准入结果。
+准入提示更新不计为会话活动；冷恢复和授权通知均不得改写 sessions-index 活动时间。
+
+## node_repl 描述只留跨 skill 契约（2026-11-09）
+
+`mcp__node_repl__js` 的 tool description 删掉 Computer Use 与 Browser Use 的专属用法，只保留路由与能力、`title`、
+`timeout_ms`、`nodeRepl.write` / `nodeRepl.emitImage` 与“每次调用都 bootstrap”，长度 2182 → 955 字符；
+server instructions 末句缩为 “Every `js` call starts fresh.”（622 → 530）。CUA 段是 v1 SDK 遗留：要求
+`nodeRepl.write(state.text)` 与 `state.state_id`，与现行 skill 的“观察自行展示、不要再 write”相反（SDK 侧见
+`computer-use-client.mjs` 的 emitText 注释）；其余 tab 恢复、坐标、同 cell bootstrap 等句子 skill 已覆盖。
+`nodeRepl.cwd/homeDir/tmpDir/requestMeta/setResponseMeta` 不再列出，运行时仍提供。skill 不改（CUA SKILL.md 距
+14 KiB 上限仅 19 字节，不往里挪内容）。schema、权限、执行、事件、V4 与 UI 不变；tools 段字节变化，升级后第一个
+请求缓存失效一次；node-repl-host 版本不升。合同见根目录 `docs/mcp-stateless-node-repl.md` §2。回归：
+`node-repl-host/test/mcp-server.test.ts` 的 “keeps Browser Use and Computer Use usage rules in their skills”。
+
+## node_repl 描述删除 import 规则（2026-11-06）
+
+`mcp__node_repl__js` 的 tool description 删掉 import 规则整句（`node:*` / 绝对 `file://` URL / 裸包名不解析），
+只保留 “Bootstrap the requested official capability in every call.”。原因：该句仍被读成模块白名单；且
+“裸包名不解析”与实现不符——`require` 来自 `createRequire(cwd)`，裸包名从工作区 `node_modules` 解析。
+官方脚本的 import 写法由 Browser Use / Computer Use skill 的 bootstrap 示例提供，模型不依赖这句。
+schema、权限、执行、事件、V4 与 UI 不变；tools 段字节变化，升级后第一个请求缓存失效一次；node-repl-host 版本不升。
+合同见根目录 `docs/mcp-stateless-node-repl.md` §2。回归：`node-repl-host/test/mcp-server.test.ts` 的描述断言。
+
+## node_repl 描述如实说明能力（2026-11-05）
+
+`mcp__node_repl__js` 的 tool description 与 server instructions 如实说明能力：代码以 agent 权限运行、没有沙箱，
+且不经过 Bash 的危险命令确认；并以此为理由保留路由禁令（“never use it for shell, file, package inspection,
+or data processing work; use the dedicated tools”）。import 说明去掉 “only”，只描述 `node:*` 与绝对 `file://`
+的解析规则。起因是外部安全评估把旧文案读成受限运行时，把加载 `node:child_process` 判为沙箱逃逸。
+审批路径不变也不对齐 Bash：`js` 按 MCP high/system 审批，guarded 下无危险命令匹配、按 YOLO 基础策略放行，
+所以路由禁令不能放宽成建议（MR !3499 评审 CR-01）。
+代码侧同步去掉沙箱命名：`restrictProcess` → `protectProtocolStdio`，`createRestrictedProcessFacade` →
+`createProtocolSafeProcessFacade`，vm context 对象 `sandbox` → `replGlobals`；facade 行为不变，只保护 MCP stdio
+与宿主进程生命周期。schema、权限、执行、事件、V4 与 UI（含审批卡片）不变；tools 段字节变化，升级后第一个请求
+缓存失效一次。node-repl-host 版本不升：server.js 的 buildIdentity 每次构建都变，官方 seed 会重新落盘。
+合同见根目录 `docs/mcp-stateless-node-repl.md` §2。回归：`node-repl-host/test/mcp-server.test.ts` 的描述断言。
+
+## node_repl 无进展提示（2026-10-26）
+
+只改 node-repl-host 内部：`tools/call(js)` 按 `session_id + turn_id` 计同码、同结果与本 turn 调用量，
+命中档位时在 `toMcpRunResult` 之后的 content 末尾追加一行「You may end this turn.」提示。
+schema、权限、超时、isError、图片顺序、core 的 model-anomaly 与 UI/V4 投影均不变。
+宿主行为变化，node-repl-host 升到 0.6.2（package、manifest、seed 定义、SEA 清单、serverInfo）。
+合同见根目录 `docs/mcp-stateless-node-repl.md`「无进展提示」。回归：`no-progress-guard.test.ts`
+与 `mcp-server.test.ts` 的 MCP 调用序列。
+
+## CLI / App 会话控制工具（2026-10-23）
+
+工具名改为 PascalCase（2026-11-03）：12 个名字由 snake*case 改为 `ListSessions`、`ReadSession`、
+`CreateSession`、`ForkSession`、`SendToSession`、`WaitSessions`、`InterruptSession`、`RenameSession`，
+App 另有 `ListProjects`、`OpenSession`、`SetSessionArchived`、`SetSessionPinned`。原因不只是观感：
+App 端 `toolIdentity.ts` 的 `resolveLegacyKindFamily` 按下划线边界匹配历史 `kind`，snake_case 名字因此被
+误判——`read_session` / `open_session` 渲染成读文件卡、`list*\*` 渲染成搜索卡、`create*session`渲染成写文件卡，
+其余落兜底卡并被首字母大写。PascalCase 无下划线，每条规则的`(?:*|$)`边界结构上不可能成立。
+不保留别名；权限规则名`session_control.<method>`不变（改它会第二次作废用户已保存的审批）。
+schema、权限、结果预算、超时与 V4 投影不变，只影响新请求的 tools 段（缓存失效一次）。
+注意构建顺序：bootstrap 测试经`@zcode/core`的 dist 取注册表，改名后必须先`pnpm build` 再跑，否则断言拿到旧名字。
+规格见 [会话控制设计 0.12](../../../../../../docs/architecture/zcode-app-control-design.md)。
+
+统一工具名（2026-11-02）：模型只看到一套名字，删除 `cli_` / `app_` 前缀且不保留别名。共有
+`ListSessions`、`ReadSession`、`CreateSession`、`ForkSession`、`SendToSession`、
+`WaitSessions`、`InterruptSession`、`RenameSession` 8 个；App 托管 runtime 另注册
+`ListProjects`、`OpenSession`、`SetSessionArchived`、`SetSessionPinned`。工具声明按名字只有一份，
+输入 schema 按可信装配的运行位置选择（独立 CLI 或 App），权限规则名改为
+`session_control.<method>`。指向已有会话的参数在完整引用之外可只传 `sessionId`（wait 的每个
+operation 同样），二者必须且只能有一个，由可信一侧解析后沿原授权执行。独立 CLI 的
+list/read 读本机 CLI 会话库，不要求 owner；写工具仍只作用于本进程托管的根。ToolSearch、
+deferred 曝光、结果预算与 V4 投影沿原链路，名称变化只影响新请求的 tools 段（缓存失效一次）。
+详见根目录 [会话控制设计](../../../../../../docs/architecture/zcode-app-control-design.md) 第 0 节。
+
+跨项目发现修正：App `listProjects` / `listSessions` 默认读取 Host 授予的已连接来源与项目入口，
+不再按 caller 项目或临时工作区收窄。只读发现范围与正文/执行/组织/导航的 `allowedScopes` 分离；
+显式 project/workspace 只缩小搜索，不能扩权。严格输出增加 `searchScope`，明确实际范围及不可用来源；
+工具说明应说明标题子串匹配、无正文全文搜索，并要求按回执范围解释空结果。按运行位置选择 schema 与
+deferred 曝光不变，所有 App 结果 schema 同步核心、反向 RPC、工具和真实回放断言。
+
+后续纠正：同 Host 内项目不作为操作权限墙，`allowedScopes` 按 Host 绑定；读取正文和界面打开可跨项目，
+其余操作复用原工具审批与 owner guard。默认先搜未归档，无目标再显式搜归档；不新增隐式重查逻辑。
+
+端到端覆盖补齐：App 托管的 12 个和独立 CLI 的 8 个工具逐个通过实际工具入口验证结果，沿用现有 owner、审批和持久存储。App 跨会话发送须由可信 Host 注入来源会话，随 canonical input 持久化并投影到既有气泡来源提示；恢复与手机读取保持相同来源，不能把非用户发送默认为用户亲自输入。测试先覆盖发送来源缺失回归，再修复必要接线；模型 fixture 只决定工具请求，不替代工具结果或业务状态。`ReadSession` 的正文分页从最早消息开始，以 cursor 向后读取，不能复用默认尾部窗口导致首页漏消息。
+
+按根目录 [会话控制设计](../../../../../../docs/architecture/zcode-app-control-design.md) 实施。
+独立 CLI 注册共有 8 个，App 托管 runtime 另注册 App 独有 4 个；运行位置来自可信装配，不接受模型参数切换。
+新工具是 deferred 内置工具，声明严格输入/输出 schema、searchHint、只读/副作用、权限、
+结果预算、超时与取消；沿公共 executor、ToolSearch、工具生命周期和 V4 投影处理，不新增 UI 特例。
+
+```text
+独立 CLI 的工具 → CliSessionControlPort → 本机 CLI 会话库 / 独立 CLI owner
+App 的工具     → AppControlPort → 专用反向 RPC → Host AppControlService → 原业务 owner
+                         ↓
+             @zcode/session-control 的契约、纯规则与各自用例
+```
+
+CLI/App 各自工具操作根会话，不取代 subagent Agent/SendMessage/Task 工具。来源 session、
+workspace、trace、toolCall 与权限由 runtime 注入；目标 scope 由宿主复验，不信任输入自报的
+approved/clientMode/owner。目标会话权限不继承调用者 bypass；跨会话读取属于 world-touching，
+派发执行不能声明为 protocol-only 的 `session` scope。
+
+create/send 返回接纳凭据；wait 按对应 operation 的事实收口，超时/取消只释放等待，不停止目标。
+CLI durable input 接纳后、TurnStarted 前复用 pendingCommands 发布精确 commandId；启动、拒绝、
+取消时由同一 owner 移除，避免 ACK 后空快照被误判为 unknown。该投影不接管输入队列，重启仍按丢弃事实收口。
+interrupt 校验 execution 身份；busy 排队及幂等由已有 owner 决定，新核心不保存第二份队列。
+App 控制命令的请求摘要附着于原 CommandInbox 条目，同 key 改正文/执行策略返回
+`proto.commandConflict`；issuedAt、CAS 水位及轮换鉴权不参与摘要，冷回源仅有 ACK 时不声称完整冲突核验。
+App 控制 fork 在 CLI 原子 bundle 提交前拒绝带会话批准或非 build/Plan 历史配置；普通 UI fork 保持原行为。
+App read/send 不导航，显式 open 才走 UI 导航端口。没有绑定宿主或无法确认独立 CLI owner 时
+返回明确不可用，不通过 mailbox、直接写库或重复恢复绕过。
+
+测试先覆盖核心用例与端口契约，再覆盖工具注册/曝光、权限/context 透传、真实 CLI / Host
+adapter、反向 RPC 和桌面/手机导航。独立核心测试不能替代真实 owner 路由、冷恢复和 UI E2E；
+新 case 按根目录生命周期工作流进入 pending，不自动转正。
+
+## 会话控制：回执送不回来时的重试身份，与 ListModels 的注册条件（2026-11-05）
+
+规格见根目录 [会话控制设计 0.15](../../../../../../docs/architecture/zcode-app-control-design.md)。
+
+**重试身份。** 0.14 让工具层注入 `retryOf ?? toolCallId` 作请求身份、在回执里返回，但调用在 handler
+返回之前超时或取消时没有回执，模型拿不到身份，只能另起新请求，于是重复建会话或重复发消息。链路：
+`ToolEntry.describeUnsettledCall(input, toolCallId)`（可选）→ call-runner 的执行期 `catch` → 仅对
+`ToolTimeout` 与 `ToolCancelled` 两种 CoreError 调用它 → 生成同类型新错误（复制 type、context、
+cause、stack，不改原对象）把说明追加到消息 → `createErrorResult` → 模型可见错误文本。会话控制只给
+接受 `retryOf` 的写工具声明它，说明里给出 `requestId=<id>`。其余工具不声明，行为不变。权限阶段的
+取消在 handler 之前返回，不经过这里。取消文案不再要求「用原始身份对账」。工具 schema、权限、结果
+预算不变；失败文本只在超时/取消时多一句，不影响 tools 段字节。
+
+**ListModels 注册条件。** 它不在 `DYNAMIC_WORKFLOW_TOOL_NAMES` 里（冷恢复判据 `isDynamicWorkflowToolName`
+保持不把它算作用过工作流），但注册门另加一个条件：`includeDynamicWorkflow === false` 且
+`sessionControlKind === undefined` 时跳过——此时它的两个消费者（`CreateWorkflow`、`CreateSession`）
+都不存在。会话控制在场时它不受灰度开关控制；灰度开启时照常注册。tools 段只在「灰度关 + 无会话控制」
+的会话里少一个 deferred 工具。
+
+回归：`packages/core/tests/runtime-tool-allowlist.test.ts` 覆盖 `ListModels` 在三种
+`dynamicWorkflowEnabled` 取值、有无会话控制下的注册结果（含分支刷新）；`tests/session-control/`
+覆盖超时与取消时错误文本带回 `requestId`、未声明的工具不受影响。
+
+## 插件 Agent 源文件定位（2026-10-20）
+
+`Agent` 的插件 profile 沿用组件发现结果中的实际源路径：插件目录 / manifest 目录
+→ `PluginComponentItem { name, path }` → `loadPluginAgentTemplates` → 名称空间与裸名别名
+→ Agent 工具执行。frontmatter `name` 与文件名可不同；名称不得重新转换为文件路径。
+缺少路径的描述性组件不加载，源文件不可读保留诊断；不新增路径兜底或独立注册表。
+工具 schema、权限、执行快照和 UI/V4 投影不变。详见 [插件 Agents 规范](../plugin-compat.md#agents)。
+
+## 草稿 MCP UI 完全访问（2026-10-19）
+
+审批卡 → 现有 interaction broker → runtime 授权 → 授权事件 → V4 投影 → 所属草稿 Composer。
+未持久化草稿不写 session 子行；授权与首发/外部活动持久化交错时复用已有持久化 Promise。
+重试固定原授权事件与目标集合，正式会话保留原事务；首发按当前权限保存同一 session。
+工具 schema、执行权限策略、外键与 continuous/replayable 交付不变。测试覆盖真实 SQLite、
+并发持久化、发布重试、草稿身份与首发，产品合同见根目录 `docs/plugins/draft-mcp-ui-session-spec.md`。
+
+## Automation 自暂停工具 CronPauseSelf（2026-10-16）
+
+新增 deferred 内置工具 `CronPauseSelf`，供 automation 执行轮在 prompt 的停止条件满足时暂停
+本轮所属任务。链路：contracts `CronPauseSelfInputSchema`（严格空对象）/
+`CronPauseSelfOutputSchema { paused, id, message }` → `AutomationPort.pause({ id })` → handler →
+bootstrap `automation/pause` → Host `AutomationService.pause`。目标 id 只取
+`ToolExecutionContext.automationId`，由 turn-tools / streaming coordinator / batch runner / call runner
+从 `RegularTurnLoopState.automationId` 透传；模型输入不含 id，缺少身份时 handler 返回
+PermissionDenied 且不调用 port。
+
+```text
+Host admission automationId（仅接受调度派发显式注入；inputId/runId 只是追踪字段，不能恢复权限身份） -> RegularTurnLoopState.automationId
+  -> getTurnTools：无 automationId 时隐藏 CronPauseSelf（provider 工具、ToolSearch 目录与公告同源）
+  -> executor options.automationId -> ToolExecutionContext.automationId
+  -> CronPauseSelf handler -> AutomationPort.pause -> { paused }
+
+busy admission
+  -> PendingTurnInput / TurnSteerQueued 保存同一 automationId
+  -> QueueItem 投影与编辑原样保留
+  -> sendQueuedNow 提升时显式回放 automationId
+  -> 新 RegularTurnLoopState 恢复同一身份；禁止从 inputId/queryId/denylist 重新推断
+```
+
+权限 `automation.pause`、riskLevel low、无需审批、sideEffectScope workspace、非只读、非并发安全；
+复用 Cron 工具的超时、结果预算与取消声明，searchHint 见 [19-tool-search.md](19-tool-search.md)。
+只在 `includeAutomation` 时注册；不加入 `AUTOMATION_MUTATION_TOOL_NAMES`（core / bootstrap /
+services 三处），否则执行轮会隐藏它，旧 Host 的三项 denylist 兜底判据也会失效；不进
+`SORTED_PROVIDER_TOOL_NAMES`。remote workspace 的 session denylist 加入该工具。`CronCreate`
+的 modelInstructions 增加一句：用户给出停止条件时写进 prompt，并要求条件满足时调用 `CronPauseSelf`。
+旧 Host 返回 `-32601` 时按工具错误结束，不回退。暂停的条件写与 scheduler 回写竞态见
+`docs/automation-edit-status.md`（仓库根目录）。测试覆盖 handler 身份来源、无身份拒绝、可见性矩阵、
+executor 透传、ToolSearch 目录与 bootstrap 协议请求。
+
+## Bash 临时输出路径隔离
+
+主应用及 workflow 子运行时装配 tmp 父目录 → execution adapter 实际准备具名输出文件 →
+不可用时复用原 storageRoot 文件准备 → 确定唯一输出路径 → 现有前后台执行、进度、结果与文件入口。
+模型 schema 和 App 协议不变，stdout/stderr 仍直接写 fd。覆盖降级、取消/关闭与准备竞争、
+前后台路径一致性、Windows 原生搜索自引用及崩溃后的具名文件保留；不迁移历史输出。
+存储统计仍限现有数据根，完整合同见 `04-bash.md` 和根目录 `docs/tmpdir-storage-paths-spec.md`。
+
+## 自定义 Agent Memory 工具投影（2026-10-15）
+
+Runtime 从当前父轮 Agent definitions 快照派生有效工具，启动配置、注入 reader 和 Host
+每轮加载的 profiles 必须经过同一投影。Memory 启用且允许使用时，为声明 memory scope
+及显式 tools 的 profile 补齐 Write/Edit；未声明 tools 保持继承，disallowedTools 和权限过滤
+仍生效。不修改 Host 原始快照，不跨轮缓存工具，不增加延时或重试。回归检查三种配置来源、
+连续父轮、Memory 关闭和禁用工具；Desktop MEM08 验证 custom-agent 真实写入 Memory 文件。
+
+合并后登记工具结果结算、渠道回复及留白填充入口的模块边界；复用原契约与公开路径，不改变工具执行和持久化行为。
+
+FillWorkflowHole 沿用非常驻内置工具的 deferred 分类；ReplyToChannel 不再默认注册。
+
+Local 搜索名称为 `LocalToolSearch`，Native 仍为 `ToolSearch`。contracts 名称常量 →
+单一 handler 的 Registry alias → 请求曝光与结构化历史/公告投影 → 同一 executor/权限/Hook。
+模式切换在每次请求准备时生效，不修改共享 Registry 或持久化身份；旧历史、compact 和冷恢复
+沿用原发现事实。同步包装说明、加载反馈、错误提示与真实 provider wire 回归，详见
+[三种请求投影](19-tool-search.md#local-toolsearch-与三种请求投影)。
+
+UI 按 `ToolSearch` / `LocalToolSearch` 两个名称选择同一搜索卡片，图标、文案与不可展开行为
+完全一致。参数流开始到停止均保留原工具身份；renderer 兼容新名称，避免执行归一化前落入
+通用 JSON 卡片。TS14 受控流使用 `LocalToolSearch`，验证参数占位和停止状态。
+
+ToolSearch / LocalToolSearch 的共用 `Query forms` 说明明确不支持正则，末尾给出
+`shell terminal execute command` 空格分隔关键词示例；query 参数说明同步标明不支持正则。
+仅更新模型可见文案，沿用原搜索算法与输入结构；验证 Native / Local 最终 provider wire。
+
+Local ToolSearch 描述明确搜索后的 `DeferredToolCall {name,input}` 调用方式，只用一个简短的
+deferred 工具调用示例说明（现为 TaskStop，参数值为占位符）；常驻工具仍直接调用。只经既有曝光入口更新 Local description，
+不改变 Native 文案、结果格式或执行协议。校验示例参数及 CLI/PTY 冷恢复的最终 wire，
+合同见 [模型可见文案](19-tool-search.md#模型可见文案)。
+
+Local 逐项反馈与 compact 提升：引用投影按模型调用批次前可见定义去重，新展开 schema 的
+结果在 tool_result 内给出调用指引，纯重复结果给出已加载提醒。发现扫描同时读取有效 compact
+检查点；曝光、搜索、公告及包装准入
+共用提升后的分类，成功 compact 后以普通 tools 恢复已发现工具。保持真实引用持久化、
+Native/Off、执行生命周期和 Continue 记录链不变。验收详见 [ToolSearch spec](19-tool-search.md#local-逐项反馈与-compact-后提升)。
+已加载指引在 tool_result 内使用公共 `<system-reminder>` 包装；不生成 attachment，
+MCS 开关不改变其位置或角色。验证混合/纯重复/冷恢复的最终请求及模式对应的提示数量。
+首次展开的 deferred 定义在同一 tool_result 内合并追加 Loaded 调用指引，明确顶层 name/input；
+单工具使用 `Call it now`，多工具使用 `Call them now`；其余保留统一的
+`<tool name>` 占位、精确名称指引与复数结尾；
+只加强模型行动指引，不改变执行、结果成功状态或已加载提醒，不承诺定义永久有效。
+复用引用投影，Local 不再派生结果外成功提示；Native 保持原有提示。实际请求、Continue/compact
+记录共用同一投影标记，不改变常驻选择、Native/Off 或历史持久化。验证多工具去重、
+Hook 顺序、MCS、compact 提升及真实进程冷恢复的最终 wire。
+
+ToolSearch 四项补齐：Native 有效搜索结果在整批 tool_result 后派生成功提示；未发现 deferred 参数
+错误补精确 select、当前 schema 和模式调用方式；公告使用严格来源 attachment 参与 MCS 并
+保留增量 metadata；MCP select 支持原始/规范化短名。复用既有遍历、持久化和执行链，
+保持 callID、用户/媒体归属、Continue/compact 和桌面/手机交付边界。历史定义快照和
+unavailable schema 保留延期，不增加存储字段或改变引用过滤。合同见 [19-tool-search.md](19-tool-search.md)。
+Continue/compact 的请求记录重建复用本次投影的有效搜索结果 callID，避免漏掉派生成功提示；
+不增加历史扫描、深拷贝或存储字段，实际请求与执行链不变。
+未发现 deferred 工具的参数错误保留完整纠错段落：说明定义未加载与参数类型退化的关系，
+再给出精确 select 和当前 schema；仅 Local 追加包装调用说明。完整文本回归同时保护
+原始校验错误及已发现/Off/不存在工具的既有行为，不改变准入或执行。
+
+ToolSearch 删除/恢复公告仅描述当前可用性，不推断 MCP 连接状态或变化原因。
+正常与受限 turn 的增量比较、持久化、compact 及权限筛选保持原状；精确文案测试覆盖
+内置工具恢复、MCP 分组、30/31 个删除名称和混合增删，确保不附加未经证实的原因。
+
+App Settings ToolSearch 模式：配置 schema/patch -> 本地或远程 Host 偏好响应 -> Bootstrap
+runtime-materialization -> runtimeConfig.toolSearch。只在新建/冷恢复取值，热恢复及已有草稿
+不更新；fork/子 Agent 继承。CLI 参数、工具协议/执行/历史均不变。验证 Settings UI 保存到
+最终 provider wire 的真实 E2E，及旧字段缺省、主子作用域、冷恢复与 Host 权威源。
+缺省 Off（2026-11-05 App 缺省曾改为 Auto，2026-11-09 改回；该构建未正式发布，不迁移；
+CLI 默认 Off 始终不变）；设置行底部显示实验性与原生模式供应商缓存支持不足时的用量风险，中英文一致，
+不覆盖用户已保存的模式。复用底部说明区域，验证默认关闭、说明可见与原有保存/恢复链路。
+
+常驻名单扩充（2026-11-05）：TodoWrite、WebFetch、WebSearch 去掉 `shouldDefer`，成为常驻工具；
+submit_result 同样去掉 `shouldDefer`，它只在注入 `workflowSubmitPort` 的 actor 会话注册，
+所以只在 actor 会话常驻。链路：handler metadata → `isDeferredTool` 分类 → 请求曝光/公告/
+搜索目录/DeferredToolCall 准入同源变化；执行、权限、预算与 V4 投影不变。ToolSearch 描述里
+点名 TodoWrite 的两处示例都改为 TaskStop（Local 调用示例的参数值为占位符）。验证真实内置目录的首轮名单与 Desktop ToolSearch E2E。
+合同见 [19-tool-search.md](19-tool-search.md#工具和协议)。
+
+Local ToolSearch 扩展沿用 [19-tool-search.md](19-tool-search.md) 的真实引用和发现检查点。
+`--toolsearch-mode` 替代旧 enable flag；Local 将连续引用在结果内合并展开为 functions 文本，
+两次 compact 之间的 tools 不随搜索发现增长；成功 compact 后检查点工具提升为普通 tools。DeferredToolCall 使用 `{name,input}`，仅转发当前允许的 deferred
+目标，在公共准入归一化为普通目标调用；内部历史与持久化只增加 modelCallWrapper 字面量，
+请求出口恢复原始包装，删除重复保存的 modelToolCall input。V4 scheduled 定稿目标身份；
+断流未调度时，已有 tool_call_closed 仅补齐包装工具行的目标名称与输入，不推进业务状态。
+Todo/microcompact/工具卡复用普通调用判断。重点验证原始参数隔离、调度/权限/Hook/媒体/turn-stop、
+pending 到终态重存、冷恢复/分支、六向模式切换和 Continue/compact 的原有生命周期。
+不保存 schema 快照、不新增 schema reminder、DB migration 或测试专用生产接口。
+Core 事件时序与原始流保持原状；App 共用 render unit 隐藏 inputStreaming 的 DeferredToolCall，
+完整目标身份到达后沿用原卡片和显示设置；直接工具预览及包装失败/停止展示不变。
+展示层不从半截包装参数推测已准入目标。验证无 Scheduled
+的断流恢复、实时与冷恢复身份、普通工具及失效事件隔离、continuous/replayable 的完整行更新。
+请求内的引用过滤与 Local 展开共用一次历史投影；只复制内容实际变化的工具结果，
+同一工具定义在本次请求内只编码一次。发现集合仍先独立扫描，最终 provider render
+保留隔离拷贝；不改变公告时序、引用顺序或引入跨请求缓存。
+
+ToolSearch 的默认关闭、显式模式覆盖、结构化引用与冷恢复合同见
+[19-tool-search.md](19-tool-search.md)。发现状态仅从真实结果和有效 compact 检查点推导；
+关闭只修改请求投影，不新增数据库表列，不改变 MCP 初始化或主子权限边界。
+公共 tool metadata 同时接受既有字符串 modelContent 和 ToolSearch 结构化数组，避免失败 MCP
+工具在 V4 transcript 冷恢复时丢失 display；ToolSearch 写入与发现恢复仍严格校验数组。
+请求组装统一经 `prepareRuntimeProviderRequest` 执行一次 ToolSearch 准备，主/子 Agent、
+Goal、Memory 与 Compact 提供各自完整工具目录；消息投影不再隐式猜测启用状态。
+media 保持独立环节；公告在正常提醒阶段由原历史 owner 提交后再取请求快照，纯 max-token
+Continue 不检查或生成公告。Compact 根据保留历史与继续执行的工具作用域独立重建公告；
+请求准备只投影已有公告。公告正文与增量 metadata 随隐藏 synthetic 历史持久化，
+fork/resume/rewind 按有效历史原位恢复，不新增 session 级缓存。验证续写去重、配套 wire、Goal SQLite 状态和恢复边界。
+重试按 canonical 原始输入 ID 截断，公告及 Todo 等隐藏提醒不能成为重试边界；回归检查模型请求与冷恢复没有重复输入。
+公告 metadata 只记录 addedNames/removedNames/readdedNames 增量；从保留历史顺序推导
+当前已公告与曾完整列名集合，正文与 metadata 同源。删除按完整作用域工具池判断，
+避免 compact 保留增量尾部漏补名称、deferred 转 alwaysLoad 误报删除。内置 deferred 工具
+补齐 searchHint，不改变搜索排序、真实引用或发现检查点。
+内置工具仅 Agent/AskUserQuestion/Bash/Edit/Glob/Grep/Read/ReportFindings/Skill/ToolSearch/Write
+保留常驻资格；名单外工具在各自 metadata 声明 shouldDefer，不增加分类映射层。
+ReportFindings 尚未实现，Task 兼容入口继续对 provider 隐藏；注册、灰度、权限和执行不变。
+覆盖真实内置目录首轮曝光、搜索加载与关闭回退；MCP、provider 原生工具维持原有规则。
+Native ToolSearch 的 provider description、参数说明及增删/恢复公告文案使用默认配置。
+公告沿用 30 个删除名称阈值、
+MCP server 分组与 ambient 提示；仅修改模型文案，不扩展 MCP 生命周期或公告状态。
+ToolSearch 的 provider schema 将 query/max_results 都标为 required；执行链仍先通过
+runtime schema 补默认值 5。验证最终 wire required 和省略 max_results 的真实执行结果。
+ToolSearch 的引用块不参与普通文本截断；结果的预算投影保留引用和块顺序，仅限制文本
+（Hook 文本是批次后的附件，不进 tool result）。展示内容和字节统计由最终块派生，completed metadata 与冷恢复
+沿用真实结果；覆盖超过 100 KB 的搜索、批量 select、Hook 及 SQLite 恢复，不收紧输入范围。
+Compact 摘要请求与主循环使用同一份工具目录，不按 ToolSearch 状态另选，也不设工具数量阈值；回归覆盖禁用、alwaysLoad 与超过 100 个工具的 Runtime 请求。
+插件 MCP 的 `.mcp.json`/manifest 经各 transport 配置转换时必须保留 `alwaysLoad`；
+验证插件发现到最终请求 schema 的透传，不改变 MCP 初始化、鉴权或工具权限。
+App MCP 配置转协议 DTO 同样保留布尔 `alwaysLoad`，覆盖 stdio/HTTP/SSE；
+未配置或非法值不生成字段，验证 JSON 传输与现有严格协议 schema，不扩张会话配置路径。
+
+2026-09-18 ToolSearch 测试补齐：PTY force/resume/continue 走真实终端输入；动态目录与
+尾部连续 compact 使用独立 Runtime/HTTP 集成 fixture，覆盖 streaming on/off 并检查原始历史。
+macOS 与 Windows 原生进程证据及手机待验证边界见根目录 coverage matrix；不改产品入口。
+同日补充 executor 执行边界、真实 Hook 结果 SQLite 冷恢复、搜索细分输入、开启状态空引用
+投影的单测。E2E/单测不得为测试修改生产实现或新增测试专用入口；只复用既有依赖契约。
+
+## Skill 通用名称埋点（2026-10-14）
+
+所有 `tool_name=Skill` 的 `agent_step` 增加 `skill_name`。不提取调度输入的请求名称，
+Skill handler 解析后通过既有 metadata 回调提供真实 `metadata.name`，沿
+`ToolCallResult/Error → tool.lifecycle.skillName → agent_step.skill_name` 传递。
+加载前失败/拒绝/停止、名称未解析或不符合遥测名称规则时使用 `unknown`。
+CLI fact、UI 兼容 metadata 与最终 `/report` 共用名称校验，禁止任意请求参数进入遥测；
+验收覆盖路径、URL、换行、模拟凭据与超长字符串的最终 HTTP 请求体。
+不调整模型输入输出、权限或工具执行；不新增状态 owner，桌面 continuous 与手机 replayable
+边界不变。字段、兼容与验收见根目录 `docs/monitoring/skill-agent-step-telemetry.md`。
+
+## TaskStop 查找失败提示
+
+`TaskStop` 精确查找未命中时，统一返回以下模型可见错误；不增加前缀匹配或 ID 格式校验：
+
+```text
+Invalid task ID "<id>". This lookup failure does not mean the task has completed or stopped; use the full task_id returned when the task started to stop it.
+```
+
+链路：`background_task_not_found → handler error (code: 1) → executor success: false → model isError: true`。
+查找失败不能证明目标任务已完成或停止；模型应使用启动时返回的完整 `task_id`。
+完整 ID 命中后的停止行为、其他错误、schema、权限、协议与 App 交互保持原样。
+回归覆盖短 ID、未知完整 ID 的失败文案及模型错误标记，并保留成功停止和其他失败分支断言。
+
+## 规划与 Todo 动态提醒
+
+Plan 完整、简短及退出提醒，Todo 提醒与持续静默提醒都从消息历史计数，链路为消息历史 →
+reminder formatter → runtime attachment → provider projection，复用持久化上下文载体和恢复链路。
+细节见 16-plan-mode.md 与 loop/meta-user-context.md。工具 schema、审批、执行、事件和桌面／手机 UI 不变。
+
+## 子 agent 环境与模型上下文共享
+
+普通 child 的环境与执行模型通过和 Main 相同的 section assembler → runtime announcement →
+持久化历史 → provider projection 下发，细节见 loop/meta-user-context.md。Agent schema、description、
+权限、工具集合、结果与桌面/手机展示不变。
+
+## 动态工作流的来源缺失提示
+
+`CreateWorkflow` 与 `EvalWorkflowSnippet` 的字段全部可选，模型发出的参数不是合法 JSON 时，
+adapter 记 `model.tool_input.normalize_failed` 并把它恢复成 `{}`，`{}` 能过这两个工具的 schema，
+随后在 `validateInput` 的「恰好一个来源」上失败。旧文案把「多给」和「没给」并成一句
+「Passing both, or neither, is ambiguous」，写了 `code` 的模型读不出原因，会原样重发。
+
+现在两种情况分开：多给一个来源用 `*_SOURCE_CONFLICT_ERROR`；一个都没有用
+`*_SOURCE_MISSING_ERROR`，尾部接共用的 `WORKFLOW_SOURCE_MISSING_HINT`，说明解析失败的调用
+到达时是空的、常见原因（内联源码里未转义的 `\` 或 `"`）以及改走 `path` 的办法。
+
+链路：`adapter {} 恢复 → executor schema 通过 → validateInput 返回 400 + 文案 → model isError: true`。
+schema、归一化、权限、hook、handler 与 UI 不变；`AmendWorkflow`、`SaveWorkflow`、`FillWorkflowHole`
+有必填字段，空调用先在 schema 失败，不在本次范围。回归覆盖两工具的多给 / 没给 / 只有
+`timeoutMs` 三种入参，并经 executor 断言 `{}` 拿到缺失提示、不弹确认窗。
+
+## 闲时后台执行（实施中）
+
+按根目录 `docs/off-peak-task/background-lifecycle-plan.md` 实施：Agent 显式、profile 默认及超时转后台，
+SendMessage 运行中投递/终态恢复，以及 Bash 显式/超时后台复用普通工具链。
+票据生命周期独立于工具执行：3102 使后续模型请求等待新票，本地 Bash 继续保存输出；
+换票只重试尚未提交结果的模型请求，不重放工具或原始 prompt。主轮结束后继续接收既有通知。
+真实用户输入接管后，新后台轮读取 Session Selection；已运行子轮保留本轮模型。
+输入 schema、权限、结果预算、通知包装、子轮 Bash 清理和桌面/手机交付边界不变。
+Workflow、递归闲时/定时任务和自动记忆提取的限制保留；重启不恢复后台进程或通知。
+验证覆盖换票并发、旧票迟到、用户接管、停止与任务取消、后台通知到达边界及两端交互。
+
+## 冷打开历史先显示（2026-10-09）
+
+持久化 tool 摘要由现有 V4 reducer 在 runtime 初始化前显示；工具详情、附件读取、App 交互
+与执行入口等待 runtime ready。工具声明、模型可见输入输出、权限和执行语义保持原样。
+初始化失败保留历史，显式重试复用完整 resume hook。状态与传输边界见根目录
+`docs/v4-refactor/17-cold-resume-runtime-activation.md`，桌面 continuous 与手机 replayable
+仍复用同一个 publisher，各自维持既有序号恢复语义。
+
 ## 工具内部模型请求的会话归因（2026-09-30）
 
-WebSearch、WebFetch processing、ReadSessionContext 的内部模型请求继承发起工具的宿主
+WebSearch、WebFetch processing 的内部模型请求继承发起工具的宿主
 会话类型，移除调用点的 `modelRequestSessionType: "other"`；由 runtime 模型句柄统一绑定。
-`querySource` 继续表达工具用途，ReadSessionContext 不按被读取的目标会话归因。
+`querySource` 继续表达工具用途。（原 ReadSessionContext 的抽取请求已随工具删除，2026-11-03。）
 链路为 runtime 模型句柄 → tool handler 调用上下文 → adapter → provider HTTP header；
 只调整观测分类，工具 schema、权限、执行、取消/超时、tool result、UI 与远控投递保持现状。
 覆盖 runtime 工具调用与模型边界测试，合同见根目录 Agent 模型请求归因 Header spec。
@@ -61,6 +740,8 @@ desktop continuous 与 web replayable 保持现有交付边界；2026-09-08 按�
 
 ## 飞书话题原文回查
 
+2026-11-03 已删除：话题原文改由历史附件提供，资源读取改用 `ReadTopicResource`（见“删除 ReadSessionContext，新增 ReadTopicResource”）。以下为历史记录。
+
 `ReadSessionContext` 增加只读 `topic` 策略及分页 cursor。该策略强制目标为当前 session，仅从可信输入元数据读取已归档话题消息，按消息 ID 或关键词返回原文及覆盖缺口，不调用抽取模型，不把用户正文当作身份。原有 relevant/handoff 保持兼容；输出继续走统一预算、trace、tool result 持久化与 UI 投影。测试覆盖跨 session 拒绝、原文去重、分页及缺口，不用合成结果代替真实飞书验证。
 
 2026-09-22 SaveWorkflow 溯源字段：入参增加可选 `run_id`（本定义是从哪次 run 提炼出来的）。
@@ -97,7 +778,6 @@ Stop 继续取消未完成工具；已成功结果的媒体保存不再使用该
 interrupted 冷恢复，不保证原始输出。Desktop continuous 与手机 replayable 保留既有交付边界。
 完整顺序见 [streaming recovery](../model/streaming-tool-execution-and-recovery.md#tool-result-settlement)。
 回归覆盖图片 Stop、真实 SQLite 锁、批次中途保存失败、媒体与 usage 失败、冷恢复和 checkpoint 取消。
-
 
 ## 目的
 
@@ -136,8 +816,12 @@ desktop continuous 的 live 统计不能通过手机 replayable 恢复补发。
 ## 总原则
 
 离线 prompt-trajectory 转换只影响调试产物：从相邻真实请求补全 response 摘要遗漏的
-thinking，并识别末尾 user block 追加。保留真实历史改写的分段，不改生产 tool descriptor、
-执行、缓存、权限或 UI 链路；合同见 [Model-IO trajectory](../../../plan/trajectory/model-io-to-anthropic-trajectory-tool.md)。
+thinking，并识别末尾 user block 追加。默认保留真实历史改写的分段；显式
+`--ignore-tool-search-changes` 仅在离线比较中忽略 ToolSearch 引用、占位文本、目录公告及
+成功引用结果批次后的对应 `Tool loaded.` 提示，普通同名文本仍参与比较；
+目录公告识别覆盖当前 Native／Local 文案，并保留旧日志格式的兼容性。
+输出仍保留最后真实请求并标注合成模式。不改生产 tool descriptor、执行、缓存、权限或
+UI 链路；合同见 [Model-IO trajectory](../../../plan/trajectory/model-io-to-anthropic-trajectory-tool.md)。
 
 CR-01（来源提示包装）：SendMessage、RespondToCoordinator 与后台任务产出的正文只在
 provider user reminder 包装时复用 source sanitizer 中和嵌套 `system-reminder` 标签。
@@ -145,10 +829,10 @@ canonical 载荷、工具输入/输出、权限审批与主子 Agent 身份不�
 正式主子 Agent 双能力轨迹需携带标签注入载荷，验证降级、compact 和冷恢复仍使用同一包装边界。
 
 新轮后台任务通知（2026-09-12）：共享 provider 投影对 `task_notification` 复用上述包装边界，
-为完整前缀和整批正文添加一次 `<system-reminder>`。Agent/Bash/Workflow 原始结果、通知批处理、
+为完整前缀和正文添加 `<system-reminder>`：整批的每条通知是一个文本块，各自包一次。Agent/Bash/Workflow 原始结果、通知批处理、
 主子工具权限、持久化与 UI 可见性不变；BG25/BG36 在 MCS 与非 MCS 请求中验证 user 包装。
 
-运行中立即发送：纯文本 human 输入实际抢占 Core 前台执行后，复用 `user_steer` 的 provider 投影；工具取消、结果配对、审批、队列提升与执行轮边界不变。MCS 合法位置及 user 包装继续由共享投影裁决，不因新 turn 强行插入 system。具体边界见 [turn steering](../loop/turn-steering.md#运行中立即发送的-human-提示2026-09-12)。
+运行中立即发送：抢占 Core 前台执行后，输入作为普通用户消息开启新 turn，不带 `user_steer`，不并入已发出的 tool_result；工具取消、结果配对、审批、队列提升与执行轮边界不变。具体边界见 [turn steering](../loop/turn-steering.md#运行中立即发送2026-10-26)。
 
 ### 动态工作流子代理的 Browser Use
 
@@ -159,6 +843,16 @@ canonical 载荷、工具输入/输出、权限审批与主子 Agent 身份不�
 2026-10-09：移除「subagent 不能用 Browser Use」的限制。工具定义、schema、权限与 node_repl MCP 进程不变；node-repl-host 的 browser bridge 与 bootstrap node_repl broker 不再按 `runtime_scope: "subagent"` 拒绝（错误 `Browser is not available in subagent` 删除），node-repl-host 随之升到 0.6.1（package、manifest、官方 seed 定义、SEA 清单、serverInfo 版本同步）。core `Agent` 子代理由父 runtime 以 `forChildSession({ childSessionId, parentSessionId, tabOwner: "parent" })` 派生子端口：协议 broker 把子会话请求的 `sessionId` 换成父会话下发（桌面按它判定 tab 归属与面板展开），子代理与当前对话共用 tab，子端口 turnEnded / closeSession 不发往桌面，子代理结束只撤销登记、不关 tab；dwf 子代理保持默认 `tabOwner: "child"`。Computer Use 的 subagent 限制不变。合同见根目录 `docs/browser-use/2026-07-16-subagent-browser-unavailable-spec.md`。
 
 ### Guarded 危险命令单次确认
+
+2026-10-19：额度停止（`stopped(provider)`，kind `quota`）带重置时刻时由宿主到点自动续跑（bootstrap `dynamic-workflow-quota-resume.ts`，见 execution-engine.md「Resuming after a quota reset」）；重置时刻在 Retry-After 缺席时从 provider 原文读出。`ResumeWorkflowRun` 的描述与终态通知改为「不要在重置前恢复」。不改工具 schema 与协议。回归：adapters 原文解析、bootstrap 自动续跑模块与 run service 集成用例、core 终态通知。
+
+2026-10-19：动态工作流 facade 新增值 `run`（`{ id, resumedFrom? }`，两个 facade 都含），与 `args` 同一条标识符级 lowering 与沙箱注入（spawn payload 的 `run` 字段，冻结后挂 `__host.run`）；resume 时 launch 把 journal 里的 lineage 指针递给 harness，脚本两世读到同值。不改工具 schema、协议与 UI；SKILL §16.2 标记块与 `FACADE_DTS` 同步。回归：`facade-dts.test.ts` 降级、`run-identity.test.ts` 沙箱、run service 的 amend → cancel → resume 用例。
+
+2026-10-19：`EvalWorkflowSnippet` 的 `resolveInput` 对内联与 `path` 两条来源都回填 `script`（恒等于归一化后的 `code`），PreToolUse hook、项目权限规则与另外三个工作流工具读同一个字段名。运行时 schema 加 `script`，模型面 JSON schema 不列它（与 `CreateWorkflow.script_line_offset` 同姿态）；`code` 保留给 UI 与已有 hook。回归：`eval-workflow-snippet-tool.test.ts` 的归一化与 executor 级 hook 用例。
+
+2026-10-21：子 runtime 的工具面减掉 run 内省两件套 `ListWorkflowRuns` / `GetWorkflowRun`，范围是 workflow child、nested workflow child 和主代理 `Agent` 工具的 subagent（`resolveRuntimeDisallowedTools` 按 taskType 生效）。根因：这两个工具经 dwf run 端口读取，端口只在 app 顶层 runtime，子 runtime 按不变式不得持有（`bootstrap/src/app/dynamic-workflow-run-progress-sink.ts`），所以在子 runtime 里只会报 `workflow_introspection_unavailable`（线上 10-20：workflow child 调用 155 次，全部失败）。主会话的工具面、两个工具的 schema、权限与协议都不变；ListSavedWorkflows 仍保留。合同见 `docs/dynamic-workflow/launch.md` 的「workflow child sessions」行。回归：`runtime-tool-allowlist.test.ts`。
+
+2026-10-19：动态工作流子代理的工具面再次减掉 `AskUserQuestion`，与 actor 系统提示「没有向人提问的工具」一致；子代理要人判断时只经 `escalate` 交主代理。权限模式继承、权限请求经父会话送达不变；不改 schema、协议与 UI。回归：`workflow-driver.test.ts` 工具面、`script-workflow-child-runtime.test.ts` 调用不产生 PermissionRequested。
 
 2026-09-23（续）：动态工作流子代理改为继承发起会话的完整权限模式（build/edit/yolo/guarded/auto；plan 不带入，旧值 `plan` 记为 build），`run-launched.subagentPermissionMode` 记任意模式，缺席或未知值仍按 YOLO；并把 `AskUserQuestion` 还给子代理——它本就走 PermissionRequested，已由同一条父会话镜像送达确认窗。EnterPlanMode/ExitPlanMode 仍移除。见 `docs/dynamic-workflow/launch.md`「Permissions inside a run」。
 
@@ -288,8 +982,8 @@ MCP 动态 tool 还需要额外确认：
 - 可选超时字段的 provider-visible 描述不能只写字段类型；必须给出模型可执行的决策规则，包括何时必须显式传值、如何为预计执行时间预留开销，以及超过上限时应拆分调用。
 - MCP server 可在 result `_meta` 中声明 namespaced 的 `zcode/errorPresentation: "message-only"`，要求通用 bridge 在 `isError: true` 时直接投影 content，不额外添加 `MCP tool returned an error:` 包装。该能力只控制模型可见文案，不得被当作失败状态本身；失败事实仍以标准 MCP `isError` 为准。`node_repl` 生产端不得声明 `message-only`：它直接把经过脱敏的结构化 `run.error.message` 写入 content，并让通用 bridge 投影稳定的 `MCP tool returned an error:` 前缀，供不读取私有 `_meta` 的分析链路区分成功与失败。错误结果不得混入错误类型、`at ...` 堆栈帧或失败前的 REPL 日志。通用 bridge 禁止按 `serverName` 分支或解析具体错误正文。本调整不修改 `ToolResultPayload`、session event、持久化、UI 或 desktop continuous / web remote replayable 链路。开发态 desktop agent 构建必须同步重建 `@zcode/browser-use-plugin` runtime，确保插件缓存 hash 能感知这类生产端变更。
 - 标准 media result 不应无条件降级成文本占位。`image` block 应进入 provider-neutral `ModelMessageContent`，让 screenshot/visual inspection 类 MCP 能力和内置 `Read` 图片路径一致；不支持的 media 再返回短占位并受 result budget 约束。
-- 官方 CUA 的最终 raster 是坐标输入的一部分，不是普通可优化媒体。只有通过 Host authority 校验的官方 `zcode-cua` descriptor 可以启用该路径；每个 image 必须紧邻精确形态的 `image_ref {frame_id,width,height,actionable}`，bridge 必须校验 canonical base64、PNG/JPEG 文件头、MIME、实际尺寸、200 KiB 上限和单结果 `frame_id` 唯一性，并保持 bytes 与 block 顺序不变。`PostToolUse` hook 只能在受保护媒体对之后追加有界文本，不能替换或重排。任一校验失败时必须原子移除本次结果中的全部 CUA image/image_ref 并返回错误，禁止只留引用、只留图片或退回 artifact/文本占位。第三方同名 MCP 仍走通用 result budget，不能获得豁免。
-- official CUA 结构化结果在 Host 内只由 `modelContentProtection=official_cua_frame_v1` 表示；不要再增加或恢复并行 preserve boolean。`returnedBytes` 是文本与真实媒体载荷的唯一 aggregate，hook 追加只增加新增文本 bytes，不能依赖第二份 `mediaBytes` 镜像状态。
+- 官方 CUA 的最终 raster 是坐标输入的一部分，不是普通可优化媒体。只有通过 Host authority 校验的官方 `zcode-cua` descriptor 可以启用该路径；每个 image 必须紧邻精确形态的 `image_ref {frame_id,width,height,actionable}`，bridge 必须校验 canonical base64、PNG/JPEG 文件头、MIME、实际尺寸、200 KiB 上限和单结果 `frame_id` 唯一性，并保持 bytes 与 block 顺序不变。`PostToolUse` hook 文本是这批 tool result 之后的附件，不进受保护的结果，不能替换或重排媒体对。任一校验失败时必须原子移除本次结果中的全部 CUA image/image_ref 并返回错误，禁止只留引用、只留图片或退回 artifact/文本占位。第三方同名 MCP 仍走通用 result budget，不能获得豁免。
+- official CUA 结构化结果在 Host 内只由 `modelContentProtection=official_cua_frame_v1` 表示；不要再增加或恢复并行 preserve boolean。`returnedBytes` 是文本与真实媒体载荷的唯一 aggregate，hook 文本不进 tool result，不计入它；不能依赖第二份 `mediaBytes` 镜像状态。
 - shared `node_repl` 内的 CUA SDK 不得把 producer 的 legacy MCP 文本 envelope 原样再提交给模型。成功的纯文本 action/metadata 结果只在 Worker 中归一化为 SDK 字段；若还需向 Host 传递 app-display `_meta` 或 action-state，structured sink 必须使用空 `content` 的 sideband projection。只有错误或受保护的 image/`image_ref` 结果可以携带模型可见 `content`。这样同一 cell 末尾的 `nodeRepl.write(state.text)` 是唯一 AX 文本来源，不会与动作回执或 `content`/`text`/`message` 镜像叠加。
 - official CUA plugin-host 恢复 broker token 前只校验真实权威事实：bundled official plugin id、已捕获的 authority/token 和与捕获值完全相等的 socket。`--permission-mode product` / `--backend broker` 从未参与 producer 运行时决策，不得再注入或当作安全凭据；注入 canonical socket 时必须清掉 `--` terminator 之前的旧标签，混版本配置不能继续把伪安全状态传给 producer。任一真实凭据缺失或漂移仍必须在 import 前 fail closed。
 - official CUA 的目标应用图标不得依赖模型重复输出 `bundle_id`，也不得由 Renderer /
@@ -319,11 +1013,17 @@ MCP 动态 tool 还需要额外确认：
   target 时才兜底启动 GUI emulator；`android_start_emulator` 只负责启动新的
   GUI emulator，不负责复用既有 target；复用既有真机或 emulator 时，后续
   target 类 tool 应直接传入已知 `serial`。
+- Android plugin 0.1.1 的执行链为 MCP tool → SDK 优先 / 绝对 PATH 查找 →
+  项目外真实路径校验 → 绝对路径执行，不调用 `where/which`，不裸跑 Java 或
+  Windows `cmd.exe`。显式构建仍可执行项目 Gradle wrapper；工具 schema、权限、
+  App 投影和 iOS 插件不变。Bootstrap 更新失败不得回退到漏洞版本。
+  完整边界与回归场景见 [插件兼容](../plugin-compat.md#android-tool-lookup-security-011)。
 
 ## 大内容兜底要求
 
 大内容 tool 需要在自身语义层先限制结果，再让 executor 的 `resultBudget` 作为最后保险。
 
+- formatter 已对某个输出自行限长时，tool 可以声明 `isModelContentBounded(output)`；返回 `true` 的输出不再按 `resultBudget` 落盘或截断。只用于有确定上限的文本，例如 Bash 失败结果的头尾截断；executor 不按 tool 名称判断。
 - `Read` 文本默认规则：未显式传 `limit` 时，如果文件总大小超过 `256KB`，返回稳定错误并提示使用 `offset` / `limit`；显式传 `limit` 时，必须按完整文件的真实行区间读取，而不是先截断头部再切片。
 - 用户提交的文本附件通过合成 `Read` 调用/结果进入模型上下文时，同一附件生成的 reminder body 使用单换行连接，不同附件仍使用双换行；超过默认 `2000` 行上限时，模型可见提示必须明确“first 2000 lines”并提示按需继续读取该文件。
 - `Read` 文本选中内容还需要经过 `25_000` token 输出预算校验；超过时返回稳定错误，让模型缩小 `offset` / `limit` 范围。
@@ -355,6 +1055,7 @@ MCP 动态 tool 还需要额外确认：
 - 文件保真：`Edit` 是否保持原编码和原换行风格，`Write` 是否按完整内容写入，并且所有文件 I/O 都通过 `FileSystemPort`。
 - 文件内容契约：`FileSystemPort.readTextFile` 返回给 core 的 text content 应是 LF 规范化后的 Unicode 逻辑内容，并通过 metadata 暴露原始 `encoding` 与 `lineEndings`；`Edit` / `Write` / `ApplyPatch` 需要保真写回时必须把这些 metadata 传回 adapter，而不是在 handler 中直接接触底层 bytes。
 - 文本编码边界：filesystem adapter 负责 BOM、UTF-8、UTF-16LE 以及常见中文 legacy 编码（GB2312 / GBK / GB18030）的检测、解码和写回。模型可见工具说明只表达“复制 Read 的逻辑文本即可”，不要要求模型猜测或传入编码参数。新增编码能力必须覆盖读、范围读、编辑、完整写入、结构化 patch、不可编码字符失败和二进制误判保护。
+- 大文本采样边界：`4096` 字节样本末尾的 UTF-8 候选按缺少字节数补读后再严格校验；未完成状态不能直接确认 UTF-8，非法续字节进入原有 legacy 检测。正文继续共用流式 decoder。按 [Read 文本大文件预算](01-read.md#文本大文件预算) 覆盖短读、EOF、ASCII 前缀后的 GB 字符与附件最终 provider 请求；不把有限采样视为全文件编码保证。
 - 错误契约：未读、partial read、stale file、匹配失败、多处匹配、notebook、权限拒绝和文件过大必须有稳定错误码，不能依赖英文错误文本判断流程。
 - 模型结果序列化：文件变更成功时只返回短确认文本；完整内容、diff 和 patch 留给内部 output、事件、UI projection 或 artifact。
 - Read 模型可见序列化：文本读取结果必须用专用 `formatModelContent` 输出 cat-n 风格行号文本，不得回退到 JSON 字符串化，否则 tab、换行等会被转义并污染后续 `Edit.old_string` 精确匹配。
@@ -406,6 +1107,8 @@ Browser use 虽由 `js` REPL 驱动，但其 capability manifest、模型文档�
   包，走宿主注入，不要再给模型开配置工具。
 - 模型代码的 import 因此只支持 `node:*` 内置模块与基于 skill root 的绝对 `file://` URL，裸包名
   不解析。两个官方 SDK 的 bootstrap 本来就是这个形态。
+  （2026-11-09 更正：此句只对动态 `import()` 成立。`require` 由 `createRequire(cwd)` 创建，裸包名从工作区
+  `node_modules` 解析；现行规则见根目录 `docs/mcp-stateless-node-repl.md` 的 `### js`。）
 - 删除只作用于可执行路径。历史回放渲染仍依赖 `packages/shared/src/tool-identity.ts` 与
   `packages/ui/src/lib/nodeReplToolDisplay.ts` 里的名称映射：那两处只读取历史 transcript 里的
   toolName，与当前 `tools/list` 无关，删掉会让旧会话的调用块退化成 unknown fallback renderer。
@@ -546,6 +1249,13 @@ Browser use 虽由 `js` REPL 驱动，但其 capability manifest、模型文档�
 - `sideEffectScope`、`riskLevel`、`needsApproval`。
 - `permission`、`resultBudget`、`timeout`、`cancellation`、`trace`。
 - `handler` 和可选 `formatModelContent`。
+- 可选 `formatBatchNotice`：返回 `{ source, content }` 时，工具批次结算后把它作为该 source 的
+  system-reminder 附件排在这批 tool result 之后（不进 tool_result）。结算代码只调用这个钩子，
+  不按工具名或输出形状特殊处理某个工具；Read 用它发送 `read_truncation_notice`。
+  工具 Hook 的 `tool_hook_context` 附件由同一结算写入，排在这些批次提示之前。
+  "一批结果 → 模型 entries"只有一个函数（`toolBatchModelEntries`，`runtime/helpers/tool-result.ts`），
+  Main 结算和 Memory Agent 循环（Extraction、Dream）都调用它；新增工具结果语义只改这里，
+  所有调用方一起生效。
 - registry `toContracts()` 是否把模型、runtime 或 provider adapter 需要的字段投影出去。
 
 不要只注册 handler；tool 声明是权限、调度、prompt、adapter、executor、UI 和测试共同消费的契约。
@@ -641,6 +1351,8 @@ Browser use 虽由 `js` REPL 驱动，但其 capability manifest、模型文档�
 - permission `patternSources` 是否覆盖路径、命令、domain、toolName、input 或 custom 来源。
 - allow/deny/ask、mode、allowedTools、disallowedTools、plan/read-only 限制是否仍正确。
 - hooks 的 `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` 是否需要看到新增字段，hook 修改 input 后是否重新归一化。
+- 工具 Hook 的 additionalContext 只走工具批次后的 `tool_hook_context` 附件；不得拼回 tool_result、
+  tool result 预算或 `tool_call_result` 事件。单条超过 10000 字符时落盘成 `<persisted-output>` 外壳。
 - `PermissionRequest` hook 与交互 broker 是并发竞速关系（`../permission-responder-race.md`）：
   broker 应答通道必须在确认窗可见后立即建立，hook 卡死/失败只令其退赛，不得阻塞用户应答，
   也不得转成 deny。改动 ask 路径时不得把两者重新串行化。
@@ -681,7 +1393,9 @@ Executor 是 client-side tool 的受控执行入口。`packages/core/src/tool/ex
 - 单个 tool call 编排只负责串起归一化、schema 校验、hook、permission、handler、结果序列化、事件和后台任务追踪。
 - permission flow 只负责 permission service、project rules、broker request、PermissionRequest hook 和 permission update 持久化；不得直接执行 handler。
 - hook flow 只负责构造 hook 输入、解释 hook 输出和 additional context；hook 修改 input 后必须回到 executor 主流程重新归一化与校验。
-- result serialization 只负责 `resultBudget`、artifact 写入、模型可见内容和字节截断；UI diff display、事件投影和日志不应反向解析模型可见文本。
+  工具 Hook 的 additional context 由 hook flow 格式化，executor 放进 `ToolExecutionResult.hookAdditionalContexts`
+  （成功、失败、PreToolUse 拒绝和提前失败都一样），由结算写成附件。
+- result serialization 只负责 `resultBudget`、artifact 写入、模型可见内容和字节截断；不追加 Hook 文本。UI diff display、事件投影和日志不应反向解析模型可见文本。
 - background task tracker 只负责 task polling 和 background task session event；不得影响当前 tool call 的成功/失败结果。
 - batch/schedule 只负责并发组、blocking failure 和 skipped tool result 合成；不得绕过单个 tool call 的 permission、hook、timeout 和 trace 传播。
 
@@ -1053,6 +1767,16 @@ replayable 保持原有交付链路。验证包含协议候选严格校验、Rea
 
 SendMessage / RespondToCoordinator 的来源呈现遵循 `../loop/turn-steering.md`：更新 coordinator 识别提示，保留历史前缀兼容与已有回复/继续工作合同。参数、权限、执行目标、background batch 与可见性边界不扩展；child 不获得 SendMessage，parent peer 的回复目标来自绑定 agent-id。验证工具描述、真实父子 Runtime 请求、冷恢复及 BG25/O18/O19 fixture。
 
+### 2026-09-18 ToolSearch E2E 补齐
+
+仅扩展测试与文档：真实入口 → 搜索执行 → 最终 HTTP body → compact/fork/重启后的第一条请求；包含关闭请求以验证降级和恢复。产品 schema、权限、SQLite 和 App 协议均不变。验收场景见根目录 conversation-session coverage matrix 的 TS 子场景。
+
+### 2026-09-18 ToolSearch E2E 正式准入
+
+本次及此前 8 个 spec（29 项）经用户确认转正，case-local fixture 成为实际模型响应来源，
+原请求阶段、取消屏障与产品断言保持不变。只修改测试和文档；不新增生产接口或修改
+数据库、协议。正式路径与运行证据见根目录 coverage matrix，Docker 准入单独记录。
+
 ## CreateWorkflow 修订续跑的会话内免确认（2026-09-13）
 
 ```text
@@ -1251,6 +1975,7 @@ UI/V4 投影：事件日志多一行「并发上限 8 → 2」；并发 chip 不
 V4 普通主任务审批可声明 fullAccess：同一 resolveInteraction 先取得 broker 应答权，
 原子保存任务权限和已接纳未执行队列的权限后，再允许当前工具。Runtime、Composer、
 队列各自保留 Plan；项目 ruleset/default、其他任务、用户问答与独立 workflow 确认不变。
+新投影声明自主模式选项；授权目标随同一事务写入当前会话、队列与回执。自主或完全访问实际提交成功时返回既有 `resolveInteraction.resolvedBy` 结果；未命中仍幂等成功但无授权证明。App 据此更新发起端项目的新会话权限偏好。项目归属读取失败不阻断审批。若同一 interaction 已保存另一模式，失败回执的结构化原因码标明已提交模式，UI 只允许按该模式显式重试；失败回执本身不更新 Recent。
 完整提交、失败恢复、兼容与 PA158 回归清单见根目录
 `docs/working-memory/provider-refactor/steps/todo-158-permission-dialog-full-access-and-queued-mode.md`。
 子代理请求通过父任务展示不意味着父 Runtime 拥有子 Runtime；未实现完整能力不得投放此选项。
@@ -1315,8 +2040,8 @@ resume 与修订各自重开一次进程内时钟，而同卡的 tokens 是整�
 新增 `ToolInputResolutionContext.hasLoadedSkill?`（core/tool/types.ts）→ `ToolExecutorOptions` /
 `ToolExecutorDeps` → call-runner 的解析上下文；runtime-tools.ts 只在 `deps.skillPort` 在场时注入探针，
 用 `messageHistory.borrowReadOnlyRuntimeEntries()` 回答。判据取历史而不是会话级标志：compaction 用摘要
-替换历史后技能正文已不在模型上下文里，门随之重新关上（与 Edit 要求 Read、compact 后清 readFileState
-同一种语义）；resume / rewind 重建历史即重建答案，无第二套 hydration。输出形状、权限判定、事件、v4
+替换历史后技能正文已不在模型上下文里，门随之重新关上（与 Edit 要求 Read 同一种语义：compact 后
+readFileState 只留补回给模型的文件）；resume / rewind 重建历史即重建答案，无第二套 hydration。输出形状、权限判定、事件、v4
 协议与 UI 零改动。`DYNAMIC_WORKFLOW_SKILL_NAME` 从 bootstrap 迁到 contracts（core 与 bootstrap 共用）。
 测试：`core/tests/workflow-skill-gate.test.ts`（四家 × 未加载拒绝 / 已加载放行 / 无探针放行 + 两条例外）、
 `core/tests/loaded-skills.test.ts`（成功 / 未完成 / 出错 / 别的技能 / 旧 `{name}` 形 / compaction 后）、
@@ -1459,6 +2184,15 @@ TUI 与 headless（`--prompt`、`--target`）没有 Host 下发灰度 mode，改
 
 ## ReplyToChannel（2026-09-23）
 
+2026-10-21：暂停内置暴露，后续由插件重新提供（本次不实现插件）。仅注释默认注册及 import、
+Host 默认发送接线和模型调用提示；保留 handler、权限规则、CLI reply port、Host 反向请求处理、
+远端 relay 协议、共享 schema、Bot 发送实现及对应测试。
+模型上下文不再注入工具名、发送 refId、按名字查询或调用后去重指引，原提示源码保留为注释。
+原生 mention 的有序位置、显示名与 isCurrentBot 仍用于判断分工；canonical 输入及其持久化不变。
+普通最终回复继续自动回传。依赖默认入口的 MN-02/FN-01 组合 E2E 和窗口发送接线用例暂时跳过，
+原用例及 fixture 完整保留，待插件接入后恢复；独立实现测试继续执行。
+以下发送合同只描述保留的实现，不代表当前默认产品入口可用。
+
 工具用当前任务绑定会话已确认的 mention refId 发送原生提及，包括客户端续聊引用历史目标；不接收群 ID、应用 ID 或裸用户 ID。
 2026-10-08：新增 mentionName（name、可选 candidateRef），由 Host 在当前授权会话查询真实身份。
 输入 schema/模型工具 schema/描述 → 当前执行输入 → 现有 reply port/协议 → Host 查询与复核
@@ -1473,6 +2207,10 @@ botGroupSource 仅表达单条输入来源，不是调用前提；Host 唯一绑
 保留 tool trace、取消、既有权限策略与结果预算；属于 network 副作用，非只读，非破坏性。
 普通最终回复仍由 Bot 自动发送；仅用户明确要求发送/提及时使用，不能借普通文本恢复 mention 身份。
 工作区与本地/远端身份验证在 Host，群授权及投递幂等在 Bot；不新增 accepted queue。
+
+## Agent 官方插件发现与确认安装
+
+`SearchPlugins` / `SuggestPluginInstall` 经 contracts -> Core handler -> 注入的 PluginDiscoveryPort -> Bootstrap 官方目录/安装适配器；V4 pluginInstall 专用交互由 CLI 发出，桌面/手机通过 resolveInteraction 回应。UI 仅提交选择，安装继续复用 storage lock、内置恢复和 User/Workspace 启用原语。运行时是否向模型开放这两个工具取决于本次输入的可信 attachment；不从 SessionEntry 或其他订阅继承。旧订阅收到可解析的快照和增量；确认命令还要校验本连接能力。工具内部显式确认合同绕过重复通用弹窗，但 project deny/ask 和 plan 限制保留；yolo 也必须点击卡片，绝不套用 AskUserQuestion 自动结束。SearchPlugins 对官方候选使用 BM25，ToolSearch 保持原有排序。两个工具均为 deferred（`shouldDefer`），经 ToolSearch 按需加载；Session-specific guidance 暂不注入插件推荐提示。卡片实际写入后请求同一 session 安全重载：先落盘结果、排空已接纳工作，再通过现有生命周期控制器换代；旧工具结果不能把新实例标为插件 ready。连接能力逐轮校验，旧连接不会收到 pluginInstall 帧。详见 docs/plugins/agent-plugin-discovery.md。
 
 ## 脚本为每个子代理点名模型（2026-09-26）
 
@@ -1615,8 +2353,122 @@ interrupted result。修复不改变工具 schema、权限、执行时机、协�
 后续历史只作背景。共享协议沿用严格 botGroupInputSourceSchema，不新增工具或执行队列。
 
 2026-10-09 机器人身份回归：Host 原生来源 → botGroupSource 持久化 → conversation-quotes
-模型投影 → ReplyToChannel。可信 mention 增加由 botIdentity.openId 比对派生的 isCurrentBot，
+模型分工投影。可信 mention 增加由 botIdentity.openId 比对派生的 isCurrentBot，
 区分同名机器人分工；不暴露其他目标 ID，不修改工具 schema、发送授权或 CLI admission。
 
 身份定位补充：conversation-quotes 将原始有序 text/mention 节点逐条映射到模型专用
 材料，保留同名手打文字与原生提及的区别，不改持久化正文或发送 ref 的授权边界。
+
+2026-10-09 子代理模型的 provider 边界：`subagent_model` 与脚本 `model` 名字的解析（core `model-reference.ts`）
+不再让裸 `modelId` 落到会话 provider 以外的条目上——裸名只在当前 provider 下找，只在别处有即
+`other_provider` 业务失败并列出全称；跨 provider 只有全称一种写法，而技能、两个工具的字段描述与
+`docs/dynamic-workflow/launch.md`「`subagent_model`」都改为：绝不自行把子代理换到用户没点名的另一个
+provider 的模型上。起因是主代理照技能示例自选「轻量」模型，把子代理送去了另一张账单。目录无
+`current` 条目时保持旧的「唯一就取、多个即 ambiguous」。全称仍能跨 provider，所以权限补上一道：
+`AmendWorkflow` 的 resolveInput 最后一步（绑定表落定之后）算出 `predecessor.introduces_providers`——
+这次将用的 provider（归一化后的 `subagent_model` 与 `model_bindings`）减去会话模型与前驱 `run-launched`
+上用过的 provider，非空才在场；契约谓词 `isAmendWorkflowOwnedPredecessor` 见它在场即不给本会话 run
+免确认，权限服务照常 ask（`tool.alwaysAsk`），Deny 不动前驱。同 provider 换模型、沿用前驱的选择仍免
+确认；只改并发的就地调整与 `not_live` 落回不引入模型，不受影响。CreateWorkflow 本来就总开窗，不变。
+schema 只多这个回填键（模型面 JSON schema 不列，带 `predecessor` 的调用照旧在校验被拒）；事件与
+UI 不变，桌面只从前驱块读 `status` / `name`，旧客户端不受新键影响。
+
+## 插件使用归属
+
+ToolEntry 的 MCP pluginId 在执行准入时捕获，沿工具成功/失败事件、V4 tool.lifecycle、既有 agent_step 传递。保持 Skill 原字段兼容；普通 MCP 和未知归属留空，不从名字解析、不复制执行事件。仅增加可选 metadata，不改变工具执行、权限、存储和 continuous/replayable 交付。
+
+## UI 插件后台首次创建
+
+成功 MCP UI 工具结果沿现有 V4 投影提交后，以 `v4/plugin-ui/tool-result` 通知本地桌面宿主，
+不依赖 conversation 订阅或工具卡片挂载。复用已校验的 display.ui 和投影输入；失败、取消、
+MCP isError 和历史 hydration 不触发创建。工具执行、权限、原始结果和持久化不变；
+手机 replayable 不消费创建副作用。测试覆盖无订阅实时结果、重复事件、历史恢复、后台建页与返回复用。
+宿主执行/保留规则见根目录 `docs/plugin-ui-background-execution.md`。
+
+### 文档插件多窗口视图修复（2026-10-16）
+
+MCP app-only report_view 增加可选 viewId，release_view 释放指定窗口；模型 get_view 可选 viewId，缺省且存在多个上报窗口时返回歧义与清单。状态唯一归属 DocumentOwner，不由页面决定其他窗口的视图；旧客户端缺省 viewId 仍走 legacy 槽。show_in_viewer 保持专用 surface 路由并明确工具描述。导入仍为 app-only workspace 副作用；串行 admission、10 分钟未活动过期与部分文件清扫归 importer，完成副本不清理。覆盖 schema 到真实 MCP/AppBridge 的多窗口回归。
+
+## Session 整体关闭（2026-10-28）
+
+单任务 stop/restart → App.close → 各所属 runner 关闭准入、取消并等待真实执行与清理 → 释放资源。
+Agent/SendMessage/旧 Workflow/动态 workflow 均保留工具 schema、权限与历史展示，后台仅脱离 turn。
+取消结果沿既有工具/任务事件与持久化链返回；不能用 registry terminal 替代资源释放完成。
+详见 ../session-runtime-lifecycle.md「所属工作整体关闭」；桌面与手机复用同一后端事实，无 schema 迁移。
+
+### Session 关闭的执行与资源边界
+
+Agent / Workflow 的执行结果不被浏览器等释放异常覆盖。所属 owner 持有未释放的 child，
+正常后台工作结束后自动释放，主动关闭取消并等待；最终关闭依据当前资源释放结果，不重放模型执行。
+MCP 调用取消归 session，物理共享连接归 pool；详见 [生命周期](../session-runtime-lifecycle.md#关闭契约收口review-修订)。
+
+### 草稿 MCP UI 会话清理
+
+V4 `deleteSession` 复用 `closeSessionRuntime` 的统一生命周期 owner：先通知删除并摘除运行实例，再取消该 session 的 UI 工具调用、撤销实例凭证和 App tool 注册，等待 session 前缀的资源退订完成后关闭 App。按实例发起的异步退订不能代替这个等待，否则多 server 退订会与 pool lease 释放竞争。不能依赖共享 MCP 连接退出清理；其他 session 可继续持有同一连接。回归在 `v4-cold-resume.test.ts` 覆盖删除中的调用和共享连接隔离。
+
+### 浏览器关闭路由修复（2026-10-29）
+
+Browser js → BrowserControlPort → protocol broker 登记已校验路由 → Host/Main 执行。
+关闭/轮尾/取消使用原控制资源路由，不再依赖活动 session；关闭等待真实结果并传播失败。
+保持工具 schema、权限、会话身份、主标签页保留和子会话临时标签页策略；无协议和持久化迁移。
+
+## Browser control scope 生命周期
+
+node_repl browser-client → protocol broker → 已有 browserExecute 反向协议 → Host → Main owner。
+声明 controlScopes 能力的后端首次使用前建立实例级作用域，内部 openScope/releaseScope 不暴露为模型工具。
+业务命令与模型结果格式不变；作用域的准入、关闭屏障和重试契约见根 docs/session-task-restart.md。
+
+Browser control scope 的 admission 失败可由下一次业务请求用原 ID 重试；未知结果保留释放责任，
+只清除失败 flight。关闭优先于新 admission，不自动重放业务命令。Host ambient 无实例 ID 的
+只读 list 汇总同一会话路由的受控页面；模型 execute、取消、释放仍严格隔离实例。
+
+### 默认安装并在当前工作区启用
+
+推荐候选 → `install/workspace` 确认卡片 → 同一插件存储锁内安装并写当前工作区启用 → 校验有效启用态 → 现有安全重载。已安装时仅启用，不改用户级显式禁用及其他工作区覆盖。旧 `install/user` 确认不能被升级授权；失败不冒充已就绪。规格见根 docs/plugins/agent-plugin-discovery.md。
+
+### 插件推荐多语言载荷边界
+
+官方目录 → 共享翻译表裁剪器 → 推荐候选 → 安装交互 → 共享 schema 校验 → 持久化与 V4 投影。名称和描述分别限制语言数量、键/文本长度及 JSON UTF-8 字节数；优先保留全部支持的界面语言与默认文本。协议采用同一组上限，超限原始字段不得进入交互事件；确认、启用和自动 reload 不变。见根 docs/plugins/agent-plugin-discovery.md「多语言载荷边界」。
+
+### 草稿 MCP UI 会话清理
+
+V4 `deleteSession` 复用 `closeSessionRuntime` 的统一生命周期 owner：先通知删除并摘除运行实例，再取消该 session 的 UI 工具调用、撤销实例凭证和 App tool 注册，等待 session 前缀的资源退订完成后关闭 App。按实例发起的异步退订不能代替这个等待，否则多 server 退订会与 pool lease 释放竞争。不能依赖共享 MCP 连接退出清理；其他 session 可继续持有同一连接。回归在 `v4-cold-resume.test.ts` 覆盖删除中的调用和共享连接隔离。
+
+### Agent workspace 身份回归（2026-10-26）
+
+Bash 返回 resolvedCwd → 父 runtime 更新执行 cwd → Agent 创建 child 时分别继承稳定 workspace 身份与当前执行 cwd → SQLite 保留同 workspace 父子链 → 重启后目录 owner 校验及 V4 冷订阅。验证真实 cd、旧 child 错误 cwd、跨 workspace 拒绝；不改变 Bash 的 cd 语义或工具 schema。
+
+## MCP 启动失败诊断（2026-10-30）
+
+stdio stderr → adapter 有界缓冲与脱敏 → 已有 `McpServerStatus.error` → `mcp/list` → 设置详情。
+连接失败在传输错误后附带最近 stderr，去除 ANSI；HTTP/SSE 不附带 stdio 信息。
+界面处理建议只按已有 `failureKind` 国际化，不按错误文本分流；`tools/call`、工具结果、
+权限、重试和错误分类不变。展示契约见根 `docs/settings-mcp-list.md`，CLI 回归在
+`packages/adapters/tests/mcp.test.ts`，App 使用候选 E2E，不恢复业务单测。
+
+## MCP App 授权失败的错误类型（2026-11-05）
+
+`ToolExecutor.authorizeAppTool` 是宿主发起的插件工具调用（`mcp/uiCallTool` 与 `plugins/mentionItems`）
+共用的授权链：schema 校验 → PreToolUse hook → 权限规则 / 审批。失败时改为抛 `CoreError`，保留稳定类型，
+调用方按 `type` 分支，不读错误文本：
+
+| 失败                                     | `type`                                                                                |
+| ---------------------------------------- | ------------------------------------------------------------------------------------- |
+| 输入不合工具 schema（含 hook 改写后）    | `invalid_input`                                                                       |
+| hook 拒绝或要求停止                      | `permission_denied`                                                                   |
+| 权限拒绝（deny 规则、用户拒绝）          | `permission_denied`（沿用执行器的拒绝结果类型）                                       |
+| 其他未放行（取消、升级、规则加载失败等） | 执行器结果里的原类型（如 `tool_cancelled`、`permission_escalation`、`storage_error`） |
+
+链路：宿主调用 → session facade `callMcpToolForUi` → `authorizeAppTool` → 连接代际复验 → `McpPort.callTool`。
+错误信息文本不变；`mcp/uiCallTool` 的协议错误按现有 `toProtocolError` 规则多带 `data.code`（大写的 CoreError code），
+页面不依赖它。工具 schema、权限判定、审批事件、hook、tools 段字节与 UI/V4 投影都不变；
+`plugins/mentionItems` 把 `permission_denied` 映射为 `plugin_mention_tool_denied`（见 [插件兼容](../plugin-compat.md#composer-mention-items)）。
+回归：`packages/core/tests/app-tool-authorization.test.ts`（放行、用户拒绝、deny 规则、输入不合 schema）。
+
+## Bash 摘要描述（2026-11-04）
+
+已有可选 input.description 经 V4 input 原样进入 UI；执行摘要优先显示非空描述，缺失时显示命令。独立行、组内子项与活动组头共用 Execute renderer；展开后摘要继续显示非空 description，详情保留命令和输出；权限详情保持实际命令。只修改 UI 展示，不改 schema、执行、权限、事件或持久化。验收见根 docs/ui/tool-display-rendering.md 的 Bash 调用描述与浏览器分组候选。
+
+## legacy 会话事件剥掉后加的字段（2026-11-06）
+
+legacy v1 的 `session/events` 由 `bootstrap/src/zcode-protocol/session-mapper.ts` 整体 spread CLI 事件的 payload，App 侧是 strict schema，整页 `safeParse`。后加到 CLI 事件里、legacy schema 没有声明的字段要在 mapper 里剥掉，不改 App 的 schema（已经装出去的旧桌面同样会整页失败）。这次补上两处：`ToolCallStarted` 的 `readOnly`、`sideEffectScope`（解析后的副作用能力，只给 core 与 dynamic-workflow 用），`PermissionRequested` 的 `fullAccessSupported`（只给 v4 的审批）。漏掉时的后果：App 的 `readSession(view: "summary")` 经事件读 `executionId`，调用过工具、正在运行的会话报 ZodError，中断不了（2026-11-06 PLM-JARVIS-2 的运行时证据；示例插件 Jarvis 已迁出到市场仓库，那个 E2E 已删除）。回归由 `bootstrap/tests/session-mapper-legacy-strip.test.ts` 守住。以后给工具或权限事件加字段，同时决定 legacy mapper 要不要剥。

@@ -1,6 +1,7 @@
-import { parseRuntimeSubagentConfig } from "./subagent-runtime-config.js";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { readFile, readdir } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import { parseRuntimeSubagentConfig } from "./runtime-subagents/index.js";
 import { migrateUserSubagentMarkdown, migrateSubagentStateFile } from "@zcode/shared/node";
 import {
   parseAgentProfileFromMarkdown,
@@ -20,6 +21,7 @@ interface LoadZCodeAgentProfilesInput {
   logger?: Logger;
   storageRoot: string;
   workingDirectory: string;
+  additionalDirectories?: readonly string[];
 }
 
 interface LoadZCodeAgentProfilesResult {
@@ -50,10 +52,20 @@ export async function loadZCodeAgentProfiles(
 ): Promise<LoadZCodeAgentProfilesResult> {
   const migration = await migrateUserSubagentMarkdown(join(input.storageRoot, "agents"));
   await migrateSubagentStateFile(join(input.storageRoot, "v2", "agents-state.json"));
-  const roots = [
+  const roots: Array<{ path: string; source: "user" | "project"; namespace?: string }> = [
     { path: join(input.storageRoot, "agents"), source: "user" as const },
     { path: join(input.workingDirectory, ".zcode", "agents"), source: "project" as const },
   ];
+  for (const directory of new Set(
+    (input.additionalDirectories ?? []).map((path) => resolve(path)),
+  )) {
+    if (directory === resolve(input.workingDirectory)) continue;
+    roots.push({
+      path: join(directory, ".zcode", "agents"),
+      source: "project",
+      namespace: basename(directory),
+    });
+  }
   const diagnostics: AgentProfileParseDiagnostic[] = [];
   for (const failure of migration.failures) {
     diagnostics.push({
@@ -67,20 +79,24 @@ export async function loadZCodeAgentProfiles(
       error: String(failure.error),
     });
   }
-  const agentState = readAgentState(input.storageRoot);
-  const documents = roots.flatMap((root) =>
-    listMarkdownFiles(root.path).map((path) => ({
-      path,
-      source: root.source,
-      content: readFileSync(path, "utf8"),
-    })),
-  );
+  const agentState = await readAgentState(input.storageRoot);
+  const documents = (
+    await Promise.all(
+      roots.map(async (root) =>
+        Promise.all(
+          (await listMarkdownFiles(root.path)).map(async (path) => ({
+            path,
+            source: root.source,
+            namespace: root.namespace,
+            content: await readFile(path, "utf8"),
+          })),
+        ),
+      ),
+    )
+  ).flat();
   const parsed = parseRuntimeSubagentConfig({
     documents,
-    state: {
-      ...agentState,
-      disabledAgentIds: [...agentState.disabledAgentIds],
-    },
+    state: { ...agentState, disabledAgentIds: [...agentState.disabledAgentIds] },
   });
   for (const diagnostic of parsed.diagnostics)
     input.logger?.warn("Agent profile diagnostic", {
@@ -99,8 +115,13 @@ export function loadPluginAgentTemplates(
     if (!plugin.enabled) continue;
     const agents = plugin.components.find((group) => group.kind === "agent")?.items ?? [];
     for (const agent of agents) {
-      const filePath = join(plugin.rootPath, "agents", `${agent.name}.md`);
-      const result = parsePluginAgentProfile({ filePath, logger: input.logger, plugin });
+      // 名称可能来自 frontmatter，不能还原文件位置；只读取发现阶段保留的源路径。
+      if (!agent.path) continue;
+      const result = parsePluginAgentProfile({
+        filePath: agent.path,
+        logger: input.logger,
+        plugin,
+      });
       if (result.diagnostic) diagnostics.push(result.diagnostic);
       if (result.parsed) parsedProfiles.push(result.parsed);
     }
@@ -191,7 +212,9 @@ function parsePluginAgentProfile(input: {
       parsed: {
         bareName: result.profile.name,
         plugin: input.plugin,
-        profile: result.profile,
+        // 修复原因：插件 profile 按 user 解析，permissionMode 原样生效；bypassPermissions 会让
+        // 被委派的子会话在父会话 build 时以 yolo 运行。官方与第三方插件同一规则：声明只能收紧父会话模式。
+        profile: { ...result.profile, permissionModeRestrictOnly: true },
       },
     };
   } catch (error) {
@@ -228,13 +251,13 @@ function countBareProfileNames(
   return counts;
 }
 
-function readAgentState(storageRoot: string): {
+async function readAgentState(storageRoot: string): Promise<{
   builtInModelSelectionOverrides: BuiltInSubagentModelSelectionOverrides;
   pluginAgentModelSelectionOverrides: PluginSubagentModelSelectionOverrides;
   disabledAgentIds: Set<string>;
-} {
+}> {
   try {
-    const raw = readFileSync(join(storageRoot, "v2", "agents-state.json"), "utf8");
+    const raw = await readFile(join(storageRoot, "v2", "agents-state.json"), "utf8");
     const parsed = JSON.parse(raw) as {
       builtInModelSelectionOverrides?: unknown;
       pluginAgentModelSelectionOverrides?: unknown;
@@ -276,12 +299,15 @@ function normalizeBuiltInSelectionOverrides(
   return result;
 }
 
-function listMarkdownFiles(root: string): string[] {
-  if (!existsSync(root)) return [];
-  if (!statSync(root).isDirectory()) return [];
-
+async function listMarkdownFiles(root: string): Promise<string[]> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
+      throw error;
+    },
+  );
   const result: string[] = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
+  for (const entry of entries) {
     const path = join(root, entry.name);
     // 与 Host / Settings 一致，只加载根目录直接文件；插件使用独立发现入口。
     if (entry.isFile() && /\.(md|markdown)$/iu.test(entry.name)) {

@@ -1,6 +1,8 @@
 # 内置浏览器自由尺寸视口
 
 > 2026-09-07 坐标与 CDP 重连契约补充见 [Desktop 缩放坐标 spec](2026-09-07-desktop-zoom-coordinate-spec.md)：保留 raster 补偿，输入按已应用 metrics scale 换算；Main 在设置/重放 viewport 时归一 guest zoom，截图临界区内不得跳过重放。
+>
+> 2026-10-16 起放大档也改为 renderer 布局补偿（webview 布局 ×1/zoom + scale(zoom)），CDP metrics 不再带 scale，输入不再乘倍率；下文 2026-07-22「guest metrics 放大补偿」已被取代，原因见同一 spec 的「CDP idle detach 后页面变大变小」。
 
 日期：2026-07-15（2026-07-16 补充截图像素、超时重入与横向滚动链语义；2026-07-17 补充顶部尺寸输入、预览缩放、高视口、越界反馈、默认 Fit、纵向滚动链、模型主动打开/resize 静默语义、全局缩放隔离与 guest 合成层覆盖/缩小布局补偿；2026-07-20 补充 Retina 宿主可见 surface 与 DPR=1 页面指标的解耦、按 tab 创建来源区分默认尺寸、截图 raster 尺寸自校正、截图首帧 CSS 1× 基准，以及动态尺寸的高质量宿主降采样；2026-07-22 补充 Desktop zoom 动态 Fit 重测、更正延迟 transform 误判，改为 guest metrics 放大补偿，并锁定 metrics 完成后的 guest zoom 归一时序；2026-07-24 补充负 Desktop zoom 下截图 surface 就绪尺寸的逻辑归一化；2026-08-03 补充拖拽中窗口失焦的取消语义；2026-08-05 补充多 tab 切换时 Fit 首帧稳定语义；2026-08-30 补充人类用户浏览器显示偏好的跨重启持久化及 Agent Browser Use 隔离）
 状态：已实现
@@ -14,6 +16,13 @@
 | Existing docs         | `docs/browser-use/2026-07-08-webview-cdp-on-guest-pivot-spec.md`、`docs/ui/web-element-context.md`                                                                                                                                                                                 |
 | Existing code owners  | `BrowserToolbar`、`UnifiedBrowserView`、renderer 内 `<webview>`、`BrowserGuestManager`、browser-client `Tab`                                                                                                                                                                       |
 | Out of scope          | UA、touch、方向传感器、网络限速、设备列表、网页自身 zoom、Browser Tab/URL/history 跨重启恢复、Web/手机端独立 Browser runtime                                                                                                                                                       |
+
+## 工具栏选中态
+
+- “自由尺寸”和“选择元素”启用时，统一使用 `bg-accent text-icon-blue`：蓝色图标配合主题对应的蓝色底色，避免灰色选中态与普通悬停混淆。
+- 悬停在已启用按钮上时保留同一蓝色前景和底色；取消后恢复普通 ghost 按钮样式。
+- 保留现有 `aria-pressed`、提示文案、禁用态、按钮尺寸及点击行为；人类 Browser 与 Agent Browser Use 共用此样式。
+- 视觉验收使用真实 `BrowserToolbar`，覆盖 Zai Light / Zai Dark、宽屏 / 390px 窄宽度、中英文，以及未选中、选中、悬停和取消。Web / 手机端不因此新增内置浏览器能力。
 
 ## Clarification Log
 

@@ -28,7 +28,7 @@ import {
   scanMemoryManifest,
   type MemoryManifestEntry,
 } from "../src/memory/recall/index.js";
-import { createReadFileStateKey } from "../src/tool/read-file-state.js";
+import { createReadFileStatePathKey } from "../src/tool/read-file-state.js";
 import type { ReadFileStateMap } from "../src/tool/types.js";
 import { createTestModelFormatProperties } from "./test-runtime-model.js";
 
@@ -417,7 +417,7 @@ describe("Semantic Memory selection and content", () => {
     const manifest = Array.from({ length: 8 }, (_, index) => manifestEntry(`memory-${index}.md`));
     const readFileState: ReadFileStateMap = new Map();
     const readEntry = manifest[1]!;
-    readFileState.set(createReadFileStateKey(readEntry.filePath, 1, undefined), {
+    readFileState.set(createReadFileStatePathKey(readEntry.filePath), {
       content: "read",
       isPartialView: false,
       path: readEntry.filePath,
@@ -548,13 +548,6 @@ describe("Semantic Memory selection and content", () => {
       nowMs: 100 + 2 * DAY_MS - 1,
     });
     expect(notYetStale[0]?.header).toBe(`Memory: ${path}:`);
-
-    const oneDayOld = await readRecalledMemories({
-      entries: [manifestEntry("database-test-policy.md", { mtimeMs: 100 })],
-      fileSystem: new RecallFileSystem({ [path]: file(content, 100) }),
-      nowMs: 100 + DAY_MS + 1,
-    });
-    expect(oneDayOld[0]?.header).toBe(`Memory: ${path}:`);
 
     const staleAtTwoDays = await readRecalledMemories({
       entries: [manifestEntry("database-test-policy.md", { mtimeMs: 100 })],

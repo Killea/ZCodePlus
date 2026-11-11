@@ -14,6 +14,7 @@ This file is meant for coding agents. When generating or editing UI in this repo
 The dedicated `text-ui-*` scale is a mandatory repository-wide constraint for application interface typography:
 
 - UI components must use `text-ui-xl`, `text-ui-lg`, `text-ui-base`, `text-ui-caption`, `text-ui-sm`, or `text-ui-xs`.
+- The shared Settings section heading may use the dedicated `text-ui-settings-title` / `lg:text-ui-settings-title-lg` role defined below.
 - Do not introduce Tailwind's built-in `text-base`, `text-sm`, or `text-xs` for application UI.
 - Do not introduce arbitrary UI font sizes such as `text-[13px]` or inline `font-size` values.
 - The only content-level exceptions are code, Diff, and terminal rendering that consume their independent numeric font-size settings. Their surrounding controls, labels, headers, and metadata must still use `text-ui-*`.
@@ -89,6 +90,8 @@ Default light and dark CSS variables still exist as fallback foundations, but ne
   Low-elevation container surface.
 - **Surface Hover**: `--color-surface-hover`
   Hover state for low-elevation surfaces.
+- **Remote Continuity Panel**: `--color-remote-continuity-panel`, `--color-remote-continuity-panel-surface`, `--color-remote-continuity-panel-foreground`, `--color-remote-continuity-panel-subtle`
+  Reserved for the first-connect local-offline / remote-running comparison. It stays dark in both themes so the handoff remains visually stable; do not reuse it as a generic dark card.
 - **Card**: `--color-card`
   Standard content card background.
 - **Card Selected**: `--color-card-selected`
@@ -117,6 +120,10 @@ Default light and dark CSS variables still exist as fallback foundations, but ne
 
 ### Border colors
 
+- **Desktop Resize Handle**: `--color-resize-handle` uses sky-500 in light themes and sky-400 in dark themes. Use only for desktop workspace resize indicators; retain the existing geometry and interaction states.
+
+- **Voice Input Recording**: `--color-voice-input-surface` (sky-100 `#e0f2fe` in light themes, sky-950 `#082f49` in dark themes) and `--color-voice-input-wave` (sky-600 `#0284c7` light, sky-300 `#7dd3fc` dark). The tokens hold these hex values directly, because Tailwind 4's oklch sky palette renders slightly different colors. Use only for the composer voice input recording pill: the surface fills the pill, the wave colors the level bars and the stop square.
+
 - **Border**: `--color-border`
   Default border and separator.
 - **Border Hover**: `--color-border-hover`
@@ -132,6 +139,9 @@ Default light and dark CSS variables still exist as fallback foundations, but ne
 - **Success**: `--color-success` with `--color-success-foreground`
 - **Warning**: `--color-warning` with `--color-warning-foreground`
 - **Destructive**: `--color-destructive` with `--color-destructive-foreground`
+- **Success surface**: `--color-success-surface` with `--color-success-surface-foreground`
+- **Warning surface**: `--color-warning-surface` with `--color-warning-surface-foreground`
+- **Destructive surface**: `--color-destructive-surface` with `--color-destructive-surface-foreground`
 - **Idle-time task**: `--color-idle-task` with `--color-idle-task-surface`
   Use only for idle-time queue and paused tags so they remain visually distinct
   from the green scheduled-task treatment.
@@ -139,6 +149,7 @@ Default light and dark CSS variables still exist as fallback foundations, but ne
 - **Diff Removed**: `--color-diff-removed` with `--color-diff-removed-foreground`
 
 Use semantic colors only for actual semantic states. Do not borrow success, warning, or destructive colors just to make a block feel louder.
+Use `*-surface` for translucent state chips and banners; pair it with the matching `*-surface-foreground` and never add ad-hoc alpha in a component. Surface foreground values must preserve at least 4.5:1 contrast across shipped themes.
 
 ### Blocking interaction colors
 
@@ -191,31 +202,31 @@ feature-scoped token family:
 
 ### Specialized color tokens
 
-| Token | Purpose |
-| --- | --- |
-| `--color-markdown-inline-code` | Markdown 行内代码背景，沿用 tag / label 胶囊层级 |
-| `--color-popover-header` | Popover header |
-| `--color-tab` | Tab 默认背景 |
-| `--color-tab-active` | 当前激活 tab |
-| `--color-tab-border` | Tab 分隔线 |
-| `--color-feedback-privacy-hint` | 反馈截图隐私提醒文字及叹号图标；独立一行，使用辅助说明字号 |
-| `--color-git-none` | Git 无变更状态，沿用普通文件名颜色 |
-| `--color-git-modified` | Git modified，表示已跟踪文件有未提交修改 |
-| `--color-git-added` | Git added，表示新增文件已进入工作树 / 暂存区 |
-| `--color-git-deleted` | Git deleted，表示已跟踪文件被删除 |
-| `--color-git-renamed` | Git renamed，表示已跟踪文件移动或重命名 |
-| `--color-git-untracked` | Git untracked，表示 Git 尚未跟踪的新文件 |
-| `--color-git-ignored` | Git ignored，继承弱化文本层级 |
-| `--color-git-descendant` | Git descendant，表示目录后代包含变更 |
-| `--color-file-node` | 文件 mention node 背景 |
-| `--color-file-node-hover` | 文件 mention node hover 背景 |
-| `--color-file-node-foreground` | 文件 mention node 文字 / 图标 |
-| `--color-skill-node` | Skill mention node 背景 |
-| `--color-skill-node-hover` | Skill mention node hover 背景 |
-| `--color-skill-node-foreground` | Skill mention node 文字 / 图标 |
-| `--color-command-node` | Command mention node 背景 |
-| `--color-command-node-hover` | Command mention node hover 背景 |
-| `--color-command-node-foreground` | Command mention node 文字 / 图标 |
+| Token                             | Purpose                                                    |
+| --------------------------------- | ---------------------------------------------------------- |
+| `--color-markdown-inline-code`    | Markdown 行内代码背景，沿用 tag / label 胶囊层级           |
+| `--color-popover-header`          | Popover header                                             |
+| `--color-tab`                     | Tab 默认背景                                               |
+| `--color-tab-active`              | 当前激活 tab                                               |
+| `--color-tab-border`              | Tab 分隔线                                                 |
+| `--color-feedback-privacy-hint`   | 反馈截图隐私提醒文字及叹号图标；独立一行，使用辅助说明字号 |
+| `--color-git-none`                | Git 无变更状态，沿用普通文件名颜色                         |
+| `--color-git-modified`            | Git modified，表示已跟踪文件有未提交修改                   |
+| `--color-git-added`               | Git added，表示新增文件已进入工作树 / 暂存区               |
+| `--color-git-deleted`             | Git deleted，表示已跟踪文件被删除                          |
+| `--color-git-renamed`             | Git renamed，表示已跟踪文件移动或重命名                    |
+| `--color-git-untracked`           | Git untracked，表示 Git 尚未跟踪的新文件                   |
+| `--color-git-ignored`             | Git ignored，继承弱化文本层级                              |
+| `--color-git-descendant`          | Git descendant，表示目录后代包含变更                       |
+| `--color-file-node`               | 文件 mention node 背景                                     |
+| `--color-file-node-hover`         | 文件 mention node hover 背景                               |
+| `--color-file-node-foreground`    | 文件 mention node 文字 / 图标                              |
+| `--color-skill-node`              | Skill mention node 背景                                    |
+| `--color-skill-node-hover`        | Skill mention node hover 背景                              |
+| `--color-skill-node-foreground`   | Skill mention node 文字 / 图标                             |
+| `--color-command-node`            | Command mention node 背景                                  |
+| `--color-command-node-hover`      | Command mention node hover 背景                            |
+| `--color-command-node-foreground` | Command mention node 文字 / 图标                           |
 
 Git file statuses must use `text-git-*` / `bg-git-*`, rather than borrowing diff or warning tokens.
 Mention tokens belong to prompt-editor and UserPrompt mention nodes; their background, hover,
@@ -260,20 +271,27 @@ Each `text-ui-*` utility maps to the corresponding `--text-ui-*` CSS token.
 
 All interface typography must use the dedicated `text-ui-*` scale. The Appearance setting controls `--ui-font-size`, whose default is `14px`:
 
-| Token | Formula | Default |
-| --- | --- | ---: |
-| `text-ui-xl` | `--ui-font-size + 4px` | 18px |
-| `text-ui-lg` | `--ui-font-size + 2px` | 16px |
-| `text-ui-base` | `--ui-font-size` | 14px |
-| `text-ui-caption` | `--ui-font-size - 1px` | 13px |
-| `text-ui-sm` | `--ui-font-size - 2px` | 12px |
-| `text-ui-xs` | `--ui-font-size - 4px` | 10px |
-| `text-ui-2xs` | `--ui-font-size - 5px` | 9px |
+| Token             | Formula                | Default |
+| ----------------- | ---------------------- | ------: |
+| `text-ui-xl`      | `--ui-font-size + 4px` |    18px |
+| `text-ui-lg`      | `--ui-font-size + 2px` |    16px |
+| `text-ui-base`    | `--ui-font-size`       |    14px |
+| `text-ui-caption` | `--ui-font-size - 1px` |    13px |
+| `text-ui-sm`      | `--ui-font-size - 2px` |    12px |
+| `text-ui-xs`      | `--ui-font-size - 4px` |    10px |
+| `text-ui-2xs`     | `--ui-font-size - 5px` |     9px |
 
 `text-ui-2xs` is a restricted exception below the `text-ui-xs` floor: it is permitted
 only for graph **axis furniture** — timebase tick labels, channel codes, and unit
 suffixes in the workflow timeline — never for content, labels, or metadata.
 Treat any other use as a design-system defect.
+
+The shared Settings section heading uses `text-ui-settings-title` with
+`lg:text-ui-settings-title-lg`: `--ui-font-size + 10px` / `+ 16px` (24px / 30px
+at the default setting), with line-height ratios of `4 / 3` / `1.2` (32px / 36px
+by default). These tokens preserve the larger responsive heading while following
+the interface font setting. They are reserved for this page heading; ordinary
+section titles and controls retain the standard scale.
 
 `text-mobile-input-safe` is a fixed 16px platform-compatibility token. It is
 reserved for editable controls on mobile Web surfaces where iOS focus zoom must
@@ -288,14 +306,14 @@ be prevented, and therefore does not scale with `--ui-font-size`.
 
 The `text-ui-*` scale expresses stable semantic roles. Choose a token by content role rather than by isolated visual preference:
 
-| Token | Primary roles |
-| --- | --- |
-| `text-ui-xl` | Markdown `h1` and equivalent first-level reading headings |
-| `text-ui-lg` | Markdown `h2` and equivalent second-level reading headings |
-| `text-ui-base` | Markdown `h3`-`h6`, body copy, common buttons, workspace and section titles, and other primary UI text |
+| Token             | Primary roles                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| `text-ui-xl`      | Markdown `h1` and equivalent first-level reading headings                                                    |
+| `text-ui-lg`      | Markdown `h2` and equivalent second-level reading headings                                                   |
+| `text-ui-base`    | Markdown `h3`-`h6`, body copy, common buttons, workspace and section titles, and other primary UI text       |
 | `text-ui-caption` | Compact supporting copy that must remain one step below body text, such as the New Task feature announcement |
-| `text-ui-sm` | Secondary copy, supporting information, helper text, Tooltip copy, and Markdown inline code |
-| `text-ui-xs` | Tooltip keyboard shortcuts, badges, compact labels, counters, and very weak metadata |
+| `text-ui-sm`      | Secondary copy, supporting information, helper text, Tooltip copy, and Markdown inline code                  |
+| `text-ui-xs`      | Tooltip keyboard shortcuts, badges, compact labels, counters, and very weak metadata                         |
 
 - Markdown `h3`-`h6` share `text-ui-base`; distinguish their hierarchy through weight: `h3`-`h4` use `font-semibold`, `h5` uses `font-medium`, and `h6` uses `font-normal`.
 - Body copy and common controls normally use `text-ui-base font-normal`; titles and labels may strengthen weight without changing their semantic size role.
@@ -490,6 +508,22 @@ Overlay rules:
 - Diff UI must use diff-specific semantic colors, not generic success/destructive colors
 - Dense operational panels are preferred over marketing-card styling
 
+### Extension slots
+
+Extension slots are shell-owned positions where extensions supply data only (spec: `docs/plugins/extension-host.md` §6, §16). The shell component owns all styling; a plugin never provides HTML, SVG, or CSS for a slot. Slot ids come only from `EXTENSION_SLOTS` in the extension host protocol. Slot items are static manifest declarations (top-level `slots`) and stay visible while the extension host is stopped.
+
+- **`composer.status`**: sits directly left of the context-usage ring in the composer toolbar. Ghost `Button` at `size="default"` (`h-7`), `rounded-lg`, `px-1.5`, `gap-1`; a `size-3.5` icon plus text in `text-ui-sm text-foreground-subtle tabular-nums`, capped at `max-w-40` with truncation. The hover description uses `ControlHintTooltip`. It renders only when the extension has set `text`. It is the first item to collapse: collapse tier `extension` hides the text and leaves a `size-7` icon button.
+- **Side pane launcher "Extensions" section**: follows the built-in apps and UI plugins in the new-tab launcher, after the same short divider, with a `text-ui-lg font-semibold` heading. Rows reuse `SidePaneLauncherRow`. Problem rows (`failed`, `invalid`, `incompatible`, and a plugin with an unusable slot item, labelled `invalid`) are static rows without a button or capsule, one per plugin: `CircleAlertIcon`, the plugin name, a `bg-tag` state label, and the reason in the hover title (with the field path when there is one). The "Extensions stopped" row uses `OctagonXIcon` and the secondary "Reload" capsule. Rows do not use destructive or warning fills; the state label carries the meaning as text.
+- **Launcher view items**: `sidePane.launcher` items are ordinary `SidePaneLauncherRow` rows in the same section (whitelisted icon, localized view title, the plugin name as the description, the default "Open" capsule). While the extension host is stopped they stay visible: a `bg-tag` "Extensions stopped" label precedes the plugin name and the capsule becomes "Reload". No disabled or destructive styling.
+- **Extension view tabs**: an `extension-view` side pane tab uses the standard tab trigger with the view's whitelisted icon and its localized title. The body is the plugin's MCP App page in the shared sandbox; the shell only draws the loading, "not running" and error states as centered `text-ui-sm text-foreground-subtle` text. Theme and locale reach the page through the MCP Apps host context (style variables), not through shell CSS.
+- **Extension logs tab**: one `extension-logs` side pane tab per pane (`ScrollTextIcon`, title "Extension logs"), opened from an "Extension logs" `SidePaneLauncherRow` in the launcher "Extensions" section (shown only when a plugin declares `extension` or the host is stopped) and from the command center. A single `border-b` toolbar row (`px-3 py-2`, wraps when narrow): two input-style `Select` filters (source: all, extension host, each plugin id in `font-mono`; level: all, warnings and errors, errors only) on the left; `icon-md` ghost buttons with `ControlHintTooltip` on the right for auto-scroll (`secondary` + `aria-pressed` while on), copy and clear view. Rows are terminal-style `font-mono text-ui-sm` lines: time (`text-foreground-subtlest tabular-nums`), the level word padded to five characters, the source (`text-foreground-subtle`, plugin id or "Extension host gen=N"), then the message, all as one wrapping run (`whitespace-pre-wrap break-words`) with a hanging indent (`pl-9 -indent-6`) so continuation lines use the full width. Warning and error rows use `bg-warning-surface` / `bg-destructive-surface` with the matching `*-surface-foreground` level word; info rows have no fill. Empty, loading and "no match" states are centered `text-ui-sm text-foreground-subtle` text.
+- **`nav.primary`**: rows in the left primary navigation, directly after "Plugin store", one per plugin, sorted by the localized title. Each row is the same ghost `Button` as the built-in rows (`size="lg"`, `w-full justify-start gap-2`) with a `size-4` whitelisted icon and the title truncated in one line. Rows have no selected state (no `aria-pressed`, no `bg-selected`): a click opens the target in the right Side Pane and the main view stays the conversation. A view-target row while the extension host is stopped keeps its title and adds a short `bg-tag` "Stopped" label plus a trailing `text-ui-sm text-foreground-subtle` "Reload"; the hover hint and accessible name carry the full "Extensions stopped · Reload"; the click reloads. The row is narrow, so it uses the short label to keep the title readable. Surface-target (MCP App) rows never show the stopped state. An extension can set an unread badge (spec §18.1 H11): a count renders after the title as the same `bg-tag` label (`text-ui-xs tabular-nums`, `99+` above 99), and `"dot"` renders the task list unread dot (`size-[7px] rounded-full bg-icon-blue`); the accessible name appends "N unread" or "New activity". Hidden in phone remote control, like "Automations" and "Plugin store".
+- **File viewer tabs**: a `file.viewer` view opens as a regular `extension-view` tab per file; the tab title is the file name and the icon is the view's whitelisted icon. A `file.viewer` surface opens as a regular `plugin-ui` tab per file. No extra chrome; the page draws the file.
+- **`composer.mention`**: one group per entry in the composer `@` panel, after the built-in groups. The group header (the entry title) is always shown, even when it is the only visible group. Candidate rows use the skills row density: a `size-3.5` whitelisted icon, the label in `text-ui-base font-medium` (truncated at half the row), the description in `text-ui-xs text-foreground-subtlest`. Loading reuses the panel's skeleton rows; a denied or failed query and "Extensions stopped" reuse the panel's error status row, one line inside the group, so other groups stay usable. A chosen candidate becomes a mention chip in the plugin colour (`text-plugin-node-foreground`) with the generic plugin icon; it serializes to the candidate's `insertText`.
+- **Extension permissions** (spec §17.7): the launcher "Extensions" section shows one "Needs permission" row per plugin whose declared session tiers are not granted yet, right after the "Extensions stopped" row: a `SidePaneLauncherRow` with `KeyRoundIcon`, the plugin name, a `bg-tag` "Needs permission" label, the requested tiers as the description, and a "Grant" capsule that opens the consent dialog. The consent dialog and the enable confirmation reuse the shared `ConfirmDialog` (title names the plugin, the spec text is the description, default confirm button, no keyboard hints); no custom dialog chrome. The plugin details page shows a "Permissions" section after "Information" when the plugin declares or holds tiers: the same `border-b` heading as "Information", a `bg-tag` status label with the tiers, a primary "Grant" or an outline "Revoke" button at `size="sm"`, a one-line `text-ui-sm text-foreground-subtle` note, a "System notifications" row when the notifications tier is granted (spec §18.1 H8: `text-ui-base` label, `text-ui-sm text-foreground-subtle` note under it, the shared default-size `Switch` at the row end, on by default), and "Recent actions" rows in the information grid (`grid-cols-[8rem_minmax(0,1fr)]`, time in `tabular-nums text-foreground-subtle`). No destructive or warning fills. Desktop only.
+- **Icons**: only Lucide names in the extension icon whitelist render (`packages/ui/src/extension-slots/components/extensionIcons.ts`); any other name falls back to `PuzzleIcon`. The whitelist: `activity`, `bell`, `bot`, `chart-bar`, `chart-pie` (alias `pie-chart`), `clock`, `cpu`, `database`, `eye`, `file-text`, `gauge`, `git-branch`, `git-merge`, `git-pull-request`, `globe`, `info`, `layers`, `list`, `log-in`, `log-out`, `message-square`, `puzzle`, `sparkles`, `terminal`, `timer`, `zap`. Add a name in both places; a whitelisted icon uses the same size and `currentColor` as the built-in icons of that slot.
+- **Scope**: desktop only. Web and phone remote control render no slot. Verify in Zai Light and Zai Dark, zh-CN and en-US, at narrow toolbar widths where the composer slot collapses first, and with long navigation titles that must truncate.
+
 ## Elevation and Depth
 
 ZCode should use restrained depth. Layer primarily through background contrast, borders, and radius before relying on heavy shadows.
@@ -532,13 +566,14 @@ Rules:
 
 ### Breakpoint roles
 
-| Breakpoint | Preferred use |
-| --- | --- |
-| `sm:` | Dialog width, button arrangement, small-screen layout corrections |
-| `md:` | Grid columns and form layout expansion |
-| `lg:` | Desktop toolbar visibility and secondary information density |
-| `xl:` | Chat and complex content arrangements |
-| `2xl:` | Wide-screen reading-width caps, not ordinary page behavior |
+| Breakpoint     | Preferred use                                                                                                                                                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sm:`          | Dialog width, button arrangement, small-screen layout corrections                                                                                                                                                                            |
+| `md:`          | Grid columns and form layout expansion                                                                                                                                                                                                       |
+| `lg:`          | Desktop toolbar visibility and secondary information density                                                                                                                                                                                 |
+| `xl:`          | Chat and complex content arrangements                                                                                                                                                                                                        |
+| `2xl:`         | Wide-screen reading-width caps, not ordinary page behavior                                                                                                                                                                                   |
+| `compact-web:` | Phone and narrow Web (`< 40rem` without a desktop platform class) layout corrections that must not change narrow desktop windows; CSS only, do not copy its condition into JS (see [settings narrow layout](docs/settings-narrow-layout.md)) |
 
 Start with the unprefixed layout, then add the fewest breakpoints needed. Prefer changing
 layout, `max-width`, and visibility to repeatedly switching fixed dimensions or semantic
@@ -550,7 +585,7 @@ adding breakpoint overrides.
 ## Accessibility and Internationalization
 
 - Support keyboard navigation as a first-class interaction path.
-- Preserve visible focus behavior through the repo's established focus styling patterns.
+- Preserve the repo's established component focus styling. Do not add a shared `!important` outline to dialog descendants, remote controls, or settings navigation. Composite inputs use their existing outer border or ring without an additional inner outline. This also applies in forced-colors mode; test IDs are not styling contracts.
 - Ensure contrast remains safe in light, dark, and Zai modes.
 - Write layouts that tolerate longer translations.
 - Avoid icon-only meaning when a text label is practical.
@@ -584,3 +619,11 @@ adding breakpoint overrides.
 - use semantic error or success colors for non-semantic decoration
 - create components that only look correct in one theme
 - trade clarity for visual novelty in tool-heavy screens
+
+## Remote connection progress (RDUX-03)
+
+`--color-progress-surface` / `--color-progress-surface-foreground` express work in progress, including connecting, automatic recovery and updating. Use `bg-progress-surface` with `text-progress-surface-foreground`; the foreground can also color progress indicators and borders. Four themes define the pair and all parent backgrounds must retain a 4.5:1 text contrast.
+
+Remote state mapping: connected → success (neutral cloud in project rows); connecting/updating → progress; disconnected → neutral surface/subtle foreground; needs attention → warning; failed → destructive. SSH/WSL/Docker tokens are reserved for connection type labels, never connection status. Always include visible status text outside the connected state; recovery attempts are visible text. See the remote device UX specification for the authoritative mapping and glossary.
+
+远程可读辅助文字：`--color-remote-foreground-muted` / `text-remote-foreground-muted` 用于远程向导、设备卡和日志辅助文字、侧栏设备标签与设置导航；侧栏共享的任务/项目视图切换、分组操作及搜索快捷键也沿用此可读辅助文字等级，浅色 `#595959`、深色 `#b3b3b3`，在 sidebar / popover / surface / card / selected / background 上保持至少 4.5:1。Zai Light SSH 类型标签前景为 `#0867ce`，保持与 `#ebf4ff` 底色至少 4.5:1。

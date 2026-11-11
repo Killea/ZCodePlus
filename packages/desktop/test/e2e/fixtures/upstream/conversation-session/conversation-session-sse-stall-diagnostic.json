@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-sse-stall-diagnostic",
-  "spec": "./test/e2e/conversation-session/conversation-session-sse-stall-diagnostic.test.ts",
+  "spec": "./test/e2e/conversation-session/runtime/conversation-session-sse-stall-diagnostic.test.ts",
   "fixtures": [
     {
       "id": "sse-stall-diagnostic-title",
@@ -21,10 +21,10 @@
       "response": {
         "statusCode": 200,
         "statusMessage": "OK",
-        "text": {
-          "id": "msg_e2e_sse_stall_title",
-          "text": "{\"title\":\"SSE Stall Diagnostic\"}"
-        }
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": "{\"id\":\"msg_e2e_sse_stall_title\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v4-flash\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"title\\\":\\\"SSE Stall Diagnostic\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":128,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":12,\"service_tier\":\"standard\"}}"
       }
     },
     {

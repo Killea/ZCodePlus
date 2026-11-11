@@ -19,6 +19,7 @@ import {
   pendingInteractionSchema,
   planStateSchema,
   queueStateSchema,
+  runtimeInitializationSchema,
   sessionActionAvailabilitySchema,
   sessionConfigStateSchema,
   sessionControlSchema,
@@ -27,6 +28,7 @@ import {
   sessionUsageStateSchema,
   subagentProjectionStateSchema,
   workspaceHookAdmissionStateSchema,
+  workspaceMcpAdmissionStateSchema,
 } from "./snapshot.js";
 import {
   WORKFLOW_RUNS_LIMITS,
@@ -38,6 +40,7 @@ import {
 
 // StatePatch：键级整体替换（Object.assign），键集合封闭。键内绝不深合并。
 export const statePatchSchema = z.object({
+  runtimeInitialization: runtimeInitializationSchema.optional(),
   revision: z.number().optional(),
   control: sessionControlSchema.optional(),
   sharedContextImport: sharedContextImportStateSchema.optional(),
@@ -59,6 +62,7 @@ export const statePatchSchema = z.object({
   plan: planStateSchema.nullable().optional(),
   // 软门禁：null = pending 清零(提示条消失);对象 = 待审核状态更新。
   workspaceHookAdmission: workspaceHookAdmissionStateSchema.nullable().optional(),
+  workspaceMcpAdmission: workspaceMcpAdmissionStateSchema.nullable().optional(),
 });
 export type StatePatch = z.infer<typeof statePatchSchema>;
 

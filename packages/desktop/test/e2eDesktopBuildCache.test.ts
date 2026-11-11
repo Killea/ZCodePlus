@@ -95,6 +95,11 @@ describe("desktop E2E build cache", () => {
       for (const match of source.matchAll(
         /\b(?:process\.env|env|runtimeEnv)\.([A-Z][A-Z0-9_]*)/gu,
       )) {
+        // Vite 配置同时包含 serve/build；Scan 仅用于 serve，不应让生产构建缓存失效。
+        // 只排除此文件的开发开关，build 分支不装配 Scan 由 viteRendererConfig.test.ts 验证。
+        if (configPath === "packages/desktop/vite.config.ts" && match[1] === "ZCODE_REACT_SCAN") {
+          continue;
+        }
         referencedEnvNames.add(match[1]);
       }
     }
@@ -102,6 +107,21 @@ describe("desktop E2E build cache", () => {
     expect(E2E_DESKTOP_BUILD_ENV_NAMES).toEqual(
       expect.arrayContaining([...referencedEnvNames].sort()),
     );
+  });
+
+  it("keeps the bundle fingerprint unchanged when the development Scan switch changes", () => {
+    const fingerprint = (env: Record<string, string>) =>
+      createE2EDesktopBuildFingerprint({
+        env,
+        gitHead: "head-a",
+        inputPaths: [],
+        repoRoot: ROOT,
+      });
+    const base = fingerprint({});
+
+    for (const value of ["", "0", "1"]) {
+      expect(fingerprint({ ZCODE_REACT_SCAN: value })).toBe(base);
+    }
   });
 
   it("invalidates when a workspace dependency or production env file changes", () => {
@@ -177,6 +197,7 @@ describe("desktop E2E build cache", () => {
       "out/main/index.js",
       "out/host/index.js",
       "out/scheduler/index.js",
+      "out/extension-host/index.js",
       "out/preload/index.cjs",
       "out/preload/resourceManager.cjs",
       "out/renderer/index.html",
@@ -255,6 +276,27 @@ describe("desktop E2E build cache", () => {
     expect(entered).toBe(true);
     expect(existsSync(lockPath)).toBe(false);
   });
+
+  it.each([false, true])(
+    "holds the build lock through asynchronous staging (failure=%s)",
+    async (fail) => {
+      const lockPath = resolve(ROOT, "cache/desktop-build.lock");
+      let finish!: () => void;
+      const staged = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const result = withE2EDesktopBuildLock({ lockPath }, async () => {
+        await staged;
+        if (fail) throw new Error("staging failed");
+        return "staged";
+      });
+      expect(existsSync(lockPath)).toBe(true);
+      finish();
+      if (fail) await expect(result).rejects.toThrow("staging failed");
+      else await expect(result).resolves.toBe("staged");
+      expect(existsSync(lockPath)).toBe(false);
+    },
+  );
 });
 
 function runBuildCacheWorker() {

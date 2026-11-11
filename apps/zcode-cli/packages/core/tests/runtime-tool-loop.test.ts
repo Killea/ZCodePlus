@@ -53,12 +53,14 @@ import type {
 import { createTestAgentRuntime } from "./test-agent-runtime.js";
 import { MessageHistoryImpl } from "../src/agent/message-history.js";
 import { hydrateMessageHistoryFromSession } from "../src/agent/session-history-hydrator.js";
+import { buildProviderRequestMessages } from "../src/runtime/helpers/provider-request-messages.js";
 import { DEFAULT_MODEL_REQUEST_MEDIA_BUDGET_BYTES } from "../src/runtime/helpers/media-budget.js";
 import { MAX_TURN_STEER_INPUT_BYTES } from "../src/runtime/helpers/steering.js";
 import { projectIdFromDirectory } from "../src/runtime/helpers/project.js";
 import { InMemoryRuntimeTaskRegistry } from "../src/runtime-task/registry.js";
 import { createToolRegistry } from "../src/tool/registry.js";
 import { BackgroundTaskTracker } from "../src/tool/executor/background-tasks.js";
+import { formatReadBatchNotice } from "../src/tool/handlers/read-text.js";
 import type { ToolExecutionContext } from "../src/tool/types.js";
 import { createTestSessionEventStore } from "./test-event-store.js";
 import { START_PLAN_BUSY_AUTO_RETRY_EXHAUSTED_MESSAGE } from "../src/runtime/methods/streaming-recovery.js";
@@ -132,7 +134,6 @@ function createProviderBusyError(providerId: string, providerCode = "3010"): Err
 }
 
 describe("AgentRuntime tool loop", () => {
-
   it("tracks Bash background completion through direct execution wait", async () => {
     const sessionId = createSessionId("runtime-bash-background-direct-wait");
     const turnId = createTurnId("turn-bash-background-direct-wait");
@@ -1405,7 +1406,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore: createTestSessionEventStore(),
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            mainInputs.push(providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content));
+            mainInputs.push(
+              providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content),
+            );
             mainModelStarted.resolve();
             await mainModelCanFinish.promise;
             return {
@@ -1429,7 +1432,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore: createTestSessionEventStore(),
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            childInputs.push(providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content));
+            childInputs.push(
+              providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content),
+            );
             return {
               finishReason: "stop",
               providerMetadata: undefined,
@@ -2492,7 +2497,6 @@ describe("AgentRuntime tool loop", () => {
     );
     expect(firstResponseRequest).toBe(1);
     expect(firstNotificationRequest).toBe(2);
-    expect(firstResponseRequest).toBeLessThan(firstNotificationRequest);
     expect(maxConcurrentModelCalls).toBe(1);
   });
 
@@ -2709,85 +2713,6 @@ describe("AgentRuntime tool loop", () => {
     expect(requests[1]?.captureCwdAfterSuccess).toBe(true);
     expect(rootObservations).toEqual([initialCwd]);
     expect(runtime.getProjectId()).toBe(projectIdFromDirectory(initialCwd));
-  });
-
-  it("keeps provider-visible embedded search enabled without injecting Bash prelude", async () => {
-    const sessionId = createSessionId("runtime-bash-embedded-search");
-    const eventStore = createTestSessionEventStore();
-    const backend = {
-      kind: "internal-cli" as const,
-      command: "zcode",
-      args: ["__internal-search"],
-    };
-    let capturedRequest: Parameters<ExecutionPort["run"]>[0] | undefined;
-    const now = new Date();
-    const executionPort: ExecutionPort = {
-      async run(request) {
-        capturedRequest = request;
-        return {
-          status: "completed",
-          exitCode: 0,
-          stdout: {
-            text: "",
-            bytes: 0,
-            truncated: false,
-          },
-          stderr: {
-            text: "",
-            bytes: 0,
-            truncated: false,
-          },
-          durationMs: 1,
-          timedOut: false,
-          cancelled: false,
-          startedAt: now,
-          completedAt: now,
-        };
-      },
-    };
-    let modelCallCount = 0;
-    const runtime = createTestAgentRuntime(
-      sessionId,
-      {
-        embeddedSearchBackend: backend,
-        mode: "yolo",
-        workingDirectory: "/workspace/project",
-      },
-      {
-        eventStore,
-        executionPort,
-        modelFactory: createTestModelFactory({
-          async generateText(request: any) {
-            modelCallCount++;
-            if (modelCallCount === 1) {
-              return {
-                finishReason: "tool-calls",
-                providerMetadata: undefined,
-                text: "",
-                toolCalls: [
-                  {
-                    id: "bash-grep",
-                    name: "Bash",
-                    input: { command: "grep needle file.txt" },
-                  },
-                ],
-                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-              };
-            }
-            return {
-              finishReason: "stop",
-              providerMetadata: undefined,
-              text: "done",
-              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-            };
-          },
-        } as never),
-      },
-    );
-
-    await runtime.executeTurn("search with grep");
-
-    expect(capturedRequest?.bashPrelude).toBeUndefined();
   });
 
   it("resets Bash cwd to workspace root after a successful command leaves the workspace", async () => {
@@ -3279,7 +3204,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("Verify whether the active session goal")) {
               verifierCount += 1;
               if (verifierCount === 1) {
@@ -3352,7 +3279,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("finish target")) {
               requestOrder.push("prompt");
               return {
@@ -3432,7 +3361,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("finish with continuation error")) {
               requestOrder.push("prompt");
               return {
@@ -3497,7 +3428,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("plain prompt")) {
               requestOrder.push("prompt");
               return {
@@ -3543,7 +3476,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("Verify whether the active session goal")) {
               requestOrder.push("verifier-pass");
               return {
@@ -3606,7 +3541,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("blocking prompt")) {
               requestOrder.push("prompt");
               promptStarted.resolve();
@@ -3683,7 +3620,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("blocking prompt")) {
               requestOrder.push("prompt");
               promptStarted.resolve();
@@ -4012,7 +3951,9 @@ describe("AgentRuntime tool loop", () => {
         },
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const requestText = providerMessagesToText(withoutAgentListingMessages(request.messages));
+            const requestText = providerMessagesToText(
+              withoutAgentListingMessages(request.messages),
+            );
             const isContinuation = requestText.includes(
               "Continue working toward the active session goal.",
             );
@@ -4090,7 +4031,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             const isVerifier = latestText.includes("Verify whether the active session goal");
             if (isVerifier) {
               verifierOutputTokenSettings.push({
@@ -4228,7 +4171,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("<task-id>bg-notification-1</task-id>")) {
               expect(latestText).toContain("<task-id>bg-notification-2</task-id>");
               requestOrder.push("notification-batch");
@@ -4329,7 +4274,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("<task-id>bg-notification-clear</task-id>")) {
               requestOrder.push("notification");
               await sessionStore.clearTarget({ sessionID: sessionId });
@@ -4384,7 +4331,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("<task-id>bg-notification-loop</task-id>")) {
               requestOrder.push("notification");
               return {
@@ -4474,7 +4423,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("<task-id>bg-notification-yield</task-id>")) {
               requestOrder.push("notification");
               return {
@@ -4580,7 +4531,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("<task-id>bg-notification-disabled</task-id>")) {
               requestOrder.push("notification");
               return {
@@ -4633,7 +4586,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            requests.push(providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content));
+            requests.push(
+              providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content),
+            );
             return {
               finishReason: "stop",
               providerMetadata: undefined,
@@ -4698,7 +4653,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             requestOrder.push(
               latestText.includes("<task-notification>")
                 ? "notification"
@@ -4751,7 +4708,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("first prompt")) {
               requestOrder.push("first-prompt");
               firstPromptStarted.resolve();
@@ -5258,6 +5217,161 @@ describe("AgentRuntime tool loop", () => {
     expect(pauseReminderIndex).toBeGreaterThan(Math.max(...toolResultIndexes));
   });
 
+  it("keeps the Read truncation notice when Stop interrupts the checkpoint, live and after resume", async () => {
+    const sessionId = createSessionId("runtime-read-notice-during-tool-checkpoint");
+    const workingDirectory = "/tmp/zcode-read-notice-checkpoint";
+    const sessionStore = new RecordingSessionStore();
+    const eventStore = createTestSessionEventStore();
+    const checkpointStarted = deferred();
+    const artifactStore: ToolArtifactStorePort = {
+      async writeToolResultArtifact(_request, options) {
+        checkpointStarted.resolve();
+        await waitForAbort(options?.signal);
+        throw options?.signal?.reason ?? new Error("checkpoint cancelled");
+      },
+      async readToolResultArtifact(request) {
+        throw new Error(`unexpected artifact read: ${request.uri}`);
+      },
+    };
+    const notice = `[Truncated: PARTIAL view — ${workingDirectory}/big.txt: showing lines 1-1 of 99 total (30000 tokens, cap 25000). Do NOT answer from this page alone if the answer may be further in the file.]`;
+    const registry = createToolRegistry();
+    registry.register({
+      inputSchema: {},
+      metadata: {
+        concurrentSafe: true,
+        destructive: false,
+        name: "CheckpointMutation",
+        needsApproval: false,
+        readOnly: false,
+        riskLevel: "medium",
+        sideEffectScope: "workspace",
+      },
+      handler: async () => ({
+        content: "export const value = 2;\n",
+        filePath: `${workingDirectory}/src/checkpoint.ts`,
+        originalFile: "export const value = 1;\n",
+        structuredPatch: [
+          {
+            oldStart: 1,
+            oldLines: 1,
+            newStart: 1,
+            newLines: 1,
+            lines: ["-export const value = 1;", "+export const value = 2;"],
+          },
+        ],
+        type: "update",
+      }),
+    });
+    registry.register({
+      inputSchema: {},
+      metadata: {
+        concurrentSafe: true,
+        destructive: false,
+        name: "PartialRead",
+        needsApproval: false,
+        readOnly: true,
+        riskLevel: "low",
+        sideEffectScope: "none",
+      },
+      // 与 Read 相同：工具自己声明批次提示，结算不按输出形状识别。
+      formatBatchNotice: formatReadBatchNotice,
+      handler: async () => ({
+        type: "text",
+        filePath: `${workingDirectory}/big.txt`,
+        content: "first line",
+        numLines: 1,
+        startLine: 1,
+        totalLines: 99,
+        truncated: true,
+        truncatedByTokenCap: true,
+        partialViewNotice: notice,
+      }),
+    });
+    const createRuntime = (requests: any[][]) => {
+      let modelCallCount = 0;
+      return createTestAgentRuntime(
+        sessionId,
+        { mode: "yolo", workingDirectory },
+        {
+          artifactStore,
+          eventStore,
+          modelFactory: createTestModelFactory({
+            async generateText(request: any) {
+              requests.push(withoutAgentListingMessages(request.messages));
+              modelCallCount += 1;
+              if (modelCallCount === 1 && requests === liveRequests) {
+                return {
+                  finishReason: "tool-calls",
+                  providerMetadata: undefined,
+                  text: "",
+                  toolCalls: [
+                    { id: "checkpoint-mutation", name: "CheckpointMutation", input: {} },
+                    { id: "partial-read", name: "PartialRead", input: {} },
+                  ],
+                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                };
+              }
+              return {
+                finishReason: "stop",
+                providerMetadata: undefined,
+                text: "next request completed",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            },
+          } as never),
+          sessionStore,
+          toolRegistry: registry,
+        },
+      );
+    };
+    const liveRequests: any[][] = [];
+    const runtime = createRuntime(liveRequests);
+    const abortController = new AbortController();
+    const pendingTurn = runtime.executeTurn("read and edit", undefined, {
+      abortSignal: abortController.signal,
+    });
+    await checkpointStarted.promise;
+    abortController.abort(new Error("stop during checkpoint creation"));
+    await expect(pendingTurn).rejects.toMatchObject({ type: CoreErrorType.TurnCancelled });
+
+    // Stop 打断 checkpoint 时截断提示也要写入，顺序是 结果 → 提示 → 中断标记；
+    // 否则 tool result 已在历史里，模型之后只看到被截断的正文。
+    const persistedOrder = (await sessionStore.messages({ sessionID: sessionId }))
+      .flatMap((message) => message.parts)
+      .flatMap((part) => {
+        if (part.type === "tool" && part.state.status === "completed")
+          return [`tool:${part.callID}`];
+        const source = part.type === "text" ? part.metadata?.runtimeMessage?.source : undefined;
+        return source === "read_truncation_notice" || source === "interrupt_marker" ? [source] : [];
+      });
+    expect(persistedOrder).toEqual([
+      "tool:checkpoint-mutation",
+      "tool:partial-read",
+      "read_truncation_notice",
+      "interrupt_marker",
+    ]);
+    const expectNoticeBetweenResultAndMarker = (messages: any[]) => {
+      const text = providerMessagesToText(messages);
+      const resultIndex = text.indexOf("first line");
+      const noticeIndex = text.indexOf(notice);
+      expect(resultIndex).toBeGreaterThanOrEqual(0);
+      expect(noticeIndex).toBeGreaterThan(resultIndex);
+      // checkpoint 被取消也属于工具阶段停止，标记用工具阶段的文字。
+      expect(text.indexOf("[Request interrupted by user for tool use]")).toBeGreaterThan(
+        noticeIndex,
+      );
+    };
+
+    await runtime.executeTurn("next query after checkpoint stop");
+    expectNoticeBetweenResultAndMarker(liveRequests[1]!);
+
+    const coldRequests: any[][] = [];
+    const cold = createRuntime(coldRequests);
+    await cold.resumeFromStore();
+    await cold.executeTurn("after resume");
+    expectNoticeBetweenResultAndMarker(coldRequests[0]!);
+  });
+
   it("materializes a late active-turn goal pause before the terminal event", async () => {
     const sessionId = createSessionId("runtime-goal-pause-during-terminal-persistence");
     const persistenceOrder: string[] = [];
@@ -5583,6 +5697,105 @@ describe("AgentRuntime tool loop", () => {
     expect(requestText).not.toContain(objective);
   });
 
+  it.each([
+    { mcs: false, taskType: undefined },
+    { mcs: true, taskType: undefined },
+    { mcs: true, taskType: "subagent_child" as const },
+  ])(
+    "collects and restores silent reminders only for main continuations %j",
+    async ({ mcs, taskType }) => {
+      const sessionId = createSessionId("runtime-silent-reminder");
+      const sessionStore = new RecordingSessionStore();
+      const registry = createToolRegistry();
+      registry.register({
+        inputSchema: {},
+        metadata: {
+          name: "Inspect",
+          concurrentSafe: true,
+          destructive: false,
+          needsApproval: false,
+          readOnly: true,
+          riskLevel: "low",
+          sideEffectScope: "none",
+        },
+        handler: async () => "inspection result",
+      });
+      const requests: any[][] = [];
+      const runtime = createTestAgentRuntime(
+        sessionId,
+        {
+          mode: "yolo",
+          taskType,
+          maxTurns: 30,
+          workingDirectory: "/tmp/silent-reminder-test",
+        },
+        {
+          eventStore: createTestSessionEventStore(),
+          sessionStore,
+          toolRegistry: registry,
+          modelFactory: createTestModelFactory({
+            properties: { supportsMidConversationSystem: mcs },
+            async generateText(request) {
+              requests.push(request.messages);
+              const step = requests.length;
+              return {
+                finishReason: step <= 20 ? "tool-calls" : "stop",
+                text: step <= 20 ? "" : "Finished inspection.",
+                toolCalls:
+                  step <= 20 ? [{ id: `inspect-${step}`, name: "Inspect", input: { step } }] : [],
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            },
+          }),
+        },
+      );
+      await runtime.executeTurn("Inspect the code");
+      expect(requests).toHaveLength(21);
+      const marker = "The user hasn't heard from you in a while.";
+      const reminderCounts = requests.map(
+        (messages) => providerMessagesToText(messages).split(marker).length - 1,
+      );
+      expect(reminderCounts).toEqual(
+        Array.from({ length: 21 }, (_, index) =>
+          taskType ? 0 : Math.min(3, Math.floor(index / 5)),
+        ),
+      );
+      // 静默提醒在 MCS 开启时投影为 system 消息。
+      expect(
+        requests
+          .flat()
+          .filter((message) => message.role === "system")
+          .some((message) => providerContentToText(message.content).includes(marker)),
+      ).toBe(mcs && !taskType);
+      const persisted = await sessionStore.messages({ sessionID: sessionId });
+      const notices = persisted
+        .flatMap((message) => message.parts)
+        .filter(
+          (part) =>
+            part.type === "text" &&
+            part.metadata?.runtimeMessage?.source === "silent_turn_reminder",
+        );
+      expect(notices).toHaveLength(taskType ? 0 : 3);
+      expect(
+        notices.every(
+          (part) =>
+            part.type === "text" && part.synthetic && !part.text.includes("<system-reminder>"),
+        ),
+      ).toBe(true);
+      const restored = new MessageHistoryImpl();
+      await hydrateMessageHistoryFromSession({ history: restored, messages: persisted });
+      expect(
+        restored
+          .borrowReadOnlyRuntimeEntries()
+          .filter((entry) => entry.metadata?.source === "silent_turn_reminder"),
+      ).toHaveLength(taskType ? 0 : 3);
+      await runtime.executeTurn("New user request");
+      expect(providerMessagesToText(requests.at(-1)!).split(marker).length - 1).toBe(
+        taskType ? 0 : 3,
+      );
+    },
+  );
+
   it("does not inject todo reminders before the cadence threshold", async () => {
     const sessionId = createSessionId("runtime-todo-current-turn-context");
     const eventStore = createTestSessionEventStore();
@@ -5640,46 +5853,6 @@ describe("AgentRuntime tool loop", () => {
     expect(persistedTexts.join("\n")).not.toContain(
       "The TodoWrite tool hasn't been used recently.",
     );
-  });
-
-  it("does not inject a todo current-turn reminder when there are no todos", async () => {
-    const sessionId = createSessionId("runtime-empty-todo-current-turn-context");
-    const eventStore = createTestSessionEventStore();
-    const sessionStore = new RecordingSessionStore();
-    let capturedMessages: any[] = [];
-
-    const runtime = createTestAgentRuntime(
-      sessionId,
-      {
-        mode: "build",
-        workingDirectory: "/tmp/zcode-empty-todo-current-turn-context",
-      },
-      {
-        eventStore,
-        modelFactory: createTestModelFactory({
-          async generateText(request: any) {
-            capturedMessages = withoutAgentListingMessages(request.messages);
-            return {
-              finishReason: "stop",
-              providerMetadata: undefined,
-              text: "no todo answer",
-              usage: {
-                inputTokens: 1,
-                outputTokens: 1,
-                totalTokens: 2,
-              },
-            };
-          },
-        } as never),
-        sessionStore,
-      },
-    );
-
-    await runtime.executeTurn("continue without todos");
-
-    const contextText = providerMessagesToText(capturedMessages);
-    expect(contextText).not.toContain("Current session todo state (authoritative):");
-    expect(contextText).not.toContain("TodoRead or TodoWrite result updates it.");
   });
 
   it("injects and persists a todo reminder only when cadence is due", async () => {
@@ -5807,7 +5980,7 @@ describe("AgentRuntime tool loop", () => {
     expect(persistedTodoReminders).toHaveLength(0);
   });
 
-  it("keeps output style reminders in runtime history without persisting them", async () => {
+  it("persists output style reminders like other input attachments", async () => {
     const sessionId = createSessionId("runtime-output-style-in-memory-history");
     const eventStore = createTestSessionEventStore();
     const sessionStore = new RecordingSessionStore();
@@ -5853,10 +6026,11 @@ describe("AgentRuntime tool loop", () => {
 
     expect(firstRequestText.match(/Learning output style is active/g)).toHaveLength(1);
     expect(secondRequestText.match(/Learning output style is active/g)).toHaveLength(2);
-    expect(persistedTexts).not.toContain("Learning output style is active");
+    // output_style 与其他输入附件一样写入历史，resume 后前缀不变。
+    expect(persistedTexts.match(/Learning output style is active/g)).toHaveLength(2);
   });
 
-  it("does not duplicate output style reminders across model requests in the same turn", async () => {
+  it("repeats the output style reminder on every input attachment run in a turn", async () => {
     const sessionId = createSessionId("runtime-output-style-single-per-turn");
     const eventStore = createTestSessionEventStore();
     const registry = createToolRegistry();
@@ -5915,7 +6089,8 @@ describe("AgentRuntime tool loop", () => {
     await runtime.executeTurn("read marker with style");
 
     const secondRequestText = providerMessagesToText(requests[1]!);
-    expect(secondRequestText.match(/Learning output style is active/g)).toHaveLength(1);
+    // 每次附件收集都产出 output_style，不去重；工具批次后的请求因此有两条。
+    expect(secondRequestText.match(/Learning output style is active/g)).toHaveLength(2);
   });
 
   it("uses hydrated todo reminder metadata to avoid duplicate cadence reminders after resume", async () => {
@@ -6075,7 +6250,13 @@ describe("AgentRuntime tool loop", () => {
       (message: any) => message.role === "user",
     );
     const verifierLastMessage = requests[1]?.messages.at(-1);
-    expect(verifierUserMessages).toHaveLength(2);
+    // verifier 复用共享投影：持久化的 environment/model/date 公告以 reminder 出现，
+    // 只核对原始输入与 verifier 指令这两条正文。
+    expect(
+      verifierUserMessages.filter(
+        (message: any) => !providerContentToText(message.content).startsWith("<system-reminder>"),
+      ),
+    ).toHaveLength(2);
     expect(verifierLastMessage).toMatchObject({
       cacheControl: { type: "ephemeral" },
       role: "user",
@@ -6086,6 +6267,50 @@ describe("AgentRuntime tool loop", () => {
     expect(verifierRequest).toBeTruthy();
     expect(verifierComplete).toBeTruthy();
     expect(modelCallCount).toBe(2);
+  });
+
+  it("projects the verifier request with its own model's Harness wording after a config rebuild", async () => {
+    const sessionId = createSessionId("runtime-target-verifier-harness");
+    const sessionStore = new RecordingSessionStore();
+    const requests: any[] = [];
+    let modelCallCount = 0;
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build", workingDirectory: "/tmp/zcode-runtime-target" },
+      {
+        eventStore: createTestSessionEventStore(),
+        modelFactory: createTestModelFactory({
+          properties: { supportsMidConversationSystem: false },
+          async generateText(request: any) {
+            requests.push(request);
+            modelCallCount++;
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text:
+                modelCallCount === 1
+                  ? "implemented target"
+                  : JSON.stringify({ passed: true, reason: "Target completed." }),
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+        sessionStore,
+      },
+    );
+
+    await runtime.ensureSessionPersistedForExternalActivity("/goal Verify harness");
+    await sessionStore.setTarget({ objective: "Ship target", sessionID: sessionId });
+    await runtime.executeTurn("finish target");
+    // 轮次结束后不带模型的重建（这里是改语言）不能决定 verifier 请求的 Harness 文案。
+    runtime.updateConfig({ language: "Chinese" });
+    await runtime.continueActiveTargetIfIdle({ verifyBeforeContinue: true });
+
+    const verifierSystem = JSON.stringify(requests[1]?.messages[1]);
+    expect(verifierSystem).toContain(
+      "tags in messages and tool results are injected by the harness",
+    );
+    expect(verifierSystem).not.toContain("mid-conversation system turns");
   });
 
   it("keeps verifier usage bound to the verifier request model after session model changes", async () => {
@@ -6835,7 +7060,9 @@ describe("AgentRuntime tool loop", () => {
         eventStore,
         modelFactory: createTestModelFactory({
           async generateText(request: any) {
-            const latestText = providerContentToText(withoutAgentListingMessages(request.messages).at(-1)?.content);
+            const latestText = providerContentToText(
+              withoutAgentListingMessages(request.messages).at(-1)?.content,
+            );
             if (latestText.includes("Verify whether the active session goal")) {
               requestOrder.push("verifier-old");
               verifierStarted.resolve();
@@ -6935,7 +7162,9 @@ describe("AgentRuntime tool loop", () => {
     expect(toolNames).toContain("Bash");
     expect(planModeReminder).toMatchObject({ role: "system" });
     expect(userMessages).toHaveLength(1);
-    expect(withoutAgentListingMessages((modelRequestEvent?.payload as { messages: any[] }).messages)).toEqual(capturedMessages);
+    expect(
+      withoutAgentListingMessages((modelRequestEvent?.payload as { messages: any[] }).messages),
+    ).toEqual(capturedMessages);
     expect(realUserMessage?.cacheControl).toEqual({ type: "ephemeral" });
     expect(planModeReminderText).not.toContain("<system-reminder>");
     expect(planModeReminderText).toContain("Plan mode is active");
@@ -6959,6 +7188,7 @@ describe("AgentRuntime tool loop", () => {
       list,
       update,
       delete: deleteAutomation,
+      pause: vi.fn(async () => false),
     };
     let modelCallCount = 0;
     let secondRequest: any;
@@ -7044,6 +7274,7 @@ describe("AgentRuntime tool loop", () => {
       list: vi.fn(async () => []),
       update: vi.fn(),
       delete: vi.fn(),
+      pause: vi.fn(),
     };
     let modelCallCount = 0;
     const runtime = createTestAgentRuntime(
@@ -7060,7 +7291,7 @@ describe("AgentRuntime tool loop", () => {
                 request.tools
                   .map((tool: { name: string }) => tool.name)
                   .filter((name: string) => name.startsWith("Cron")),
-              ).toEqual(["CronList"]);
+              ).toEqual(["CronList", "CronPauseSelf"]);
               // 模拟 provider 无视声明工具面，直接返回三种 mutation tool call。
               return {
                 finishReason: "tool-calls",
@@ -7125,6 +7356,131 @@ describe("AgentRuntime tool loop", () => {
           error: expect.objectContaining({ type: CoreErrorType.PermissionDenied }),
         }),
       ]),
+    );
+  });
+
+  it("automation turn 的 CronPauseSelf 只暂停 Host 准入注入的本轮 automationId", async () => {
+    const sessionId = createSessionId("runtime-automation-pause-self");
+    const eventStore = createTestSessionEventStore();
+    const automationPort: AutomationPort = {
+      create: vi.fn(),
+      list: vi.fn(async () => []),
+      update: vi.fn(),
+      delete: vi.fn(),
+      pause: vi.fn(async () => true),
+    };
+    let modelCallCount = 0;
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build" },
+      {
+        automationPort,
+        eventStore,
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            modelCallCount++;
+            if (modelCallCount === 1) {
+              expect(request.tools.map((tool: { name: string }) => tool.name)).toContain(
+                "CronPauseSelf",
+              );
+              return {
+                finishReason: "tool-calls",
+                providerMetadata: undefined,
+                text: "",
+                toolCalls: [{ id: "pause-self", input: {}, name: "CronPauseSelf" }],
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "paused",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+        permissionBroker: {
+          async requestPermission() {
+            return { decision: "allow" };
+          },
+        },
+      },
+    );
+
+    await runtime.executeTurn("stop when the condition is met", undefined, {
+      automationId: "automation-1",
+      toolDisallowlist: ["CronCreate", "CronUpdate", "CronDelete"],
+    });
+
+    // 暂停目标只能是 loop state 的 automationId，模型输入为空对象。
+    expect(automationPort.pause).toHaveBeenCalledTimes(1);
+    expect(automationPort.pause).toHaveBeenCalledWith({ id: "automation-1" });
+    const errors = (await eventStore.getEvents(sessionId)).filter(
+      (event) => event.type === SessionEventType.ToolCallError,
+    );
+    expect(errors).toHaveLength(0);
+  });
+
+  it("普通用户轮即使 provider 直接提交 CronPauseSelf 也由 handler 拒绝且不调用端口", async () => {
+    const sessionId = createSessionId("runtime-user-turn-pause-self-guard");
+    const eventStore = createTestSessionEventStore();
+    const automationPort: AutomationPort = {
+      create: vi.fn(),
+      list: vi.fn(async () => []),
+      update: vi.fn(),
+      delete: vi.fn(),
+      pause: vi.fn(async () => true),
+    };
+    let modelCallCount = 0;
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build" },
+      {
+        automationPort,
+        eventStore,
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            modelCallCount++;
+            if (modelCallCount === 1) {
+              // 普通用户轮没有本轮 automationId，provider 工具面不得出现 CronPauseSelf。
+              expect(request.tools.map((tool: { name: string }) => tool.name)).not.toContain(
+                "CronPauseSelf",
+              );
+              return {
+                finishReason: "tool-calls",
+                providerMetadata: undefined,
+                text: "",
+                toolCalls: [{ id: "pause-self-blocked", input: {}, name: "CronPauseSelf" }],
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "done",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+        permissionBroker: {
+          async requestPermission() {
+            return { decision: "allow" };
+          },
+        },
+      },
+    );
+
+    await runtime.executeTurn("pause my automation");
+
+    expect(automationPort.pause).not.toHaveBeenCalled();
+    const errors = (await eventStore.getEvents(sessionId)).filter(
+      (event) => event.type === SessionEventType.ToolCallError,
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.payload).toEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({ type: CoreErrorType.PermissionDenied }),
+      }),
     );
   });
 
@@ -8248,12 +8604,17 @@ describe("AgentRuntime tool loop", () => {
 
     expect(result.response).toBe("done after queued input");
     expect(modelCallCount).toBe(2);
-    expect(secondRequestMessages.slice(-4).map((message) => message.role)).toEqual([
+    // 工具批次之后的 token 预算提醒冒泡到保留 user 形态的输入之前，停在 tool result 后。
+    expect(secondRequestMessages.slice(-5).map((message) => message.role)).toEqual([
       "assistant",
       "tool",
       "tool",
       "user",
+      "user",
     ]);
+    expect(providerContentToText(secondRequestMessages.at(-2)?.content)).toContain(
+      "<total_tokens>",
+    );
     expect(providerContentToText(secondRequestMessages.at(-1)?.content)).toContain("note body");
     const drainIndex = eventTypes.indexOf(SessionEventType.TurnSteerDrained);
     const toolResultIndexes = eventTypes.flatMap((type, index) =>
@@ -8358,10 +8719,16 @@ describe("AgentRuntime tool loop", () => {
 
     const events = await eventStore.getEvents(sessionId);
     expect(modelCallCount).toBe(2);
-    expect(secondRequestMessages.slice(-2).map((message) => message.role)).toEqual([
+    // 纯文本回复后取出 guide 时收集预算提醒，排在这条 user 输入之前。这条 guide 直接调 steerTurn、
+    // 不带 user_steer，不重新起算：已用 = 上一次响应的 1 + 1。
+    expect(secondRequestMessages.slice(-3).map((message) => message.role)).toEqual([
       "assistant",
       "user",
+      "user",
     ]);
+    expect(providerContentToText(secondRequestMessages.at(-2)?.content)).toContain(
+      "<total_tokens>14999998 tokens left</total_tokens>",
+    );
     expect(providerContentToText(secondRequestMessages.at(-1)?.content)).toContain(
       "guide without a tool boundary",
     );
@@ -8370,6 +8737,48 @@ describe("AgentRuntime tool loop", () => {
       SessionEventType.TurnSteerDeliveryChanged,
     );
     expect((await runtime.getProjection()).pendingSteerInputs).toEqual([]);
+  });
+
+  it("collects input attachments again for a text-only guide continuation", async () => {
+    const sessionId = createSessionId("runtime-guide-text-only-attachments");
+    let runtime: AgentRuntime;
+    const requests: unknown[] = [];
+
+    runtime = createTestAgentRuntime(
+      sessionId,
+      {
+        mode: "build",
+        outputStyle: { name: "Learning", prompt: "Explain tradeoffs while solving the task." },
+      },
+      {
+        eventStore: createTestSessionEventStore(),
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            requests.push(request.messages);
+            if (requests.length === 1) {
+              const activeTurn = runtime.getActiveTurnInfo();
+              await runtime.steerTurn({
+                expectedTurnId: activeTurn?.turnId,
+                input: "guide without a tool boundary",
+                delivery: "guide",
+              });
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "text-only completion",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+
+    await runtime.executeTurn("finish without tools");
+
+    expect(requests).toHaveLength(2);
+    // 文本回复后续上的 guide 是新输入，和工具批次之后一样收集输入附件。
+    expect(JSON.stringify(requests[1]).match(/Learning output style is active/g)).toHaveLength(2);
   });
 
   it("does not inline-drain an ordinary queue item at a text-only model boundary", async () => {
@@ -8539,7 +8948,6 @@ describe("AgentRuntime tool loop", () => {
       content: literalQueuedInput,
       cacheControl: { type: "ephemeral" },
     });
-    expect(String(queuedUserMessage?.content)).not.toContain("&lt;system-reminder>");
   });
 
   it("keeps a no-tool ordinary follow-up queued for a future product turn", async () => {
@@ -8663,14 +9071,14 @@ describe("AgentRuntime tool loop", () => {
     ]);
   });
 
-  it("drains multiple guides one per completed tool batch with distinct query ids", async () => {
+  it("drains all waiting guides together after the next completed tool batch", async () => {
     const sessionId = createSessionId("runtime-turn-steer-query-queue");
     const eventStore = createTestSessionEventStore();
     const registry = createToolRegistry();
     let runtime: AgentRuntime;
     let modelCallCount = 0;
     const requestQueryIds: Array<string | undefined> = [];
-    const lastUserContents: string[] = [];
+    const trailingUserTexts: string[][] = [];
 
     registry.register({
       inputSchema: {},
@@ -8696,10 +9104,14 @@ describe("AgentRuntime tool loop", () => {
           async generateText(request: any, observation) {
             modelCallCount++;
             requestQueryIds.push(observation.invocationContext?.traceContext?.queryId);
-            const lastUserMessage = [...withoutAgentListingMessages(request.messages)]
-              .reverse()
-              .find((message) => message.role === "user");
-            lastUserContents.push(String(lastUserMessage?.content ?? ""));
+            const messages = withoutAgentListingMessages(request.messages);
+            const lastResult = messages.findLastIndex((message: any) => message.role === "tool");
+            trailingUserTexts.push(
+              messages
+                .slice(lastResult + 1)
+                .filter((message: any) => message.role === "user")
+                .map((message: any) => String(message.content)),
+            );
             if (modelCallCount === 1) {
               const activeTurn = runtime.getActiveTurnInfo();
               expect(activeTurn?.steerable).toBe(true);
@@ -8730,24 +9142,16 @@ describe("AgentRuntime tool loop", () => {
               };
             }
 
-            return modelCallCount === 2
-              ? {
-                  finishReason: "tool-calls",
-                  providerMetadata: undefined,
-                  text: "",
-                  toolCalls: [{ id: "guide-boundary-2", name: "GuideBoundary", input: {} }],
-                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-                }
-              : {
-                  finishReason: "stop",
-                  providerMetadata: undefined,
-                  text: "answer after second queued follow-up",
-                  usage: {
-                    inputTokens: 1,
-                    outputTokens: 1,
-                    totalTokens: 2,
-                  },
-                };
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "answer after both queued follow-ups",
+              usage: {
+                inputTokens: 1,
+                outputTokens: 1,
+                totalTokens: 2,
+              },
+            };
           },
         } as never),
       },
@@ -8762,25 +9166,433 @@ describe("AgentRuntime tool loop", () => {
       (event) => event.type === SessionEventType.TurnSteerDrained,
     );
 
-    expect(result.response).toBe("answer after second queued follow-up");
-    expect(modelCallCount).toBe(3);
-    expect(requestQueryIds).toEqual([
-      "query_original_request",
-      "query_first_steer",
-      "query_second_steer",
-    ]);
-    expect(lastUserContents).toEqual([
-      "original request",
+    expect(result.response).toBe("answer after both queued follow-ups");
+    // 同一边界一次取出全部已等待的 guide；下一次请求归因到最后一条的 query。
+    expect(requestQueryIds).toEqual(["query_original_request", "query_second_steer"]);
+    // 默认测试模型不合并相邻 user 内容，不补换行。这批工具的 token 预算提醒按冒泡规则
+    // 越过保留 user 形态的 guide，停在 tool result 之后。
+    expect(trailingUserTexts[1]).toEqual([
+      "<system-reminder>\n<total_tokens>14999998 tokens left</total_tokens>\n</system-reminder>",
       "first queued follow-up",
       "second queued follow-up",
     ]);
-    expect(drainedEvents.map((event) => (event.payload as any).queryIds)).toEqual([
+    // 一起取出，但每条各自落库并各发一个 drained 事件。
+    const drainedPayloads = drainedEvents.map((event) => event.payload as any);
+    expect(drainedPayloads.map((payload) => payload.queryIds)).toEqual([
       ["query_first_steer"],
       ["query_second_steer"],
+    ]);
+    expect(drainedPayloads.map((payload) => payload.injectedMessageIds)).toEqual([
+      [expect.any(String)],
+      [expect.any(String)],
     ]);
     // 普通 active-turn steer 不需要显式 source；缺省即表示普通 guided steer。
     expect(queuedEvents.every((event) => !("source" in event.payload))).toBe(true);
     expect(drainedEvents.every((event) => !("sources" in event.payload))).toBe(true);
+  });
+
+  it.each([true, false])(
+    "keeps each guide's page state next to it when guides drain together, live and cold (MCS=%s)",
+    async (mcs) => {
+      const sessionId = createSessionId(`runtime-guide-gen-ui-pairing-${mcs}`);
+      const sessionStore = new RecordingSessionStore();
+      const registry = createToolRegistry();
+      let runtime: AgentRuntime;
+      let modelCallCount = 0;
+      let continuationMessages: any[] = [];
+      // guide 和页面状态带 mk: 标记，按出现顺序比较位置。
+      const guideMarkers = (messages: readonly unknown[]) =>
+        [...JSON.stringify(messages).matchAll(/mk:(st[a-z]+-\d)/g)].map((match) => match[1]);
+      const steerWithPageState = (input: string, state: string) =>
+        runtime.steerTurn({
+          delivery: "guide",
+          expectedTurnId: runtime.getActiveTurnInfo()?.turnId,
+          input,
+          // 与 App 发送 guide 的路径相同（input-facade 标为 user_steer）。
+          inputPresentation: "user_steer",
+          intent: { genUiContext: [{ path: "/workspace/gen-ui/widget.html", state }] },
+        });
+
+      registry.register({
+        inputSchema: {},
+        metadata: {
+          concurrentSafe: true,
+          destructive: false,
+          name: "GuideBoundary",
+          needsApproval: false,
+          readOnly: true,
+          riskLevel: "low",
+          sideEffectScope: "none",
+        },
+        handler: async () => "tool boundary complete",
+      });
+
+      runtime = createTestAgentRuntime(
+        sessionId,
+        { mode: "yolo" },
+        {
+          eventStore: createTestSessionEventStore(),
+          sessionStore,
+          toolRegistry: registry,
+          modelFactory: createTestModelFactory({
+            properties: { supportsMidConversationSystem: mcs },
+            async generateText(request: any) {
+              modelCallCount++;
+              if (modelCallCount === 1) {
+                // 工具运行期间，用户在两个不同的页面状态下各发一条消息；同一边界一起取出。
+                await steerWithPageState("mk:steer-1", "mk:state-1");
+                await steerWithPageState("mk:steer-2", "mk:state-2");
+                return {
+                  finishReason: "tool-calls",
+                  providerMetadata: undefined,
+                  text: "",
+                  toolCalls: [{ id: "guide-boundary-1", name: "GuideBoundary", input: {} }],
+                  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                };
+              }
+              continuationMessages = withoutAgentListingMessages(request.messages);
+              return {
+                finishReason: "stop",
+                providerMetadata: undefined,
+                text: "answered both",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            },
+          } as never),
+        },
+      );
+
+      await runtime.executeTurn("original request");
+      // MCS 下两条 guide 合成一条 system，状态都在它之前的 user 侧；MCS 关时每个状态紧跟它的 guide。
+      const expected = mcs
+        ? ["state-1", "state-2", "steer-1", "steer-2"]
+        : ["steer-1", "state-1", "steer-2", "state-2"];
+      expect(modelCallCount).toBe(2);
+      expect(guideMarkers(continuationMessages)).toEqual(expected);
+
+      // 冷恢复从同一份输入快照派生状态，请求里的顺序与 live 相同。
+      const restored = new MessageHistoryImpl();
+      await hydrateMessageHistoryFromSession({
+        history: restored,
+        messages: await sessionStore.messages({ sessionID: sessionId }),
+      });
+      const coldMessages = buildProviderRequestMessages({
+        entries: restored.borrowReadOnlyRuntimeEntries(),
+        useMidConversationSystem: mcs,
+      }).messages;
+      expect(guideMarkers(coldMessages)).toEqual(expected);
+    },
+  );
+
+  it.each([true, false])(
+    "keeps the page state of a user_steer input that opens a new turn, live and cold (MCS=%s)",
+    async (mcs) => {
+      const sessionId = createSessionId(`runtime-send-now-gen-ui-${mcs}`);
+      const sessionStore = new RecordingSessionStore();
+      let lastMessages: any[] = [];
+      const runtime = createTestAgentRuntime(
+        sessionId,
+        { mode: "yolo" },
+        {
+          eventStore: createTestSessionEventStore(),
+          sessionStore,
+          modelFactory: createTestModelFactory({
+            properties: { supportsMidConversationSystem: mcs },
+            async generateText(request: any) {
+              lastMessages = withoutAgentListingMessages(request.messages);
+              return {
+                finishReason: "stop",
+                providerMetadata: undefined,
+                text: "done",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            },
+          } as never),
+        },
+      );
+      const markers = (messages: readonly unknown[]) =>
+        [...JSON.stringify(messages).matchAll(/mk:([a-z-]+)/g)].map((match) => match[1]);
+
+      await runtime.executeTurn("mk:original");
+      // 旧版本的立即发送以 user_steer 开新一轮，已存会话仍是这种形式；页面状态要留在输入旁边。
+      await runtime.executeTurn("mk:send-now", undefined, {
+        inputPresentation: "user_steer",
+        intent: {
+          genUiContext: [{ path: "/workspace/gen-ui/widget.html", state: "mk:send-now-state" }],
+        },
+      } as never);
+      // 接在 text-only 回复之后，MCS 下也没有 system 锚点，降级为 user reminder，状态跟在它之后。
+      const expected = ["original", "send-now", "send-now-state"];
+      expect(markers(lastMessages)).toEqual(expected);
+
+      const restored = new MessageHistoryImpl();
+      await hydrateMessageHistoryFromSession({
+        history: restored,
+        messages: await sessionStore.messages({ sessionID: sessionId }),
+      });
+      const coldMessages = buildProviderRequestMessages({
+        entries: restored.borrowReadOnlyRuntimeEntries(),
+        useMidConversationSystem: mcs,
+      }).messages;
+      expect(markers(coldMessages)).toEqual(expected);
+    },
+  );
+
+  it("stops the guide drain at a guide reserved by send-now", async () => {
+    const sessionId = createSessionId("runtime-turn-steer-reserved-guide");
+    const eventStore = createTestSessionEventStore();
+    let runtime: AgentRuntime;
+    const trailingUserTexts: string[][] = [];
+
+    runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "yolo" },
+      {
+        eventStore,
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            const messages = withoutAgentListingMessages(request.messages);
+            const lastAssistant = messages.findLastIndex(
+              (message: any) => message.role === "assistant",
+            );
+            trailingUserTexts.push(
+              messages
+                .slice(lastAssistant + 1)
+                .filter((message: any) => message.role === "user")
+                .map((message: any) => String(message.content)),
+            );
+            if (trailingUserTexts.length === 1) {
+              const turnId = runtime.getActiveTurnInfo()?.turnId;
+              await runtime.steerTurn({
+                delivery: "guide",
+                expectedTurnId: turnId,
+                input: "guide a",
+              });
+              const reserved = await runtime.steerTurn({
+                delivery: "guide",
+                expectedTurnId: turnId,
+                input: "guide b reserved",
+              });
+              await runtime.steerTurn({
+                delivery: "guide",
+                expectedTurnId: turnId,
+                input: "guide c",
+              });
+              if (reserved.kind !== "queued") throw new Error("expected queued input");
+              await expect(
+                runtime.reservePendingInputById({
+                  pendingInputId: reserved.pendingInputId,
+                  reservationId: "send-now-command",
+                  traceContext: { sessionId, traceId: createTraceId("trace-reserved-guide") },
+                }),
+              ).resolves.toBe(true);
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: `step ${trailingUserTexts.length}`,
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+
+    await runtime.executeTurn("original request");
+    const drainedEvents = (await eventStore.getEvents(sessionId)).filter(
+      (event) => event.type === SessionEventType.TurnSteerDrained,
+    );
+
+    // 已被 send-now 预留的 guide 归预留方提升；按 FIFO 取到它为止，后面的 guide 也不越过它。
+    // 这些 guide 直接调 steerTurn、不带 user_steer，纯文本回复后的预算提醒不重新起算：
+    // 已用 = 上一次响应的 1 + 1。
+    expect(trailingUserTexts[1]).toEqual([
+      "<system-reminder>\n<total_tokens>14999998 tokens left</total_tokens>\n</system-reminder>",
+      "guide a",
+    ]);
+    expect(drainedEvents).toHaveLength(1);
+    expect(
+      (drainedEvents[0]!.payload as any).drainedInputs.map((input: any) => input.text),
+    ).toEqual(["guide a"]);
+  });
+
+  it("settles each drained guide before the next, so a later persistence failure keeps the earlier one and leaves the rest queued", async () => {
+    const sessionId = createSessionId("runtime-turn-steer-partial-drain");
+    const eventStore = createTestSessionEventStore();
+    // 第二条 guide 的 user message + session input promote 提交失败。
+    class FailingGuideBStore extends RecordingSessionStore {
+      override async promoteSessionInput(
+        input: Parameters<RecordingSessionStore["promoteSessionInput"]>[0],
+      ): Promise<void> {
+        if (input.parts.some((part) => part.type === "text" && part.text === "guide b")) {
+          throw new Error("injected guide b promote failure");
+        }
+        await super.promoteSessionInput(input);
+      }
+    }
+    const sessionStore = new FailingGuideBStore();
+    let runtime: AgentRuntime;
+    let modelCallCount = 0;
+    const requestTexts: string[] = [];
+
+    runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "yolo" },
+      {
+        eventStore,
+        sessionStore,
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            modelCallCount++;
+            requestTexts.push(JSON.stringify(request.messages));
+            if (modelCallCount === 1) {
+              const turnId = runtime.getActiveTurnInfo()?.turnId;
+              for (const input of ["guide a", "guide b", "guide c"]) {
+                await runtime.steerTurn({ delivery: "guide", expectedTurnId: turnId, input });
+              }
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: `step ${modelCallCount}`,
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+
+    await runtime.executeTurn("original request").catch(() => undefined);
+    const events = await eventStore.getEvents(sessionId);
+    const drainedTexts = events
+      .filter((event) => event.type === SessionEventType.TurnSteerDrained)
+      .map((event) => (event.payload as any).drainedInputs.map((input: any) => input.text));
+    const queuedIds = events
+      .filter((event) => event.type === SessionEventType.TurnSteerQueued)
+      .map((event) => (event.payload as any).pendingInputId);
+
+    // A 的记录、移出队列与 drained 事实已按条完成；B 没有提交，不进入 drained，也不再请求模型。
+    expect(drainedTexts).toEqual([["guide a"]]);
+    expect(sessionStore.promotedSessionInputIds).toEqual([queuedIds[0]]);
+    expect(modelCallCount).toBe(1);
+    // B 与之后的 C 仍在队列里（error-paused），等待用户继续。
+    expect((await runtime.getProjection()).pendingSteerInputs.map((item) => item.input)).toEqual([
+      "guide b",
+      "guide c",
+    ]);
+
+    // B 仍在队列里，下一轮请求不能已经带着它；否则继续队列时模型会看到两次。
+    await runtime.executeTurn("next request");
+    expect(requestTexts.at(-1)).toContain("guide a");
+    expect(requestTexts.at(-1)).not.toContain("guide b");
+  });
+
+  it("finishes a started guide drain when the turn is stopped mid-way, and the next turn sends a valid request", async () => {
+    const sessionId = createSessionId("runtime-turn-steer-stop-during-drain");
+    const eventStore = createTestSessionEventStore();
+    const registry = createToolRegistry();
+    let runtime: AgentRuntime;
+    // 第一条 guide 提交期间用户按停止。
+    class StopDuringGuideAStore extends RecordingSessionStore {
+      override async promoteSessionInput(
+        input: Parameters<RecordingSessionStore["promoteSessionInput"]>[0],
+      ): Promise<void> {
+        if (input.parts.some((part) => part.type === "text" && part.text === "guide a")) {
+          runtime.stopActiveForegroundExecution({ reason: "user stop" });
+        }
+        await super.promoteSessionInput(input);
+      }
+    }
+    const sessionStore = new StopDuringGuideAStore();
+    const requests: any[][] = [];
+
+    registry.register({
+      inputSchema: {},
+      metadata: {
+        concurrentSafe: true,
+        destructive: false,
+        name: "GuideBoundary",
+        needsApproval: false,
+        readOnly: true,
+        riskLevel: "low",
+        sideEffectScope: "none",
+      },
+      handler: async () => "tool boundary complete",
+    });
+
+    runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "yolo" },
+      {
+        eventStore,
+        sessionStore,
+        toolRegistry: registry,
+        modelFactory: createTestModelFactory({
+          async generateText(request: any) {
+            requests.push(withoutAgentListingMessages(request.messages));
+            if (requests.length === 1) {
+              const turnId = runtime.getActiveTurnInfo()?.turnId;
+              for (const input of ["guide a", "guide b", "guide c"]) {
+                await runtime.steerTurn({ delivery: "guide", expectedTurnId: turnId, input });
+              }
+              return {
+                finishReason: "tool-calls",
+                providerMetadata: undefined,
+                text: "",
+                toolCalls: [{ id: "guide-boundary-1", name: "GuideBoundary", input: {} }],
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            }
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "next answer",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+
+    await expect(runtime.executeTurn("original request")).rejects.toMatchObject({
+      type: CoreErrorType.TurnCancelled,
+    });
+    const drainedTexts = (await eventStore.getEvents(sessionId))
+      .filter((event) => event.type === SessionEventType.TurnSteerDrained)
+      .map((event) => (event.payload as any).drainedInputs.map((input: any) => input.text));
+
+    // 已开始的取出做完整批：停止在 a 提交期间到达，b、c 仍按条提交并各有自己的 drained 事件。
+    expect(drainedTexts).toEqual([["guide a"], ["guide b"], ["guide c"]]);
+    // 停止在本批提交后生效：本轮不再请求模型，也没有 guide 退回队列。
+    expect(requests).toHaveLength(1);
+    expect((await runtime.getProjection()).pendingSteerInputs).toEqual([]);
+
+    // 下一轮照常：tool call 后紧跟它的结果，之后依次是三条 guide、中断标记与新输入。
+    // 新输入轮首的 token 预算提醒按冒泡规则越过这些 user 输入，停在 tool result 之后。
+    await expect(runtime.executeTurn("next request")).resolves.toMatchObject({
+      response: "next answer",
+    });
+    const next = requests.at(-1)!;
+    const toolCallIndex = next.findIndex(
+      (message: any) =>
+        message.role === "assistant" &&
+        message.toolCalls?.some((call: any) => call.id === "guide-boundary-1"),
+    );
+    expect(toolCallIndex).toBeGreaterThan(-1);
+    expect(next[toolCallIndex + 1]?.role).toBe("tool");
+    expect(
+      next
+        .slice(toolCallIndex + 2)
+        .filter((message: any) => message.role === "user")
+        .map((message: any) => providerContentToText(message.content)),
+    ).toEqual([
+      "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>",
+      "guide a",
+      "guide b",
+      "guide c",
+      "[Request interrupted by user]",
+      "next request",
+    ]);
   });
 
   it("rejects steering when the expected turn id is stale", async () => {
@@ -9064,7 +9876,7 @@ describe("AgentRuntime tool loop", () => {
         newText: "first edited",
         traceContext,
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe("edited");
     await expect(
       runtime.reorderPendingInput({
         pendingInputId: second.pendingInputId,
@@ -9224,6 +10036,468 @@ describe("AgentRuntime tool loop", () => {
     // send-now 从 queue 摘除后仍保持 admitted；真正的 user message 会在另一条
     // startPromptTurn 写路径中原子 promotion，崩溃则由恢复清扫置 discarded。
     expect(sessionStore.settledSessionInputIds).not.toContain(queued.pendingInputId);
+  });
+
+  it("freezes a queued input for composer edit until the owning editor submits or releases it", async () => {
+    // docs/ui/composer-edit-mode.md：编辑锁与 reservation 互斥；冻结期间不能被删除、重排、
+    // 提升，只有持锁编辑器的 editPendingInputById 能写回并同时释放锁。
+    const sessionId = createSessionId("runtime-turn-steer-edit-lock");
+    const eventStore = createTestSessionEventStore();
+    const sessionStore = new RecordingSessionStore();
+    const modelStarted = deferred();
+    const finishModel = deferred();
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build" },
+      {
+        eventStore,
+        sessionStore,
+        modelFactory: createTestModelFactory({
+          async generateText() {
+            modelStarted.resolve();
+            await finishModel.promise;
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "first answer",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+    const traceContext = { sessionId, traceId: createTraceId("trace-edit-lock") };
+    const pendingTurn = runtime.executeTurn("run while editing");
+    await modelStarted.promise;
+    const queued = await runtime.steerTurn({
+      input: "edit me",
+      delivery: "queue",
+      intent: {
+        sourceCommandId: "command-edit",
+        queueItemId: "queue-edit",
+        clientId: "desktop",
+        kind: "sendText",
+        admissionSeq: 1,
+        admittedAt: 1,
+        requestedDelivery: "queue",
+        admittedDelivery: "queue",
+        mode: "build",
+      },
+    });
+    const other = await runtime.steerTurn({ input: "other", delivery: "queue" });
+    if (queued.kind !== "queued" || other.kind !== "queued") {
+      throw new Error("expected queued inputs");
+    }
+    const lock = { editorId: "editor-a", clientId: "desktop", inputOrigin: "desktop" as const };
+
+    await expect(
+      runtime.lockPendingInputEdit({
+        pendingInputId: queued.pendingInputId,
+        editLock: lock,
+        traceContext,
+      }),
+    ).resolves.toBe("locked");
+    await expect(
+      runtime.lockPendingInputEdit({
+        pendingInputId: queued.pendingInputId,
+        editLock: { ...lock, editorId: "editor-b" },
+        traceContext,
+      }),
+    ).resolves.toBe("lockedByOther");
+    await expect(
+      runtime.lockPendingInputEdit({
+        pendingInputId: "missing-input",
+        editLock: lock,
+        traceContext,
+      }),
+    ).resolves.toBe("missing");
+    expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toEqual(lock);
+
+    // 冻结项：reserve / 删除 / 重排都被拒绝；其他项不受影响。
+    await expect(
+      runtime.reservePendingInputById({
+        pendingInputId: queued.pendingInputId,
+        reservationId: "send-now",
+        traceContext,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      runtime.removePendingInputById({
+        pendingInputId: queued.pendingInputId,
+        reason: "user_removed",
+        traceContext,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      runtime.reorderPendingInput({
+        pendingInputId: queued.pendingInputId,
+        beforePendingInputId: null,
+        traceContext,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      runtime.reorderPendingInput({
+        pendingInputId: other.pendingInputId,
+        beforePendingInputId: queued.pendingInputId,
+        traceContext,
+      }),
+    ).resolves.toBe(true);
+
+    // 未持锁的写回不能覆盖冻结项；声明错误编辑器视为锁已丢失。
+    await expect(
+      runtime.editPendingInputById({
+        pendingInputId: queued.pendingInputId,
+        newText: "overwrite",
+        traceContext,
+      }),
+    ).resolves.toBe("editLocked");
+    await expect(
+      runtime.editPendingInputById({
+        pendingInputId: queued.pendingInputId,
+        newText: "overwrite",
+        editorId: "editor-b",
+        traceContext,
+      }),
+    ).resolves.toBe("lockLost");
+
+    const attachmentRefs = [
+      { ref: "artifact:new", fileName: "new.txt", mime: "text/plain", bytes: 3 },
+    ];
+    const modelSelection = { providerId: "provider-edit", modelId: "model-edit" };
+    await expect(
+      runtime.editPendingInputById({
+        pendingInputId: queued.pendingInputId,
+        newText: "edited text",
+        editorId: "editor-a",
+        attachmentRefs,
+        modelSelection,
+        mode: "yolo",
+        planEnabled: true,
+        traceContext,
+      }),
+    ).resolves.toBe("edited");
+    expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toBeUndefined();
+
+    const events = await eventStore.getEvents(sessionId);
+    const lockEvents = events
+      .filter((event) => event.type === SessionEventType.TurnSteerEditLockChanged)
+      .map((event) => (event.payload as { editLock?: unknown }).editLock ?? null);
+    expect(lockEvents).toEqual([lock, null]);
+    const editedEvent = events
+      .filter((event) => event.type === SessionEventType.TurnSteerQueued)
+      .at(-1);
+    expect(editedEvent?.payload).toMatchObject({
+      pendingInputId: queued.pendingInputId,
+      input: "edited text",
+      intent: {
+        text: "edited text",
+        attachmentRefs,
+        modelSelection,
+        mode: "yolo",
+        planEnabled: true,
+      },
+    });
+
+    // 只改配置（applyQueueItemsConfig）：缺省 newText 保留原输入，不写正文更新。
+    const inputUpdatesBefore = sessionStore.sessionInputUpdates.length;
+    await expect(
+      runtime.editPendingInputById({
+        pendingInputId: queued.pendingInputId,
+        mode: "guarded",
+        traceContext,
+      }),
+    ).resolves.toBe("edited");
+    expect(sessionStore.sessionInputUpdates).toHaveLength(inputUpdatesBefore);
+    const configEdited = (await eventStore.getEvents(sessionId))
+      .filter((event) => event.type === SessionEventType.TurnSteerQueued)
+      .at(-1);
+    expect(configEdited?.payload).toMatchObject({
+      pendingInputId: queued.pendingInputId,
+      input: "edited text",
+      intent: { text: "edited text", attachmentRefs, modelSelection, mode: "guarded" },
+    });
+
+    // 解锁后恢复正常：可再次加锁并由任意端解除。
+    await expect(
+      runtime.lockPendingInputEdit({
+        pendingInputId: queued.pendingInputId,
+        editLock: lock,
+        traceContext,
+      }),
+    ).resolves.toBe("locked");
+    await expect(
+      runtime.releasePendingInputEdit({ pendingInputId: queued.pendingInputId, traceContext }),
+    ).resolves.toBe(true);
+    await expect(
+      runtime.releasePendingInputEdit({ pendingInputId: queued.pendingInputId, traceContext }),
+    ).resolves.toBe(false);
+    await expect(
+      runtime.reservePendingInputById({
+        pendingInputId: queued.pendingInputId,
+        reservationId: "send-now",
+        traceContext,
+      }),
+    ).resolves.toBe(true);
+    // reserve 后不能再被冻结，与 sendQueuedNow 互斥。
+    await expect(
+      runtime.lockPendingInputEdit({
+        pendingInputId: queued.pendingInputId,
+        editLock: lock,
+        traceContext,
+      }),
+    ).resolves.toBe("reserved");
+
+    finishModel.resolve();
+    await pendingTurn;
+  });
+
+  it("drops a queued input together with its composer edit lock when a rebuilt runtime resumes", async () => {
+    // 编辑锁只属于当前 runtime 实例（docs/ui/composer-edit-mode.md「锁的释放」）。新 runtime
+    // 必须经 resumeFromStore 丢弃残留队列项（session_resumed），投影与空锁表才保持一致；
+    // 否则会出现「投影显示已锁、runtime 查不到锁」而无法解除、阻塞续跑。
+    const sessionId = createSessionId("runtime-edit-lock-resume");
+    const eventStore = createTestSessionEventStore();
+    const sessionStore = new RecordingSessionStore();
+    const modelStarted = deferred();
+    const finishModel = deferred();
+    const createRuntime = () =>
+      createTestAgentRuntime(
+        sessionId,
+        { mode: "build", workingDirectory: "/tmp/zcode-edit-lock-resume" },
+        {
+          eventStore,
+          sessionStore,
+          modelFactory: createTestModelFactory({
+            async generateText() {
+              modelStarted.resolve();
+              await finishModel.promise;
+              return {
+                finishReason: "stop",
+                providerMetadata: undefined,
+                text: "answer",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+            },
+          } as never),
+        },
+      );
+    const traceContext = { sessionId, traceId: createTraceId("trace-edit-lock-resume") };
+    const firstRuntime = createRuntime();
+    const pendingTurn = firstRuntime.executeTurn("run while editing");
+    await modelStarted.promise;
+    const queued = await firstRuntime.steerTurn({ input: "edit me", delivery: "queue" });
+    if (queued.kind !== "queued") throw new Error("expected queued input");
+    await expect(
+      firstRuntime.lockPendingInputEdit({
+        pendingInputId: queued.pendingInputId,
+        editLock: { editorId: "editor-a", clientId: "desktop" },
+        traceContext,
+      }),
+    ).resolves.toBe("locked");
+
+    const resumedRuntime = createRuntime();
+    await resumedRuntime.resumeFromStore();
+
+    expect((await resumedRuntime.getProjection()).pendingSteerInputs).toHaveLength(0);
+    expect(resumedRuntime.getPendingInputEditLock(queued.pendingInputId)).toBeUndefined();
+    const discarded = (await eventStore.getEvents(sessionId)).find(
+      (event) => event.type === SessionEventType.TurnSteerDiscarded,
+    );
+    expect(discarded?.payload).toMatchObject({
+      pendingInputIds: [queued.pendingInputId],
+      reason: "session_resumed",
+    });
+
+    finishModel.resolve();
+    await pendingTurn;
+  });
+
+  it("keeps a frozen item's edit lock when clearing the queue fails to record the discard", async () => {
+    // docs/ui/composer-edit-mode.md：锁与队列项同生同灭。清空队列写丢弃事件失败时，
+    // 项仍在投影里，锁也必须仍在 runtime 里，才能被解除且继续拦住删除。
+    const sessionId = createSessionId("runtime-edit-lock-clear-failure");
+    const baseStore = createTestSessionEventStore();
+    let failNextDiscard = true;
+    const eventStore = new Proxy(baseStore, {
+      get(target, property, receiver) {
+        if (property === "append") {
+          return async (event: SessionEvent) => {
+            if (failNextDiscard && event.type === SessionEventType.TurnSteerDiscarded) {
+              failNextDiscard = false;
+              throw new Error("discard append failed");
+            }
+            return target.append(event);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const sessionStore = new RecordingSessionStore();
+    const modelStarted = deferred();
+    const finishModel = deferred();
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build" },
+      {
+        eventStore,
+        sessionStore,
+        modelFactory: createTestModelFactory({
+          async generateText() {
+            modelStarted.resolve();
+            await finishModel.promise;
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "answer",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+    const traceContext = { sessionId, traceId: createTraceId("trace-edit-lock-clear-failure") };
+    const pendingTurn = runtime.executeTurn("run while editing");
+    await modelStarted.promise;
+    const queued = await runtime.steerTurn({ input: "edit me", delivery: "queue" });
+    if (queued.kind !== "queued") throw new Error("expected queued input");
+    const lock = { editorId: "editor-a", clientId: "desktop" };
+    await runtime.lockPendingInputEdit({
+      pendingInputId: queued.pendingInputId,
+      editLock: lock,
+      traceContext,
+    });
+
+    await expect(runtime.clearAllPendingInputs(traceContext)).rejects.toThrow(
+      "discard append failed",
+    );
+    expect((await runtime.getProjection()).pendingSteerInputs).toMatchObject([
+      { pendingInputId: queued.pendingInputId },
+    ]);
+    expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toEqual(lock);
+    await expect(
+      runtime.removePendingInputById({
+        pendingInputId: queued.pendingInputId,
+        reason: "user_removed",
+        traceContext,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      runtime.releasePendingInputEdit({ pendingInputId: queued.pendingInputId, traceContext }),
+    ).resolves.toBe(true);
+
+    // 重试清空成功后，项与锁一起消失。
+    await runtime.lockPendingInputEdit({
+      pendingInputId: queued.pendingInputId,
+      editLock: lock,
+      traceContext,
+    });
+    await expect(runtime.clearAllPendingInputs(traceContext)).resolves.toBe(1);
+    expect((await runtime.getProjection()).pendingSteerInputs).toHaveLength(0);
+    expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toBeUndefined();
+
+    finishModel.resolve();
+    await pendingTurn;
+  });
+
+  it("keeps the edit lock when the unlock event after an edit or release fails to persist", async () => {
+    // docs/ui/composer-edit-mode.md：锁的内存状态与锁事件同生同灭。解锁事件写入失败时，
+    // 投影仍显示锁，runtime 也必须仍持锁：可重试解除，且删除继续被拒绝。
+    const sessionId = createSessionId("runtime-edit-lock-unlock-failure");
+    const baseStore = createTestSessionEventStore();
+    let failNextUnlock = false;
+    const eventStore = new Proxy(baseStore, {
+      get(target, property, receiver) {
+        if (property === "append") {
+          return async (event: SessionEvent) => {
+            const unlocking =
+              event.type === SessionEventType.TurnSteerEditLockChanged &&
+              !(event.payload as { editLock?: unknown }).editLock;
+            if (failNextUnlock && unlocking) {
+              failNextUnlock = false;
+              throw new Error("unlock append failed");
+            }
+            return target.append(event);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const sessionStore = new RecordingSessionStore();
+    const modelStarted = deferred();
+    const finishModel = deferred();
+    const runtime = createTestAgentRuntime(
+      sessionId,
+      { mode: "build" },
+      {
+        eventStore,
+        sessionStore,
+        modelFactory: createTestModelFactory({
+          async generateText() {
+            modelStarted.resolve();
+            await finishModel.promise;
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "answer",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+    const traceContext = { sessionId, traceId: createTraceId("trace-edit-lock-unlock-failure") };
+    const pendingTurn = runtime.executeTurn("run while editing");
+    await modelStarted.promise;
+    const queued = await runtime.steerTurn({ input: "edit me", delivery: "queue" });
+    if (queued.kind !== "queued") throw new Error("expected queued input");
+    const lock = { editorId: "editor-a", clientId: "desktop" };
+    const expectStillLocked = async () => {
+      expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toEqual(lock);
+      await expect(
+        runtime.removePendingInputById({
+          pendingInputId: queued.pendingInputId,
+          reason: "user_removed",
+          traceContext,
+        }),
+      ).resolves.toBe(false);
+    };
+    await runtime.lockPendingInputEdit({
+      pendingInputId: queued.pendingInputId,
+      editLock: lock,
+      traceContext,
+    });
+
+    // 编辑提交：内容已写入，解锁事件失败。
+    failNextUnlock = true;
+    await expect(
+      runtime.editPendingInputById({
+        pendingInputId: queued.pendingInputId,
+        newText: "edited",
+        editorId: "editor-a",
+        traceContext,
+      }),
+    ).rejects.toThrow("unlock append failed");
+    await expectStillLocked();
+
+    // 手动解除：解锁事件失败，锁保留；重试成功后才删除。
+    failNextUnlock = true;
+    await expect(
+      runtime.releasePendingInputEdit({ pendingInputId: queued.pendingInputId, traceContext }),
+    ).rejects.toThrow("unlock append failed");
+    await expectStillLocked();
+    await expect(
+      runtime.releasePendingInputEdit({ pendingInputId: queued.pendingInputId, traceContext }),
+    ).resolves.toBe(true);
+    expect(runtime.getPendingInputEditLock(queued.pendingInputId)).toBeUndefined();
+    const lockEvents = (await baseStore.getEvents(sessionId))
+      .filter((event) => event.type === SessionEventType.TurnSteerEditLockChanged)
+      .map((event) => Boolean((event.payload as { editLock?: unknown }).editLock));
+    expect(lockEvents).toEqual([true, false]);
+
+    finishModel.resolve();
+    await pendingTurn;
   });
 
   it("discards queued-but-not-drained steering input during resume", async () => {
@@ -9509,11 +10783,17 @@ describe("AgentRuntime tool loop", () => {
       content: [{ type: "reasoning", text: "thinking before tool" }],
       toolCalls: [{ id: "stream-read", name: "StreamRead", input: {} }],
     });
-    expect(secondRequest.messages.at(-1)).toMatchObject({
+    expect(secondRequest.messages.at(-2)).toMatchObject({
       content: "stream-read-ok",
       role: "tool",
       toolCallId: "stream-read",
       toolName: "StreamRead",
+    });
+    // 工具批次之后的 token 预算提醒：首轮从 0 计到上一次响应的 usage（1 + 1）。
+    expect(secondRequest.messages.at(-1)).toMatchObject({
+      content:
+        "<system-reminder>\n<total_tokens>14999998 tokens left</total_tokens>\n</system-reminder>",
+      role: "user",
     });
     expect(events.map((event) => event.type)).toContain(SessionEventType.ModelStreaming);
     expect(events.map((event) => event.type)).toContain(SessionEventType.ToolCallScheduled);
@@ -9797,21 +11077,25 @@ describe("AgentRuntime tool loop", () => {
     expect(result.response).toBe("recovered after malformed tool input");
     expect(assistantToolUse?.toolCalls).toEqual([
       {
+        blockIndex: 0,
         id: "malformed-ask-call",
         input: {},
         name: "AskUserQuestionFixture",
       },
       {
+        blockIndex: 1,
         id: "empty-input-call",
         input: {},
         name: "EmptyInputFixture",
       },
       {
+        blockIndex: 2,
         id: "unknown-tool-call",
         input: {},
         name: "UnknownFixture",
       },
       {
+        blockIndex: 3,
         id: "empty-name-call",
         input: {},
         name: "",
@@ -9842,8 +11126,8 @@ describe("AgentRuntime tool loop", () => {
       toolCallId: "unknown-tool-call",
       toolName: "UnknownFixture",
     });
-    expect(providerContentToText(unknownToolResult?.content)).toContain(
-      "Tool not found: UnknownFixture",
+    expect(providerContentToText(unknownToolResult?.content)).toBe(
+      "<tool_use_error>Error: No such tool available: UnknownFixture</tool_use_error>",
     );
     expect(emptyNameToolResult).toMatchObject({
       isError: true,
@@ -10070,11 +11354,17 @@ describe("AgentRuntime tool loop", () => {
       modelId: requestModel.modelId,
       toolCalls: [{ id: "recover-read", name: "RecoverRead", input: {} }],
     });
-    expect(secondRequest.messages.at(-1)).toMatchObject({
+    expect(secondRequest.messages.at(-2)).toMatchObject({
       content: "recover-read-ok",
       role: "tool",
       toolCallId: "recover-read",
       toolName: "RecoverRead",
+    });
+    // 流恢复结算的工具结果也算完整工具批次；失败的流没有 usage，预算提醒保持满额。
+    expect(secondRequest.messages.at(-1)).toMatchObject({
+      content:
+        "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>",
+      role: "user",
     });
     expect(recoveryEventTypes).toEqual([
       SessionEventType.StreamRecoveryStarted,
@@ -10231,11 +11521,6 @@ describe("AgentRuntime tool loop", () => {
       );
       expect(persistedToolParts).toHaveLength(1);
       expect(persistedToolParts[0]?.state.status).toBe(expectedPartStatus);
-      expect(
-        persistedToolParts.some(
-          (part) => part.state.status === "pending" || part.state.status === "running",
-        ),
-      ).toBe(false);
 
       const discardedAssistant = sessionStore.messagesBySession
         .get(sessionId)
@@ -10260,7 +11545,7 @@ describe("AgentRuntime tool loop", () => {
         expect.objectContaining({
           message: expect.objectContaining({
             role: "assistant",
-            toolCalls: [{ id: "fallback-read", name: "FallbackRead", input: {} }],
+            toolCalls: [{ id: "fallback-read", name: "FallbackRead", input: {}, blockIndex: 0 }],
           }),
         }),
       );
@@ -10412,11 +11697,6 @@ describe("AgentRuntime tool loop", () => {
       );
       expect(persistedToolParts).toHaveLength(1);
       expect(persistedToolParts[0]?.state.status).toBe(expectedPartStatus);
-      expect(
-        persistedToolParts.some(
-          (part) => part.state.status === "pending" || part.state.status === "running",
-        ),
-      ).toBe(false);
 
       const projectToolHistory = (entries: ReturnType<MessageHistoryImpl["toRuntimeEntries"]>) =>
         entries.flatMap((entry) => {
@@ -10821,9 +12101,7 @@ describe("AgentRuntime tool loop", () => {
       .map((event) => event.payload as any);
 
     expect(result.response).toBe("recovered after budget");
-    expect(modelCallCount).toBe(11);
     expect(streamIdleTimeoutRetryNumbers).toEqual([undefined, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    expect(retryStartedPayloads).toHaveLength(10);
     expect(retryStartedPayloads.map((payload) => payload.retryNumber)).toEqual([
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     ]);
@@ -11086,7 +12364,11 @@ describe("AgentRuntime tool loop", () => {
 
     const result = await runtime.executeTurn("recover streamed write tool");
     const events = await eventStore.getEvents(sessionId);
-    const toolMessage = secondRequest.messages.at(-1);
+    // 最后一条是这批工具之后的 token 预算提醒，工具结果在它之前。
+    const toolMessage = secondRequest.messages.at(-2);
+    expect(providerContentToText(secondRequest.messages.at(-1)?.content)).toContain(
+      "<total_tokens>",
+    );
     const ledgerPayloads = events
       .filter((event) => event.type === SessionEventType.StreamingToolLedgerUpdated)
       .map((event) => event.payload as any);
@@ -13355,7 +14637,14 @@ describe("AgentRuntime tool loop", () => {
     const events = await eventStore.getEvents(sessionId);
     const forkEvent = events.find((event) => event.type === SessionEventType.SessionForked);
     const child = sessionStore.createdSessions.find((session) => session.parentID === sessionId);
-    const childMessages = child ? (await sessionStore.messages({ sessionID: child.id })).filter((message) => message.info.source !== "agent_listing_delta") : [];
+    // 模型专用公告不属于可见对话结构，与 agent listing 一样排除。
+    const childMessages = child
+      ? (await sessionStore.messages({ sessionID: child.id })).filter(
+          (message) =>
+            message.info.source !== "agent_listing_delta" &&
+            message.info.semantics?.kind !== "system_reminder",
+        )
+      : [];
     const visibleChildText = childMessages
       .filter((message) => message.info.source !== "rewind")
       .map(messageText)
@@ -13365,13 +14654,17 @@ describe("AgentRuntime tool loop", () => {
       .map(messageText)
       .join("\n");
 
-    expect(fork.response).toContain("copied 5 messages");
+    // 复制数包含首轮持久化的 environment、model、date 公告，fork 后无需重新宣告；
+    // 还包含轮首与每个工具批次后的 token 预算提醒。整个 assistant 回合都被复制，
+    // 回合内的隐藏提醒不会截断回合。
+    expect(fork.response).toContain("copied 11 messages");
     // Bugfix 回归：fork 历史包含目标回合，工作区必须保留该回合的产出，
     // 不能恢复目标回合自身 checkpoint 的 beforeContent。
     expect(fileSystemPort.files.get("/work/src/demo.ts")).toBe("export const value = 2;\n");
     expect(fork.targetMessageId).toBe(editedAssistants[0]!.info.id);
     expect(forkEvent?.payload).toMatchObject({
-      forkPoint: 5,
+      // 与复制数一致，含 environment、model、date 公告与 token 预算提醒。
+      forkPoint: 11,
       targetMessageId: editedAssistants[0]!.info.id,
       restoredFileCount: 0,
     });
@@ -13475,16 +14768,25 @@ describe("AgentRuntime tool loop", () => {
     const forkEvent = events.find((event) => event.type === SessionEventType.SessionForked);
     const child = sessionStore.createdSessions.find((session) => session.parentID === sessionId);
     const allChildMessages = child ? await sessionStore.messages({ sessionID: child.id }) : [];
-    const listings = allChildMessages.filter((message) => message.info.source === "agent_listing_delta");
+    const listings = allChildMessages.filter(
+      (message) => message.info.source === "agent_listing_delta",
+    );
     expect(listings).toHaveLength(1);
     expect(listings[0]?.parts[0]?.metadata?.runtimeMessage).toMatchObject({
       source: "agent_listing_delta",
       agentListingDelta: { addedTypes: ["Explore", "general-purpose"] },
     });
-    const childMessages = allChildMessages.filter((message) => message.info.source !== "agent_listing_delta");
+    // 模型专用公告不属于可见对话结构，与 agent listing 一样排除。
+    const childMessages = allChildMessages.filter(
+      (message) =>
+        message.info.source !== "agent_listing_delta" &&
+        message.info.semantics?.kind !== "system_reminder",
+    );
 
     expect(fork).toMatchObject({
-      copiedMessageCount: 4,
+      // 用户输入、environment、model、agent listing、轮首 token 预算提醒、date 公告、
+      // 两条 assistant 消息，以及它们之间工具批次后的 token 预算提醒。
+      copiedMessageCount: 9,
       parentSessionId: sessionId,
       targetMessageId: target!.info.id,
       restoredFiles: [],
@@ -14421,8 +15723,6 @@ class RecordingSessionStore implements SessionStorePort {
           input.timeCompacting === null
             ? undefined
             : (input.timeCompacting ?? session.time.compacting),
-        archived:
-          input.timeArchived === null ? undefined : (input.timeArchived ?? session.time.archived),
       },
     };
     this.sessions.set(input.id, next);
@@ -14436,8 +15736,6 @@ class RecordingSessionStore implements SessionStorePort {
   async upsertTurnUsage(): Promise<void> {}
 
   async upsertToolUsage(): Promise<void> {}
-
-  async pruneUsage(): Promise<void> {}
 
   async getSession(sessionID: SessionId): Promise<SessionInfo | null> {
     return this.sessions.get(sessionID) ?? null;

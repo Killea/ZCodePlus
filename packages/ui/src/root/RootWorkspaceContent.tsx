@@ -1,11 +1,12 @@
 import { memo, useEffect } from "react";
+import { ProjectDirectoryProvider } from "@/project-sidebar/index.js";
 import { App } from "@/App.js";
 import { ScopedErrorBoundary } from "@/ErrorBoundary.js";
 import { ServiceProvider } from "@/hooks/useServices.js";
 import { logger } from "@/logger.js";
 import { WorkspaceSettingsLayer } from "@/root/WorkspaceSettingsLayer.js";
 import type { AppProps } from "@/app-shell/types.js";
-import type { RootProps } from "@/root/types.js";
+import type { RootProps, WorkspaceSettingsLayerProps } from "@/root/types.js";
 import type { IFeedbackService, IServiceAccessor } from "@zcode/services";
 import { ConversationTelemetryWorkspaceAttachment } from "@/v4/telemetry/ConversationTelemetryAttachment.js";
 
@@ -31,20 +32,22 @@ interface RootWorkspaceContentProps {
   handleOpenRemoteWorkspace?: AppProps["onOpenRemoteWorkspace"];
   handleCreateScratchWorkspace: AppProps["onCreateScratchWorkspace"];
   remoteConnectionInProgress?: AppProps["remoteConnectionInProgress"];
-  remoteWorkspaceSessions: NonNullable<AppProps["remoteWorkspaceSessions"]>;
   allowRemoteWorkspace: NonNullable<RootProps["allowRemoteWorkspace"]>;
   handleBackFromSettings: () => void;
+  // Bugfix：工作区内的设置层显式转发 props，漏掉它会让分享管理解析到会话却不显示「跳转对话」。
+  handleOpenTaskFromSettings: NonNullable<WorkspaceSettingsLayerProps["onOpenTask"]>;
   handleLogout?: () => void;
   onLogin?: () => void;
   user: AppProps["user"];
   reconnectingRemoteWorkspaceKeys: AppProps["reconnectingRemoteWorkspaceKeys"];
+  remoteWorkspaceRecoveryByWorkspaceKey: AppProps["remoteWorkspaceRecoveryByWorkspaceKey"];
   remoteWorkspaceErrorByWorkspaceKey: AppProps["remoteWorkspaceErrorByWorkspaceKey"];
-  reconnectingRemoteWorkspaceLogsByWorkspaceKey: AppProps["reconnectingRemoteWorkspaceLogsByWorkspaceKey"];
+
   remoteConnectionLogs?: AppProps["remoteConnectionLogs"];
   allowOpenWorkspace: NonNullable<RootProps["allowOpenWorkspace"]>;
   webRemoteControlWorkspaceSwitcher?: RootProps["webRemoteControlWorkspaceSwitcher"];
+  initialSidebarFileTreeOpen?: boolean;
   initialWebRemoteControlMobileNavigationIntent?: RootProps["initialWebRemoteControlMobileNavigationIntent"];
-  initialWebRemoteControlWorkspaceList?: RootProps["initialWebRemoteControlWorkspaceList"];
   webRemoteControlTerminalTransportState?: RootProps["webRemoteControlTerminalTransportState"];
   isDesktop?: RootProps["isDesktop"];
   isMacDesktop?: RootProps["isMacDesktop"];
@@ -73,20 +76,21 @@ export function RootWorkspaceContent({
   handleOpenRemoteWorkspace,
   handleCreateScratchWorkspace,
   remoteConnectionInProgress,
-  remoteWorkspaceSessions,
   allowRemoteWorkspace,
   handleBackFromSettings,
+  handleOpenTaskFromSettings,
   handleLogout,
   onLogin,
   user,
   reconnectingRemoteWorkspaceKeys,
+  remoteWorkspaceRecoveryByWorkspaceKey,
   remoteWorkspaceErrorByWorkspaceKey,
-  reconnectingRemoteWorkspaceLogsByWorkspaceKey,
+
   remoteConnectionLogs,
   allowOpenWorkspace,
   webRemoteControlWorkspaceSwitcher,
+  initialSidebarFileTreeOpen,
   initialWebRemoteControlMobileNavigationIntent,
-  initialWebRemoteControlWorkspaceList,
   webRemoteControlTerminalTransportState,
   isDesktop,
   isMacDesktop,
@@ -105,7 +109,7 @@ export function RootWorkspaceContent({
   }, [isSettingsTabActive, workspaceShellPath]);
 
   return (
-    <>
+    <ProjectDirectoryProvider isDesktop={isDesktop}>
       <div
         className={isSettingsTabActive ? "h-full opacity-0 pointer-events-none" : "h-full"}
         aria-hidden={isSettingsTabActive}
@@ -145,49 +149,44 @@ export function RootWorkspaceContent({
               className="h-full"
             >
               <StableWorkspaceApp
-              services={workspaceScopedServices}
-              baseFeedbackService={baseFeedbackService}
-              onConnectRemote={handleConnectRemote}
-              onSelectRemoteProject={handleSelectRemoteProject}
-              onCancelRemoteProject={handleCancelRemoteProject}
-              onReconnectRemoteWorkspace={handleReconnectRemoteWorkspace}
-              onLogout={handleLogout}
-              onLogin={onLogin}
-              user={user}
-              reconnectingRemoteWorkspaceKeys={reconnectingRemoteWorkspaceKeys}
-              remoteWorkspaceErrorByWorkspaceKey={remoteWorkspaceErrorByWorkspaceKey}
-              reconnectingRemoteWorkspaceLogsByWorkspaceKey={
-                reconnectingRemoteWorkspaceLogsByWorkspaceKey
-              }
-              remoteConnectionLogs={remoteConnectionLogs}
-              workspaceAbsPath={workspaceShellPath}
-              workspaceRemoteSessionId={workspaceRemoteSessionId}
-              workspaceIdentity={workspaceIdentity}
-              onCreateTask={handleCreateTask}
-              onCreateConversationTask={handleCreateConversationTask}
-              onResolveConversationWorkspace={handleResolveConversationWorkspace}
-              onOpenWorkspace={handleOpenWorkspace}
-              onOpenFolderFromWorkspaceMenu={handleOpenFolderFromWorkspaceMenu}
-              onOpenRemoteWorkspace={handleOpenRemoteWorkspace}
-              onCreateScratchWorkspace={handleCreateScratchWorkspace}
-              remoteConnectionInProgress={remoteConnectionInProgress}
-              onReturnToWorkspace={handleBackFromSettings}
-              allowOpenWorkspace={allowOpenWorkspace}
-              webRemoteControlWorkspaceSwitcher={webRemoteControlWorkspaceSwitcher}
-              initialWebRemoteControlMobileNavigationIntent={
-                initialWebRemoteControlMobileNavigationIntent
-              }
-              initialWebRemoteControlWorkspaceList={initialWebRemoteControlWorkspaceList}
-              webRemoteControlTerminalTransportState={
-                webRemoteControlTerminalTransportState
-              }
-              allowRemoteWorkspace={allowRemoteWorkspace}
-              remoteWorkspaceSessions={remoteWorkspaceSessions}
-              isWorkspaceVisible={!isSettingsTabActive}
-              isDesktop={isDesktop}
-              isMacDesktop={isMacDesktop}
-              isWindowsDesktop={isWindowsDesktop}
-              supportsEmbeddedBrowser={supportsEmbeddedBrowser}
+                services={workspaceScopedServices}
+                baseFeedbackService={baseFeedbackService}
+                onConnectRemote={handleConnectRemote}
+                onSelectRemoteProject={handleSelectRemoteProject}
+                onCancelRemoteProject={handleCancelRemoteProject}
+                onReconnectRemoteWorkspace={handleReconnectRemoteWorkspace}
+                onLogout={handleLogout}
+                onLogin={onLogin}
+                user={user}
+                reconnectingRemoteWorkspaceKeys={reconnectingRemoteWorkspaceKeys}
+                remoteWorkspaceRecoveryByWorkspaceKey={remoteWorkspaceRecoveryByWorkspaceKey}
+                remoteWorkspaceErrorByWorkspaceKey={remoteWorkspaceErrorByWorkspaceKey}
+                remoteConnectionLogs={remoteConnectionLogs}
+                workspaceAbsPath={workspaceShellPath}
+                workspaceRemoteSessionId={workspaceRemoteSessionId}
+                workspaceIdentity={workspaceIdentity}
+                onCreateTask={handleCreateTask}
+                onCreateConversationTask={handleCreateConversationTask}
+                onResolveConversationWorkspace={handleResolveConversationWorkspace}
+                onOpenWorkspace={handleOpenWorkspace}
+                onOpenFolderFromWorkspaceMenu={handleOpenFolderFromWorkspaceMenu}
+                onOpenRemoteWorkspace={handleOpenRemoteWorkspace}
+                remoteConnectionInProgress={remoteConnectionInProgress}
+                onReturnToWorkspace={handleBackFromSettings}
+                allowOpenWorkspace={allowOpenWorkspace}
+                webRemoteControlWorkspaceSwitcher={webRemoteControlWorkspaceSwitcher}
+                initialSidebarFileTreeOpen={initialSidebarFileTreeOpen}
+                initialWebRemoteControlMobileNavigationIntent={
+                  initialWebRemoteControlMobileNavigationIntent
+                }
+                webRemoteControlTerminalTransportState={webRemoteControlTerminalTransportState}
+                allowRemoteWorkspace={allowRemoteWorkspace}
+                onCreateScratchWorkspace={handleCreateScratchWorkspace}
+                isWorkspaceVisible={!isSettingsTabActive}
+                isDesktop={isDesktop}
+                isMacDesktop={isMacDesktop}
+                isWindowsDesktop={isWindowsDesktop}
+                supportsEmbeddedBrowser={supportsEmbeddedBrowser}
               />
             </ScopedErrorBoundary>
           </ServiceProvider>
@@ -209,8 +208,10 @@ export function RootWorkspaceContent({
             windowsWindowControlsRightPaddingPx={windowsWindowControlsRightPaddingPx}
             captionWorkspacePath={activeWorkspacePath}
             onBack={activeWorkspacePath ? handleBackFromSettings : undefined}
+            onOpenTask={handleOpenTaskFromSettings}
             onCreateTask={handleCreateTask}
             onOpenWorkspace={handleOpenWorkspace}
+            onOpenRemoteWorkspace={handleOpenRemoteWorkspace}
             allowOpenWorkspace={allowOpenWorkspace}
             onLogin={onLogin}
             onLogout={handleLogout}
@@ -218,6 +219,6 @@ export function RootWorkspaceContent({
           />
         </ScopedErrorBoundary>
       ) : null}
-    </>
+    </ProjectDirectoryProvider>
   );
 }

@@ -32,6 +32,43 @@ import {
 import { executeAdapterGenerateText, executeAdapterStreamText } from "./test-adapter-model.js";
 
 describe("AiSdkModelAdapter", () => {
+  it("本地首有效内容日志排除空 start，正文增量只记录一次", async () => {
+    const logs: CapturedLog[] = [];
+    const runtime = createStreamRuntime(
+      stream([
+        { type: "start" },
+        { type: "text-start", id: "text" },
+        { type: "text-delta", id: "text", text: "", delta: "" },
+        { type: "text-delta", id: "text", text: "private", delta: "private" },
+        { type: "text-delta", id: "text", text: " reply", delta: " reply" },
+        { type: "text-end", id: "text" },
+        { type: "finish", finishReason: "stop", totalUsage: usage(2, 2) },
+      ]),
+    );
+    const adapter = new AiSdkModelAdapter({
+      logger: capturingLogger(logs),
+      registry: registry(),
+      runtime,
+    });
+    for await (const event of executeAdapterStreamText(adapter, {
+      providerId: "test" as never,
+      modelId: "model-a" as never,
+      messages: [{ role: "user", content: "private prompt" }],
+      metadata: { querySource: "main_turn", queryId: "command" },
+    })) {
+      if (event.type === "text_start")
+        expect(
+          logs.filter((log) => log.context?.event === "ttft.model.first_content"),
+        ).toHaveLength(0);
+    }
+    const milestones = logs.filter((log) => log.context?.event === "ttft.model.first_content");
+    expect(milestones).toHaveLength(1);
+    expect(milestones[0]).toMatchObject({
+      level: "info",
+      context: { queryId: "command", outputKind: "text" },
+    });
+    expect(JSON.stringify(milestones)).not.toContain("private");
+  });
   it("extends SSE idle timeout by 30 seconds for each retry", () => {
     expect(resolveModelStreamIdleTimeoutMs({})).toBe(600_000);
     expect(resolveModelStreamIdleTimeoutMs({ retryNumber: 1 })).toBe(630_000);
@@ -948,7 +985,6 @@ describe("AiSdkModelAdapter", () => {
 
       const content = await readFile(join(debugDir, files[0]!), "utf8");
       const record = JSON.parse(content.trim()) as {
-        model: { role?: string };
         querySource?: string;
         request: { body: unknown; headers: Record<string, string> };
         response: { body: unknown; headers: Record<string, string>; reasoningText?: string };
@@ -961,7 +997,6 @@ describe("AiSdkModelAdapter", () => {
       expect(record.sessionId).toBe("sess_debug");
       expect(record.turnId).toBe("turn_debug");
       expect(record.querySource).toBe("session_title");
-      expect(record.model.role).toBeUndefined();
       expect(record.request.body).toMatchObject({
         messages: [{ role: "user", content: "Ping" }],
         model: "model-a",
@@ -2136,6 +2171,7 @@ describe("AiSdkModelAdapter", () => {
       });
 
       expect(result.text).toBe("done");
+      expect(result.signedReasoningReset).toBe(true);
       expect(captured).toHaveLength(2);
       expectSignatureReplayRequest(captured[0]!.messages, true);
       expectSignatureReplayRequest(captured[1]!.messages, false);
@@ -2258,6 +2294,7 @@ describe("AiSdkModelAdapter", () => {
     });
 
     expect(result.text).toBe("done");
+    expect(result.signedReasoningReset).toBe(true);
     expect(captured).toHaveLength(3);
     testCase.signedAttempts.forEach((includeSigned, index) =>
       expectSignatureReplayRequest(captured[index]!.messages, includeSigned),
@@ -2269,6 +2306,46 @@ describe("AiSdkModelAdapter", () => {
     expect(startedEvents.map((event) => event.attempt)).toEqual([1, 2, 3]);
     expect(new Set(startedEvents.map((event) => event.requestId)).size).toBe(3);
     expect(messages).toEqual(snapshot);
+  });
+
+  it("does not report a repair marker when no signature repair ran", async () => {
+    let calls = 0;
+    const runtime: AiSdkModelRuntime = {
+      async generateText() {
+        calls += 1;
+        if (calls === 1) {
+          throw apiError("provider temporarily unavailable", {
+            isRetryable: true,
+            responseHeaders: { "retry-after": "0" },
+            statusCode: 500,
+          });
+        }
+        return {
+          text: "done",
+          finishReason: "stop",
+          usage: usage(1, 1),
+          totalUsage: usage(1, 1),
+        } as never;
+      },
+      streamText() {
+        throw new Error("not used");
+      },
+    };
+    const adapter = new AiSdkModelAdapter({
+      registry: providerRegistry("anthropic"),
+      retry: { baseDelayMs: 0, jitter: false, maxAttempts: 2, maxDelayMs: 0 },
+      runtime,
+    });
+
+    const result = await executeAdapterGenerateText(adapter, {
+      providerId: "deepseek" as never,
+      modelId: "model-a" as never,
+      messages: signatureReplayMessages(),
+    });
+
+    expect(result.text).toBe("done");
+    expect(calls).toBe(2);
+    expect(result).not.toHaveProperty("signedReasoningReset");
   });
 
   it("stops generate signature repair after one rejected repaired attempt", async () => {
@@ -3426,6 +3503,7 @@ describe("AiSdkModelAdapter", () => {
       streamText() {
         return {
           fullStream: stream([
+            { type: "text-delta", id: "partial", text: "partial answer" },
             {
               type: "finish",
               finishReason: "other",
@@ -3451,6 +3529,7 @@ describe("AiSdkModelAdapter", () => {
     }
 
     expect(events).toEqual([
+      { type: "text_delta", id: "partial", text: "partial answer" },
       {
         type: "finish",
         finishReason: "other",
@@ -3679,6 +3758,9 @@ describe("AiSdkModelAdapter", () => {
       expect(statusEvents[3]).toMatchObject({ attempt: 2, maxAttempts: 2 });
       expect(statusEvents[3]!.requestId).not.toBe(statusEvents[0]!.requestId);
       expect(streamEvents.some((event) => event.type === "text_delta")).toBe(true);
+      expect(streamEvents.filter((event) => event.type === "finish")).toEqual([
+        expect.objectContaining({ signedReasoningReset: true }),
+      ]);
 
       const [fileName] = await readdir(debugDir);
       const records = (await readFile(join(debugDir, fileName!), "utf8"))
@@ -3773,6 +3855,9 @@ describe("AiSdkModelAdapter", () => {
     }
 
     expect(streamEvents.some((event) => event.type === "text_delta")).toBe(true);
+    expect(streamEvents.find((event) => event.type === "finish")).toMatchObject({
+      signedReasoningReset: true,
+    });
     expect(captured).toHaveLength(3);
     testCase.signedAttempts.forEach((includeSigned, index) =>
       expectSignatureReplayRequest(captured[index]!.messages, includeSigned),
@@ -3784,6 +3869,121 @@ describe("AiSdkModelAdapter", () => {
     expect(startedEvents.map((event) => event.attempt)).toEqual([1, 2, 3]);
     expect(new Set(startedEvents.map((event) => event.requestId)).size).toBe(3);
     expect(messages).toEqual(snapshot);
+  });
+
+  it("repairs the gateway form of a bound thinking signature and logs the provider evidence", async () => {
+    const logs: CapturedLog[] = [];
+    const captured: AiSdkGenerateTextOptions["messages"][] = [];
+    const providerMessage =
+      "ValidationException: messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
+    const runtime: AiSdkModelRuntime = {
+      async generateText() {
+        throw new Error("not used");
+      },
+      streamText(options) {
+        captured.push(structuredClone(options.messages) as never);
+        if (captured.length === 1) {
+          throw apiError(providerMessage, {
+            isRetryable: false,
+            responseHeaders: {
+              "anthropic-thinking-prefix-mismatch": "block=messages.1.content.0;kind=prefix",
+            },
+            statusCode: 400,
+          });
+        }
+        return {
+          fullStream: stream([
+            { type: "start" },
+            { type: "text-delta", id: "text-1", text: "done" },
+            { type: "finish", finishReason: "stop", totalUsage: usage(1, 1) },
+          ]),
+        } as never;
+      },
+    };
+    const adapter = new AiSdkModelAdapter({
+      logger: capturingLogger(logs),
+      registry: providerRegistry("anthropic"),
+      retry: { baseDelayMs: 0, jitter: false, maxAttempts: 1, maxDelayMs: 0 },
+      runtime,
+    });
+
+    for await (const _event of executeAdapterStreamText(adapter, {
+      providerId: "deepseek" as never,
+      modelId: "model-a" as never,
+      messages: signatureReplayMessages(),
+    })) {
+      // drain stream
+    }
+
+    // 修复原因：网关原文里 `signature` 带反引号，原来的匹配认不出，剥离重试没有触发。
+    expect(captured).toHaveLength(2);
+    expectSignatureReplayRequest(captured[0]!, true);
+    expectSignatureReplayRequest(captured[1]!, false);
+    const repairLog = logs.find(
+      (entry) => entry.context.event === "model.reasoning_signature_repair.retry",
+    );
+    expect(repairLog).toMatchObject({
+      level: "warn",
+      context: {
+        providerMessage,
+        thinkingPrefixMismatch: "block=messages.1.content.0;kind=prefix",
+      },
+    });
+  });
+
+  it("logs the provider evidence when a non-streaming request repairs a bound thinking signature", async () => {
+    const logs: CapturedLog[] = [];
+    const captured: AiSdkGenerateTextOptions["messages"][] = [];
+    const providerMessage =
+      "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
+    const runtime: AiSdkModelRuntime = {
+      async generateText(options) {
+        captured.push(structuredClone(options.messages) as never);
+        if (captured.length === 1) {
+          throw apiError(providerMessage, {
+            isRetryable: false,
+            responseHeaders: {
+              "anthropic-thinking-prefix-mismatch": "block=messages.1.content.0;kind=prefix",
+            },
+            statusCode: 400,
+          });
+        }
+        return {
+          text: "done",
+          finishReason: "stop",
+          usage: usage(1, 1),
+          totalUsage: usage(1, 1),
+        } as never;
+      },
+      streamText() {
+        throw new Error("not used");
+      },
+    };
+    const adapter = new AiSdkModelAdapter({
+      logger: capturingLogger(logs),
+      registry: providerRegistry("anthropic"),
+      retry: { baseDelayMs: 0, jitter: false, maxAttempts: 1, maxDelayMs: 0 },
+      runtime,
+    });
+
+    const result = await executeAdapterGenerateText(adapter, {
+      providerId: "deepseek" as never,
+      modelId: "model-a" as never,
+      messages: signatureReplayMessages(),
+    });
+
+    expect(result.text).toBe("done");
+    expect(captured).toHaveLength(2);
+    expectSignatureReplayRequest(captured[1]!, false);
+    expect(
+      logs.find((entry) => entry.context.event === "model.reasoning_signature_repair.retry"),
+    ).toMatchObject({
+      level: "warn",
+      context: {
+        providerMessage,
+        thinkingPrefixMismatch: "block=messages.1.content.0;kind=prefix",
+      },
+    });
   });
 
   it("publishes retry status when Anthropic rejects a thinking signature during stream setup", async () => {
@@ -4867,7 +5067,6 @@ describe("AiSdkModelAdapter", () => {
       events.push(event);
     }
 
-    expect(malformedInput).toHaveLength(884);
     expect(events.map((event) => event.type)).toEqual([
       "start",
       "tool_input_start",

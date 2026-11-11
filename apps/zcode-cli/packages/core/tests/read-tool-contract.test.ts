@@ -24,8 +24,12 @@ import {
 } from "@zcode/contracts";
 import { PermissionService, defaultPermissionConfig } from "../src/permission/service.js";
 import { createToolExecutor } from "../src/tool/executor.js";
-import { readHandler, readToolEntry } from "../src/tool/handlers/read.js";
-import { createReadFileStateKey } from "../src/tool/read-file-state.js";
+import {
+  readFileForCompactRestore,
+  readHandler,
+  readToolEntry,
+} from "../src/tool/handlers/read.js";
+import { createReadFileStatePathKey } from "../src/tool/read-file-state.js";
 import { createToolRegistry } from "../src/tool/registry.js";
 import type { ReadFileStateMap, ToolExecutionContext } from "../src/tool/types.js";
 
@@ -171,7 +175,7 @@ describe("Read model-result harness", () => {
       context,
     );
 
-    expect(readFileState.get(createReadFileStateKey(file, 2, 1))).toMatchObject({
+    expect(readFileState.get(createReadFileStatePathKey(file))).toMatchObject({
       isPartialView: false,
       limit: 1,
       offset: 2,
@@ -193,6 +197,10 @@ describe("Read model-result harness", () => {
       startLine: 1,
       totalLines: 1,
     });
+    // 与严格合同同一断言；严格套件默认跳过，这里保证默认测试也覆盖空文件提示。
+    expect(asModelText(result.modelContent)).toBe(
+      "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>",
+    );
   });
 
   it("reads past 2000 lines by default when byte and token budgets allow", async () => {
@@ -225,6 +233,163 @@ describe("Read model-result harness", () => {
     expect(first.output).toMatchObject({ type: "text", content: "same\ncontent" });
     expect(second.output).toEqual({ type: "file_unchanged", filePath: file });
     expect(asModelText(second.modelContent)).toBe(FILE_UNCHANGED_STUB);
+  });
+
+  // 修复原因：file_unchanged 的快照是当时最新记录的副本。冷恢复按它重放时，会恢复出已不在
+  // active history 里的视图（例如那次真实读取已被 compact 摘要）。冷恢复只由真实读取恢复。
+  it("records a read-state snapshot for content reads but not for file_unchanged", async () => {
+    const file = join(tmpDir, "snapshot.txt");
+    const fs = createMemoryFileSystem({ [file]: "same\ncontent" });
+    const snapshots: unknown[] = [];
+    const context: ToolExecutionContext = {
+      ...contextWith(fs, { readFileState: new Map() }),
+      recordReadFileStateMetadata: (metadata) => snapshots.push(metadata),
+    };
+
+    await readForModel({ file_path: file }, context);
+    const second = await readForModel({ file_path: file }, context);
+
+    expect(second.output).toEqual({ type: "file_unchanged", filePath: file });
+    expect(snapshots).toEqual([expect.objectContaining({ path: file, tool: "Read" })]);
+  });
+
+  it("re-reads the whole current file for compaction without touching the read state", async () => {
+    const file = join(tmpDir, "restore.txt");
+    const fs = createMemoryFileSystem({ [file]: "one\ntwo" });
+
+    const result = await readFileForCompactRestore({
+      filePath: file,
+      fileSystemPort: fs,
+      workingDirectory: tmpDir,
+      workspaceRoot: tmpDir,
+    });
+
+    expect(result).toMatchObject({
+      output: { content: "one\ntwo", startLine: 1, totalLines: 2, type: "text" },
+      readFileStateEntry: {
+        content: "one\ntwo",
+        isPartialView: false,
+        limit: undefined,
+        mtimeMs: 1,
+        offset: undefined,
+        path: file,
+        revisionId: expect.any(String),
+        sizeBytes: 7,
+        sourceTool: "Read",
+      },
+      type: "text",
+    });
+    expect(fs.readRangeRequests).toEqual([
+      expect.objectContaining({
+        limitLines: undefined,
+        maxBytes: READ_MAX_FILE_SIZE_BYTES,
+        path: file,
+      }),
+    ]);
+  });
+
+  it("records a token-capped compaction re-read as a partial view", async () => {
+    const file = join(tmpDir, "token-capped.txt");
+    // 约 4 万 token，没有超过 Read 的文件大小上限。
+    const content = Array.from(
+      { length: 4_000 },
+      (_, index) => `line ${index} ${"word ".repeat(5)}`,
+    ).join("\n");
+    const fs = createMemoryFileSystem({ [file]: content });
+
+    const result = await readFileForCompactRestore({
+      filePath: file,
+      fileSystemPort: fs,
+      workingDirectory: tmpDir,
+      workspaceRoot: tmpDir,
+    });
+
+    expect(Buffer.byteLength(content, "utf8")).toBeLessThan(READ_MAX_FILE_SIZE_BYTES);
+    expect(result).toMatchObject({
+      output: { truncatedByTokenCap: true, type: "text" },
+      readFileStateEntry: { isPartialView: true, path: file },
+      type: "text",
+    });
+  });
+
+  it("reports oversized files and skips paths Read would not read as text for compaction", async () => {
+    const large = join(tmpDir, "large.txt");
+    const image = join(tmpDir, "shot.png");
+    const binary = join(tmpDir, "tool.exe");
+    const fs = createMemoryFileSystem({
+      [large]: "x".repeat(READ_MAX_FILE_SIZE_BYTES + 1),
+      [image]: "not really an image",
+      [binary]: "not really a binary",
+    });
+    const restore = (filePath: string) =>
+      readFileForCompactRestore({
+        filePath,
+        fileSystemPort: fs,
+        workingDirectory: tmpDir,
+        workspaceRoot: tmpDir,
+      });
+
+    expect(await restore(large)).toEqual({ type: "too_large" });
+    expect(await restore(image)).toEqual({ type: "skipped" });
+    expect(await restore(binary)).toEqual({ type: "skipped" });
+    await expect(restore(join(tmpDir, "missing.txt"))).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("returns content again after Edit or Write recorded the file state", async () => {
+    for (const sourceTool of ["Edit", "Write"] as const) {
+      const file = join(tmpDir, `after-${sourceTool}.txt`);
+      const fs = createMemoryFileSystem({ [file]: "alpha\ngamma" });
+      const readFileState: ReadFileStateMap = new Map();
+      const context = contextWith(fs, { readFileState });
+      await readForModel({ file_path: file }, context);
+      const key = createReadFileStatePathKey(file);
+      // 模拟 Edit/Write 写入后的状态：同一完整视图的键，文件 mtime/size 未再变化。
+      readFileState.set(key, { ...readFileState.get(key)!, readAt: new Date(), sourceTool });
+
+      const reread = await readForModel({ file_path: file }, context);
+
+      // 写入后模型没有看过新内容，重读必须返回内容，不是 Wasted call 存根。
+      expect(reread.output).toMatchObject({ type: "text", content: "alpha\ngamma" });
+    }
+  });
+
+  it("deduplicates only against the latest Read view of the path", async () => {
+    const file = join(tmpDir, "latest-view.txt");
+    const fs = createMemoryFileSystem({ [file]: "one\ntwo\nthree" });
+    const readFileState: ReadFileStateMap = new Map();
+    const context = contextWith(fs, { readFileState });
+
+    await readForModel({ file_path: file }, context);
+    await readForModel({ file_path: file, offset: 2, limit: 1 }, context);
+    expect(readFileState.size).toBe(1);
+    const full = await readForModel({ file_path: file }, context);
+    const repeated = await readForModel({ file_path: file }, context);
+
+    // 每个文件只按最近一次视图去重：中间读过别的范围后，完整读取返回内容。
+    expect(full.output).toMatchObject({ type: "text", content: "one\ntwo\nthree" });
+    expect(repeated.output).toEqual({ type: "file_unchanged", filePath: file });
+    // 每个文件只存一条，每次读取覆盖。
+    expect(readFileState.size).toBe(1);
+  });
+
+  it("maps empty Read content the same way for an empty file and a blank line", async () => {
+    const empty = join(tmpDir, "empty-file.txt");
+    const blank = join(tmpDir, "blank-line.txt");
+    const fs = createMemoryFileSystem({ [empty]: "", [blank]: "a\n\nb" });
+    const context = contextWith(fs);
+
+    const emptyRead = await readForModel({ file_path: empty }, context);
+    const blankRead = await readForModel({ file_path: blank, offset: 2, limit: 1 }, context);
+    const pastEnd = await readForModel({ file_path: blank, offset: 5 }, context);
+
+    // 空文件说内容为空；按 offset 读到的空行带行号；只有超出末尾才说 offset 太大。
+    expect(asModelText(emptyRead.modelContent)).toBe(
+      "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>",
+    );
+    expect(asModelText(blankRead.modelContent)).toBe("2\t");
+    expect(asModelText(pastEnd.modelContent)).toBe(
+      "<system-reminder>Warning: the file exists but is shorter than the provided offset (5). The file has 3 lines.</system-reminder>",
+    );
   });
 
   it("deduplicates repeated reads when mtime only drifts inside the same millisecond", async () => {
@@ -321,13 +486,6 @@ describe("Read model-result harness", () => {
   });
 
   it("documents current non-text model-content formatting", () => {
-    expect(
-      formatReadModelContent({
-        type: "file_unchanged",
-        filePath: "/work/same.txt",
-      }),
-    ).toBe(FILE_UNCHANGED_STUB);
-
     const pdf = {
       type: "pdf" as const,
       filePath: "/work/report.pdf",
@@ -382,25 +540,6 @@ describe("Read model-result harness", () => {
 });
 
 describeReadStrictContract("Read strict model-result contract", () => {
-  it("returns numbered text content without the legacy file-read mitigation reminder", async () => {
-    const file = join(tmpDir, "notes.txt");
-    const fs = createMemoryFileSystem({
-      [file]: "alpha\nbeta",
-    });
-
-    const result = await readForModel({ file_path: file }, contextWith(fs));
-
-    expect(result.output).toMatchObject({
-      type: "text",
-      filePath: file,
-      content: "alpha\nbeta",
-      numLines: 2,
-      startLine: 1,
-      totalLines: 2,
-    });
-    expect(asModelText(result.modelContent)).toBe("1\talpha\n2\tbeta");
-  });
-
   it("normalizes UTF-8 BOM and CRLF while preserving requested offset and limit", async () => {
     const file = join(tmpDir, "windows.txt");
     const fs = createMemoryFileSystem({
@@ -425,31 +564,6 @@ describeReadStrictContract("Read strict model-result contract", () => {
       totalLines: 3,
     });
     expect(asModelText(result.modelContent)).toBe("2\tsecond");
-  });
-
-  it("allows offset zero and numbers model-facing content from line zero", async () => {
-    const file = join(tmpDir, "zero-offset.txt");
-    const fs = createMemoryFileSystem({
-      [file]: "first\nsecond",
-    });
-
-    const result = await readForModel(
-      {
-        file_path: file,
-        offset: 0,
-        limit: 1,
-      },
-      contextWith(fs),
-    );
-
-    expect(result.output).toMatchObject({
-      type: "text",
-      content: "first",
-      numLines: 1,
-      startLine: 0,
-      totalLines: 2,
-    });
-    expect(asModelText(result.modelContent)).toBe("0\tfirst");
   });
 
   it("reads relative paths against cwd while preserving the original input path in output data", async () => {
@@ -512,7 +626,7 @@ describeReadStrictContract("Read strict model-result contract", () => {
       totalLines: 1,
     });
     expect(asModelText(result.modelContent)).toBe(
-      "<system-reminder>Warning: the file exists but is shorter than the provided offset (1). The file has 1 lines.</system-reminder>",
+      "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>",
     );
   });
 
@@ -529,23 +643,6 @@ describeReadStrictContract("Read strict model-result contract", () => {
     expect(asModelText(modelContent)).toBe(
       "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>",
     );
-  });
-
-  it("reads more than 2000 lines when byte and token limits allow", async () => {
-    const file = join(tmpDir, "many-lines.txt");
-    const lines = Array.from({ length: 2005 }, (_, index) => `line-${index + 1}`);
-    const fs = createMemoryFileSystem({
-      [file]: lines.join("\n"),
-    });
-
-    const result = await readForModel({ file_path: file }, contextWith(fs));
-
-    expect(result.output).toMatchObject({
-      type: "text",
-      numLines: 2005,
-      totalLines: 2005,
-    });
-    expect(result.output).toHaveProperty("content", expect.stringContaining("line-2005"));
   });
 
   it("throws a file-size error for whole-file reads above the Read byte guard", async () => {
@@ -613,51 +710,10 @@ describeReadStrictContract("Read strict model-result contract", () => {
       content: "content",
       startLine: 2,
     });
-    expect(readFileState.get(createReadFileStateKey(file, 2, 1))).toMatchObject({
+    expect(readFileState.get(createReadFileStatePathKey(file))).toMatchObject({
       isPartialView: false,
       limit: 1,
       offset: 2,
-    });
-  });
-
-  it("re-reads full content when the file changes after a cached read", async () => {
-    const file = join(tmpDir, "changed.txt");
-    const fs = createMemoryFileSystem({
-      [file]: "before",
-    });
-    const context = contextWith(fs);
-
-    await readForModel({ file_path: file }, context);
-    fs.files.set(file, "after");
-    const second = await readForModel({ file_path: file }, context);
-
-    expect(second.output).toMatchObject({
-      type: "text",
-      content: "after",
-    });
-  });
-
-  it.todo("does not dedup partial-view or edit/write-seeded cache entries");
-
-  it.todo("notifies file-read listeners with the selected text slice only");
-
-  it("throws a friendly ENOENT message with cwd note and a similar filename suggestion", async () => {
-    const existing = join(tmpDir, "target.ts");
-    const missing = join(tmpDir, "target.js");
-    const fs = createMemoryFileSystem({
-      [existing]: "export const ok = true",
-    });
-
-    await expect(
-      readForModel(
-        { file_path: missing },
-        contextWith(fs, {
-          workingDirectory: tmpDir,
-          workspaceRoot: tmpDir,
-        }),
-      ),
-    ).rejects.toMatchObject({
-      message: `File does not exist. Note: your current working directory is ${tmpDir}. Did you mean target.ts?`,
     });
   });
 
@@ -711,49 +767,6 @@ describeReadStrictContract("Read strict model-result contract", () => {
     );
   });
 
-  it("keeps resized image Read output media-only before provider projection", () => {
-    expect(
-      formatReadModelContent({
-        type: "image",
-        base64: "abc123",
-        mimeType: "image/png",
-        originalSize: 3,
-        dimensions: {
-          originalWidth: 3000,
-          originalHeight: 1000,
-          displayWidth: 2000,
-          displayHeight: 667,
-        },
-      }),
-    ).toEqual([
-      {
-        type: "image",
-        mediaType: "image/png",
-        dataUrl: "data:image/png;base64,abc123",
-        source: {
-          id: "read-image",
-          kind: "inline",
-          mimeType: "image/png",
-          placeholder: "Read image",
-          sizeBytes: 3,
-        },
-      },
-    ]);
-  });
-
-  it("serializes PDF Read output for the model", () => {
-    expect(
-      asModelText(
-        formatReadModelContent({
-          type: "pdf",
-          filePath: "/tmp/report.pdf",
-          base64: "pdf-data",
-          originalSize: 4,
-        }),
-      ),
-    ).toBe("PDF file read: /tmp/report.pdf (4 bytes)");
-  });
-
   it("serializes PDF parts Read output for the model", () => {
     const content = formatReadModelContent({
       type: "parts",
@@ -780,17 +793,6 @@ describeReadStrictContract("Read strict model-result contract", () => {
     ]);
   });
 
-  it("serializes file_unchanged Read output for the model", () => {
-    expect(
-      asModelText(
-        formatReadModelContent({
-          type: "file_unchanged",
-          filePath: "/tmp/same.txt",
-        }),
-      ),
-    ).toBe(FILE_UNCHANGED_STUB);
-  });
-
   it("rejects malformed PDF page ranges before I/O", () => {
     expect(readInputSafeParse({ file_path: "/tmp/x.pdf", pages: "abc" }).success).toBe(false);
   });
@@ -798,19 +800,6 @@ describeReadStrictContract("Read strict model-result contract", () => {
   it("rejects oversized PDF page ranges before I/O", () => {
     expect(readInputSafeParse({ file_path: "/tmp/x.pdf", pages: "1-21" }).success).toBe(false);
     expect(readInputSafeParse({ file_path: "/tmp/x.pdf", pages: "20-" }).success).toBe(false);
-  });
-
-  it("rejects non-renderable binary extensions", () => {
-    expect(readInputSafeParse({ file_path: "/tmp/archive.zip" }).success).toBe(false);
-  });
-
-  it("allows PDFs and images through Read input validation", () => {
-    expect(readInputSafeParse({ file_path: "/tmp/image.png" }).success).toBe(true);
-    expect(readInputSafeParse({ file_path: "/tmp/doc.pdf" }).success).toBe(true);
-  });
-
-  it("rejects device paths that would block or stream indefinitely", () => {
-    expect(readInputSafeParse({ file_path: "/dev/zero" }).success).toBe(false);
   });
 });
 

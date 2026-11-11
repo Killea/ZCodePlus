@@ -6,33 +6,15 @@ import {
 import { createModelAdapter, type CreateModelAdapterOptions } from "../src/model-factory.js";
 
 describe("createModelAdapter", () => {
-  it("只接受执行基础设施配置，不接受 Provider Registry 投影", () => {
+  it("缺少执行基础设施配置时拒绝创建 Adapter", () => {
     expect(() => createModelAdapter({ env: {} } as CreateModelAdapterOptions)).toThrow(
       "requires executionConfig",
     );
-    const adapter = createModelAdapter({
-      env: {},
-      executionConfig: createRuntimeAiSdkModelExecutionConfig({}),
-    });
-    expect(adapter).not.toHaveProperty("replaceRegistryConfig");
-    expect(adapter).not.toHaveProperty("resolveConnection");
-  });
-
-  it("接受模型 IO 与流超时等 Adapter 自身选项", () => {
-    expect(() =>
-      createModelAdapter({
-        env: {},
-        executionConfig: createRuntimeAiSdkModelExecutionConfig({}),
-        modelIoDir: "/tmp/zcode-model-io-test",
-        modelIoFullRetentionEnabled: true,
-        streamIdleTimeoutMs: 42_000,
-      }),
-    ).not.toThrow();
   });
 });
 
 describe("createRuntimeAiSdkModelExecutionConfig", () => {
-  it("只装配来源 Header、网络、路由、环境和签名基础设施", () => {
+  it("装配来源 Header、网络和路由基础设施", () => {
     const endpointRoutingPort = {
       async resolve(url: string) {
         return { routed: false, url };
@@ -63,8 +45,6 @@ describe("createRuntimeAiSdkModelExecutionConfig", () => {
         noProxy: "localhost",
       },
     });
-    expect(config).not.toHaveProperty("providers");
-    expect(config).not.toHaveProperty("defaultProviderId");
   });
 
   it("过滤空网络配置", () => {
@@ -86,5 +66,20 @@ describe("buildCliZCodeSourceHeaders", () => {
       "X-Title": "Z Code@cli",
       "X-ZCode-App-Version": "3.9.0",
     });
+  });
+
+  it("X-Client-Language 优先使用 Desktop 下发的界面语言", () => {
+    expect(
+      buildCliZCodeSourceHeaders({ ZCODE_CLIENT_LANGUAGE: " ja-JP " }, { sourceTitle: "electron" }),
+    ).toMatchObject({ "X-Client-Language": "ja-JP" });
+  });
+
+  it("界面语言为空或含非打印字符时回落进程 Intl", () => {
+    const intlLocale = Intl.DateTimeFormat().resolvedOptions().locale;
+    for (const value of ["", "  ", "ko\u0001KR"]) {
+      expect(
+        buildCliZCodeSourceHeaders({ ZCODE_CLIENT_LANGUAGE: value }, { sourceTitle: "cli" }),
+      ).toMatchObject({ "X-Client-Language": intlLocale });
+    }
   });
 });

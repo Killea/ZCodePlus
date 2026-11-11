@@ -218,6 +218,8 @@ port B saturated/resync      -> 不影响 A
 
 下行帧必须按 `subscriptionId` 只送到 owner port，禁止 workspace 广播后再由客户端丢弃别人的帧。snapshot 整体替换；迟到帧 `toSeq <= localSeq` 静默丢弃；gap 只触发一个在途 resync，resume 再断档升级为强制 snapshot。attachment 重建或 CLI runtime epoch 变化后自动重订阅。relay/main 只透传 RPC payload 和连接级 `saturated/drained` 信号，不持有 session、stream、queue、snapshot 等 conversation 业务状态。
 
+冷恢复的会话身份只来自 host 可信注入的 `workspace`：`conversation/subscribe`，以及会在 runtime 不在内存时冷恢复的只读查询（`rowsRange`、`plans`、`fileChanges`、`fileRewindPreview`、附件读取与上传开始、workflow run 读面）和命令信封都带可选 `workspace`，renderer 不传。CLI 不能按存储的 cwd 重建身份：受管 worktree 会话的 key 是项目、cwd 是 worktree（`docs/git/worktree.md` §9.3）。host 只对本地 workspace 注入。
+
 ACK 丢失或重连时，UI 通过 `commands/query`（每次最多 64 个 `{sessionId, commandId}`）对账。CLI 固定按“内存 LRU -> transcript/message anchor -> timeline marker -> fork child metadata -> discarded input ledger -> unknown”查找；同 key 的查询与执行共享 single-flight，避免查询窗口诱发重复执行。
 
 同一 `commandId` 已在执行时，duplicate request 与 `commands/query` 都等待该 in-flight command
@@ -437,9 +439,9 @@ queue 表示未来用户意图，不属于已完成历史。所有来自桌面�
 
 edit、compact、fork 不应改写 queue 内容；fork 新 session 不复制父 queue。queue 真正消费时，才按消费时 session 的最新上下文、模型、思考深度执行。
 
-`editQueueItem` 原地修改权威 item，保留 ID、位置、attachments、client 和来源 command。`sendQueuedNow` 采用 `reserve -> stop barrier -> start/promote -> remove`：只有启动成功才移除；timeout 或失败释放 reservation，原 item 原位保留；连续点击或跨端竞争只能有一个 reservation owner。
+`editQueueItem` 原地修改权威 item 的文本、附件与模型/mode/Plan 配置，保留 ID、位置、kind、client 和来源 command，并释放编辑锁。编辑期间 `lockQueueItemEdit` 冻结该项（`queueItem.editLock`），自动 promotion 到冻结队首即暂停；冻结项拒绝 send-now/delete/reorder，`releaseQueueItemEdit` 可由任意端解除（见 [Composer 编辑态](ui/composer-edit-mode.md)）。`sendQueuedNow` 采用 `reserve -> stop barrier -> start/promote -> remove`：只有启动成功才移除；timeout 或失败释放 reservation，原 item 原位保留；连续点击或跨端竞争只能有一个 reservation owner。
 
-queue 只保证当前 CLI 进程内可靠。CLI runtime restart 后，上一进程已 admitted 但尚未进入 transcript 的输入进入 discarded ledger，`commands/query` 返回 `fault.command.inputDiscardedOnRestart` 及持久 `delivery`。UI 的 24 小时 pending-command registry 只覆盖投递未知窗口（敏感 interaction 只存 digest）：queue/guided projection 一到即清账；restart query 的 `queue/guide` 与无权威结论的 `unknown` 静默清账且不显示 UI 错误；只有未进入 transcript 的 `startNow` 提示用户确认重发，禁止自动恢复或自动重放。
+queue 只保证当前 CLI 进程内可靠。CLI runtime restart 后，上一进程已 admitted 但尚未进入 transcript 的输入进入 discarded ledger，`commands/query` 返回 `fault.command.inputDiscardedOnRestart` 及持久 `delivery`。UI 的 24 小时 pending-command registry 只覆盖投递未知窗口（敏感 interaction 只存 digest）：queue/guided projection 一到即清账；restart query 的 `queue/guide` 静默清账；无权威结论的 `unknown` 保留待确认线索直到明确结果、权威投影或既有 TTL，且不显示 UI 错误；只有未进入 transcript 的 `startNow` 提示用户确认重发，禁止自动恢复或自动重放。
 
 background result 如果在 foreground busy、compact、goal verifier 或 held queue 阶段返回，必须先进入 `continuation-inbox` 或等价的 deferred queue item。它可以在后续 provider 请求中以 `role=user` 出现，但 queue/event 必须保留 `origin=backgroundResult`，避免被误当作用户手写 query、误开放 edit，或被 fork child 复制为 pending future input。
 
@@ -458,7 +460,7 @@ background result 真正触发 model-only wake 时，无论 live 还是 cold 都
 
 `guide` 模式不表示可以改写已经发给 provider 的 in-flight 请求。它只允许把完整 input intent 提交给运行时的 turn-steer 机制，等待运行时确认注入、拒绝或回退。guide 不适用、带 attachments、compact/verifier busy 或 runtime 拒绝 steer 时，必须以原字段回退 CLI queue。empty、超限或 admission/runtime reject 必须返回显式 `rejected/failed`，让 UI 保留文本与附件。无论是 `queue` 还是 `guide`，用户输入都必须保留：不能从 composer 或临时状态消失后，既不在 queue/guided row/transcript 中，也没有显式 `rejected/failed/discarded` 结果。
 
-运行时确认注入一条 guide 后，产品轮次不变，但 CLI 必须在 `turnHeader.workSegments` 中关闭上一 visual work segment，并以 guided user 的稳定实体 ID 开启新 segment。UI 为每个 segment 独立展示和折叠“已工作/工作中”；这只是工作区边界，不改变最终 assistant 的 fork/retry/action 归属。
+运行时确认注入一条 guide 后，产品轮次不变，但 CLI 必须在 `turnHeader.workSegments` 中关闭上一 visual work segment，并以 guided user 的稳定实体 ID 开启新 segment。同一次取出的多条 guide（两条之间没有主模型 step）只由第一条开启一个 segment，后续 guide 并入该段；两条 guide 之间有模型 step 时，即使这一步没有可见行，后一条也开启新 segment。CLI 按模型 step 判定边界：live 由主模型流事件与主轮 `ModelComplete` 关闭当前取出，cold hydration 为每条 assistant 消息合成同样的流起始事件，两边得到同一份 segment。UI 只按 `workSegments[].triggerEntityId` 切分视觉工作段，不自行判断是否同一次取出；缺少 turn header 或 `workSegments` 的旧快照才回退为“上一行已是 guided user 时并入”。UI 为每个 segment 独立展示和折叠“已工作/工作中”；这只是工作区边界，不改变最终 assistant 的 fork/retry/action 归属。
 
 `followupInput.mode` 只决定普通 assistant 运行态中普通文本是排队还是尝试 guide。对于 `activeWork.kind=compact`、`activeWork.kind=goalVerifier` 等 `sessionEnded=false` 但不可 steer 的上下文，guide 不生效，普通文本和 `/goal` 都按 deferred input 进入 queue。
 
@@ -524,6 +526,16 @@ Fork 是从父 session 的某个稳定 assistant turn 派生 child session。它
 | `fork.backgroundPolicy` | 父 session 的 live background bash/subagent、pending background result 和 continuation inbox 不复制到 child；已在 fork 点之前 materialize 成稳定 transcript 的 background result 才会随历史复制 |
 | `fork.workspacePolicy` | running fork 只复制对话，不 rewind 共享 workspace；completed/idle 既有 checkpoint 行为本轮不扩大 |
 | `fork.timeline` | fork notice 是 turn boundary，不进入 assistant 工作历史，也不被“已工作”折叠 |
+| `fork.targetCwd` | 可选 `{ cwd, childSessionId, worktreeCreation }`。缺省时 child 在父 cwd；带上时 child 留在父 workspace，cwd 换成受管 worktree，ID 用 Host 预分配值，仍只复制对话 |
+
+`forkAssistant.targetCwd`（受管 worktree 的“在新 worktree 中分叉”使用，见 `docs/git/worktree.md` §8.2、§9.3）：
+
+- payload schema 是 strict 的 `{ cwd: string; childSessionId: string; worktreeCreation: { path, sha, ref, output } }`，App 与 CLI 共用 `@zcode/protocol` 中的同一份 schema。附加目录不在 payload 里，由 Host 在 child 的 create/resume/subscribe 时下发。
+- child 留在父会话的 workspace（key 与进程不变），`directory`/`path` 为 `cwd`，`projectID` 按 cwd 映射回源仓库的路径派生；父 session 的会话级 `allow` 规则不进入 child，`deny`/`ask`/`mode` 保留。不回退、不恢复任何目录的 checkpoint。child 时间线在 fork 分隔标记后显示 `worktreeCreated` 标记。
+- 幂等键仍是 fork 命令的 `commandId`：同一 commandId 重试返回同一 child。
+- 第一版只支持本地 workspace；父会话在远程 workspace 时返回 `guard.worktreeCwdLocalOnly`。
+- Host 必须先确认 `runtime/capabilities.worktreeCwd === true` 才能发送该字段。旧 CLI 会静默丢弃未知字段并 fork 到父目录。
+- 不带 `targetCwd` 的 fork 在 worktree 会话中执行时，child 的 `directory` 继承父会话的 worktree；Host 首次写入 child 任务行时从父行继承 `root_path` 与 `worktree_root`（`docs/git/worktree.md` §3.6）。
 
 Fork 的允许性按“历史是否稳定”裁决：
 
@@ -656,9 +668,11 @@ fork 目标只定义在 assistant message/turn 上。edit 目标只定义在 use
 | `stop` | toolbar | stop current session activity | current session active work |
 | `forkAssistant` | turn actions | fork intent | latest/old assistant turn |
 | `retryTurn` | 协议兼容入口（产品 UI 已隐藏） | retry intent | latest assistant turn |
-| `editUserQuery` | real-user row actions | edited text/goal text；保留原 intent kind | latest real-user input |
+| `editUserQuery` | composer 编辑态 | edited text/goal text + attachments + modelSelection/mode/planEnabled；保留原 intent kind | latest real-user input |
 | `sendQueuedNow` | queue actions | queue item id | `queueItem` |
-| `editQueueItem` | queue actions | edited queue content | `queueItem` |
+| `lockQueueItemEdit` | queue actions | queue item id + editorId | `queueItem` |
+| `editQueueItem` | composer 编辑态 | edited text + attachments + modelSelection/mode/planEnabled + editorId | `queueItem`（须持有锁） |
+| `releaseQueueItemEdit` | composer 取消 / queue「解除」 | queue item id | `queueItem` |
 | `reorderQueueItem` | queue actions | new order | `queueItem` |
 | `deleteQueueItem` | queue actions | queue item id | `queueItem` |
 | `switchModelConfig` | toolbar/model selector | provider/model/thought config | current session |
@@ -721,7 +735,7 @@ fork 目标只定义在 assistant message/turn 上。edit 目标只定义在 use
 | `acceptedInputHasSingleAuthority` | 所有端已提交 busy/running 输入按 CLI admission 顺序进入同一 FIFO；host/runtime/UI 不保留第二份权威队列 | accepted |
 | `acceptedInputAlwaysAccountedFor` | 每条已提交输入必须且只能处于 queue、guided row、transcript、explicit rejected/failed/discarded 之一 | accepted |
 | `sourceCommandIdEndToEnd` | queue item、drain/guided event、user row、message anchor、marker、fork child metadata 保留原始 sourceCommandId | accepted |
-| `restartDiscardRespectsDeliveryLifetime` | CLI restart 后未完成 admitted input 明确 discarded；旧 runtime 的 `queue/guide` 与无权威结论的 `unknown` 静默结算且不显示 UI 错误，只有未进入 transcript 的 `startNow` 提示确认重发，禁止自动重放 | accepted |
+| `restartDiscardRespectsDeliveryLifetime` | CLI restart 后未完成 admitted input 明确 discarded；旧 runtime 的 `queue/guide` 静默结算；无权威结论的 `unknown` 保留待确认线索且不显示 UI 错误，只有未进入 transcript 的 `startNow` 提示确认重发，禁止自动重放 | accepted |
 | `stopButtonStableAcrossActiveWork` | assistant、compact、goal verifier、goal continuation、foreground subagent 等 active work 交接时，只要 session 仍可 stop，UI 停止按钮必须保持稳定，不因内部阶段切换而闪烁 | accepted |
 | `stopPausesActiveGoalTarget` | goal target 为 active 时，用户 stop 不管作用于 assistant、compact、goal verifier 还是 goal continuation，都必须把 target 置为非 active 的暂停态 | accepted |
 | `cancelledTurnColdHydrationParity` | 用户 stop 产生的 typed/legacy ZCode cancellation 在 live 与 cold hydration 后都必须归约为 `TurnComplete(cancelled)`；不得产生 `TurnError`、`phase=error` 或 `control.lastError` | accepted |
@@ -798,6 +812,7 @@ fork 目标只定义在 assistant message/turn 上。edit 目标只定义在 use
 | `forkDoesNotCopyQueue` | `forkAssistant` | `allow` | child 继承稳定历史和 fork 点配置，不复制父 queue |
 | `forkDoesNotCopyBackgroundWork` | `forkAssistant` | `allow` | child 不复制父 session 的 live background work 或 pending background result |
 | `queueContentIndependence` | `editQueueItem/reorderQueueItem/deleteQueueItem` | `allow` | 只改 queue，不触发消费 |
+| `queuedEditFreezesItemInPlace` | `lockQueueItemEdit/editQueueItem/releaseQueueItemEdit` | `allow/reject` | 仅 `queued` 且无锁的项可加锁；冻结项拒绝 send-now/delete/reorder，自动 promotion 到冻结队首暂停；`editQueueItem` 锁不符返回 `guard.queueEditLockLost` |
 
 ## Pending Product Boundaries
 

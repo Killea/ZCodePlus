@@ -113,6 +113,8 @@ Builtin subagent 在现有 state 文件中保存完整的结构化 Model Selecti
 
 键不存在表示没有对应覆盖。Builtin 的 model 与 reasoning level 必须通过一次 service 调用组合写入；清除 model 时删除整条 Selection。已发布旧双 map 只在共享 Node 迁移入口导入并落盘，正式 reader 只读新 map；新 map 为空或损坏不得回读旧 map。
 
+state 文件按设备存放：远端设备读取远端存储根下的 `v2/agents-state.json`，与本机互不影响。本机的 Builtin 覆盖可以用数据同步推送到远端（只推送有覆盖的项，不清除远端覆盖），规则见 [数据同步](remote/data-sync.md)「子智能体」。插件 subagent 的覆盖不同步。
+
 ### Todo97：用户 Markdown 原地迁移
 
 ```text
@@ -121,10 +123,11 @@ Builtin subagent 在现有 state 文件中保存完整的结构化 Model Selecti
 项目/插件原文件（不迁移） -----------------------+-> 正式 codec -> 内部 ModelSelection
 ```
 
-- Host 与独立 Agent 初始化复用 `migrateUserSubagentMarkdown`，仅访问各自数据目录下的 `agents/`；项目和插件不自动写入，符号链接和只读文件不改写。
+- Host 与独立 Agent 初始化复用 `migrateUserSubagentMarkdown`，仅检查各自数据目录下 `agents/` 根目录直接的 `.md` / `.markdown` 文件，与自定义 Agent 的加载范围一致；不遍历子目录，包括历史 CLI 安装目录。项目和插件不自动写入，符号链接和只读文件不改写。
 - 只换 frontmatter 的旧 Provider 值，保留型号、档位、注释、正文、未知字段、换行和文件权限；不调用整份 serializer 做自动迁移。
 - 正式 Markdown 只读写字符串 `model` 与 `thoughtLevel`，不兼容未发布的 `modelSelection` 中间字段。包含分隔符的 ID 沿用已有 custom 编码保证往返。
 - 普通 reader 不再将范围外旧 Provider 临时映射到新账号；保留显式身份，沿用执行校验。没有新增账号自动切换协议或父模型兜底。
+- 回归验收：CLI 首次加载与再次加载均只迁移用户根目录文件；用户子目录中的旧格式文件不读取、不改写、不加载，项目和插件文件保持原样。
 - 详见 [全域 Selection 审计](working-memory/provider-refactor/research/todo97-selection-storage-audit.md)，Wiki 的读时写入冲突仍待裁决，不将其算作已完成。
 
 ## Runtime 语义
@@ -191,6 +194,7 @@ Subagent 设置页只读取目标 Environment 的 Model Selection View。远端 
 - effort 的加载门禁与 Draft 对齐：Selection View 中目标模型的 Option Spec 是唯一能力来源；页面不读取 Session `configOptionsStatus`，也不从另一个 Environment 的 metadata 补齐。
 - Provider/Model 身份使用 `providerId + modelId`；展示态 variant 不创建第二份模型身份。
 - 目标 Environment 尚未 ready 时显示 loading；读取失败显示错误并允许显式重试，不使用旧 Registry Snapshot 或本地 View 为远端兜底。
+- effort 控件只在目录仍会到达时显示 loading（首读中、等待远端连接）。读取失败或目标没有模型目录（远端设备「用户」）时，目录不会自行变成 ready：显示「推理档位暂不可用」，不转圈；已存的 model / `thoughtLevel` 保持原值，不判为非法，也不阻止保存。
 - reasoning Option Spec 缺失或空档位表示当前模型没有可选 reasoning 档位；非空档位是该模型的合法集合。
 - 用户选择不同模型时同步清空内存中的 explicit `thoughtLevel`；重复选择同一模型是 no-op。
 - 具体模型尚未配置 explicit `thoughtLevel` 时，控件可以展示 catalog 默认档位，但展示值不等于已经持久化的覆盖。Select 的真实选中值始终是当前 effective 档位，保证键盘焦点与可访问选中态一致；explicit 状态独立维护。用户未操作 effort 控件就保存时继续保留 `thoughtLevel: undefined`；用户再次确认当前 effective 档位或选择其他合法档位时，都必须把选择写入草稿并持久化。

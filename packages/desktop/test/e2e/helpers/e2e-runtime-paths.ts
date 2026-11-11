@@ -1,4 +1,6 @@
 import { join, posix, resolve } from "node:path";
+import { readdir, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 export const E2E_RUNTIME_RELATIVE_ROOT = ".zcode-e2e";
 export const E2E_RUNTIME_ROOT_REPLAY_TOKEN = "{{e2eRuntimeRoot}}";
@@ -18,6 +20,20 @@ export function resolveE2EHomeDir({
     env.ZCODE_DATA_BASE_DIR?.trim() ||
     env.ZCODE_DESKTOP_HOME_DIR?.trim();
   return resolve(cwd, configuredHome || ".e2e-home");
+}
+
+/**
+ * 判断 HOME 是否为 runner 分配的隔离 E2E HOME，供直接改写磁盘夹具的 case 做安全守卫。
+ * Bug 根因：旧守卫只看 basename 是否以 `.e2e-home-` 开头；直接运行 wdio 的默认 `.e2e-home`
+ * 被误拒。改为任一路径段以 `.e2e-home` 开头即可：覆盖 `.e2e-home`、`.e2e-home-<runId>[-shard-N]`，
+ * 以及根目录名带 `.e2e-home` 的显式 ZCODE_E2E_HOME_DIR 分片子目录。
+ * 根目录名不带 `.e2e-home` 的显式 HOME 无法与真实目录区分，保守拒绝；需要改写夹具的 case 应使用带该前缀的根。
+ */
+export function isIsolatedE2EHomeDir(home: string | undefined): home is string {
+  if (!home?.trim()) return false;
+  return resolve(home)
+    .split(/[\\/]/u)
+    .some((segment) => segment.startsWith(".e2e-home"));
 }
 
 export function resolveE2EStorageRoot(e2eHomeDir = resolveE2EHomeDir()): string {
@@ -54,4 +70,38 @@ export function createE2EReplayFixtureVariables(
   return {
     e2eRuntimeRoot: resolveE2ERuntimeRoot(e2eHomeDir).replaceAll("\\", "/"),
   };
+}
+
+/** 前台 Bash 仍在运行时尚无 tool_result；按真实 session/tool 查找唯一输出，不能固定旧 HOME 根。 */
+export async function findE2EBashOutputPath(
+  sessionId: string,
+  toolCallId: string,
+  {
+    tempRoot = tmpdir(),
+    storageRoot = resolveE2EStorageRoot(),
+  }: { tempRoot?: string; storageRoot?: string } = {},
+): Promise<string | null> {
+  const directories = (await readdir(tempRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("zcode-bash-"))
+    .map((entry) => join(tempRoot, entry.name));
+  const candidates = [...directories, join(storageRoot, "cli", "exec")].map((root) =>
+    join(root, sessionId, `${toolCallId}-stdout.log`),
+  );
+  const existing = (
+    await Promise.all(
+      candidates.map(async (path) => {
+        try {
+          return (await stat(path)).isFile() ? path : null;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw error;
+        }
+      }),
+    )
+  ).filter((path): path is string => path !== null);
+  if (existing.length > 1)
+    throw new Error(
+      `Bash 没有唯一实际输出文件: ${sessionId}/${toolCallId}; ${JSON.stringify(existing)}`,
+    );
+  return existing[0] ?? null;
 }

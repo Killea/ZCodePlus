@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-plugin-resident-freeze-cold-resume",
-  "spec": "./test/e2e/conversation-session/conversation-session-plugin-resident-freeze-cold-resume.test.ts",
+  "spec": "./test/e2e/conversation-session/plugins/conversation-session-plugin-resident-freeze-cold-resume.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-plugin-resident-freeze-cold-resume.json"
@@ -30,7 +30,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "tool-use",
-      "syntheticReason": "固定 resident tool_use，证明创建时 catalog 保留。"
+      "syntheticReason": "固定 resident tool_use，验证 App catalog 冻结。"
     },
     {
       "id": "resident-enabled-final",
@@ -46,7 +46,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "fast-text",
-      "syntheticReason": "固定新 Session disabled 最终响应。"
+      "syntheticReason": "固定新 Session 无 Plugin MCP tool 的最终响应。"
     },
     {
       "id": "cold-resume-disabled-final",
@@ -54,7 +54,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "fast-text",
-      "syntheticReason": "固定 cold resume disabled 最终响应。"
+      "syntheticReason": "固定 cold resume 无 Plugin MCP tool 的最终响应。"
     }
   ]
 }

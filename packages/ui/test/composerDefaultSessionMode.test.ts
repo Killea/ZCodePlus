@@ -8,9 +8,8 @@ type RecentLike = ReturnType<typeof readComposerRecent>;
 
 // 节点环境无 window.localStorage，Recent 统一经注入的 mock 控制。
 vi.mock("@/lib/composerRecent.js", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/composerRecent.js")>(
-    "@/lib/composerRecent.js",
-  );
+  const actual =
+    await vi.importActual<typeof import("@/lib/composerRecent.js")>("@/lib/composerRecent.js");
   return {
     ...actual,
     readComposerRecent: vi.fn(),
@@ -34,9 +33,7 @@ describe("新任务草稿模式种子（docs/composer-default-mode.md）", () =>
   });
 
   it("无 Recent + 设置 build → 按设置起稿（尊重用户显式改回）", () => {
-    expect(initializeNewTaskDraft(baseDraft, "/repo", undefined, view, "build").mode).toBe(
-      "build",
-    );
+    expect(initializeNewTaskDraft(baseDraft, "/repo", undefined, view, "build").mode).toBe("build");
   });
 
   it("无 Recent + 未传设置 → 回落 build（防御性兜底）", () => {
@@ -70,15 +67,14 @@ describe("新任务草稿模式种子（docs/composer-default-mode.md）", () =>
     expect(initializeNewTaskDraft(baseDraft, "/repo", undefined, view, "yolo").mode).toBe("edit");
   });
 
-  it("初始化同时清空 planEnabled 与 newTask 标记", () => {
+  it("初始化同时清空 planEnabled 标记", () => {
     const result = initializeNewTaskDraft(
-      { ...baseDraft, planEnabled: true, initializeFromNewTask: true },
+      { ...baseDraft, planEnabled: true },
       "/repo",
       undefined,
       view,
       "yolo",
     );
     expect(result.planEnabled).toBe(false);
-    expect(result.initializeFromNewTask).toBeUndefined();
   });
 });

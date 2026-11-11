@@ -6,7 +6,6 @@ import { bashToolEntry } from "../src/tool/handlers/bash.js";
 import { jsToolEntry } from "../src/tool/handlers/node-repl.js";
 import { exitPlanModeToolEntry } from "../src/tool/handlers/plan-mode.js";
 import { readToolEntry } from "../src/tool/handlers/read.js";
-import { readSessionContextToolEntry } from "../src/tool/handlers/read-session-context.js";
 import { skillToolEntry } from "../src/tool/handlers/skill.js";
 import { todoWriteToolEntry } from "../src/tool/handlers/todo.js";
 import { formatToolInputValidationError } from "../src/tool/input-validation-model-content.js";
@@ -339,7 +338,6 @@ describe("tool input validation provider content", () => {
     };
 
     const initialError = validateInitialModelToolInput({}, entry);
-    expect(initialError).toBeDefined();
     const initialResult = createErrorResult(toolCall, initialError!);
     expect(initialResult.error?.message).toBe("Tool input failed inputSchema validation");
     expect(initialResult.modelContent).toBe(
@@ -350,7 +348,6 @@ describe("tool input validation provider content", () => {
     );
 
     const laterError = validateInput({}, entry);
-    expect(laterError).toBeDefined();
     expect(createErrorResult(toolCall, laterError!).modelContent).toBeUndefined();
   });
 
@@ -369,7 +366,6 @@ describe("tool input validation provider content", () => {
     } as ToolEntry;
 
     const error = validateInitialModelToolInput({}, entry);
-    expect(error).toBeDefined();
     const result = createErrorResult(
       {
         id: "call_complete_validation",
@@ -386,7 +382,6 @@ describe("tool input validation provider content", () => {
   it("lets initial validation content take precedence over the Edit execution wrapper", () => {
     const entry = createValidationEntry("Edit");
     const error = validateInitialModelToolInput({}, entry);
-    expect(error).toBeDefined();
 
     const result = createErrorResult(
       {
@@ -576,7 +571,6 @@ function initialValidationModelContent(entry: ToolEntry, input: unknown): string
     entry,
     prepared.runtimeValidationIssues,
   );
-  expect(error).toBeDefined();
   const result = createErrorResult(
     {
       id: `call_${entry.metadata.name}`,

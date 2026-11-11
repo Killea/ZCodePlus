@@ -9,15 +9,20 @@ export interface ServerLayout {
   readonly runDir: string;
   readonly currentFile: string;
   readonly pendingFile: string;
+  readonly downgradeMarkerFile: string;
   readonly installFile: string;
   readonly componentsCacheDir: string;
   readonly stableBinDir: string;
   readonly statusFile: string;
+  readonly ingressTokenFile: string;
   readonly lockFile: string;
   readonly controlEndpoint: string;
   readonly serviceDir: string;
   readonly uninstalledFile: string;
   readonly updateTransactionFile: string;
+  readonly updateLockFile: string;
+  /** Supervisor 写出第一份状态前失败时的诊断摘要；不参与任何状态判断（R2 §7.1）。 */
+  readonly supervisorStartupFailureFile: string;
 }
 
 export function getDefaultServerDataRoot(): string {
@@ -35,10 +40,12 @@ export function resolveServerLayout(serverRoot = getDefaultServerDataRoot()): Se
     runDir,
     currentFile: join(root, "current.json"),
     pendingFile: join(root, "pending.json"),
+    downgradeMarkerFile: join(root, "downgrade.json"),
     installFile: join(root, "install.json"),
     componentsCacheDir: join(root, "cache", "components"),
     stableBinDir: join(root, "bin"),
     statusFile: join(runDir, "status.json"),
+    ingressTokenFile: join(runDir, "ingress-token"),
     lockFile: join(runDir, "server.lock"),
     controlEndpoint:
       process.platform === "win32"
@@ -47,10 +54,14 @@ export function resolveServerLayout(serverRoot = getDefaultServerDataRoot()): Se
     serviceDir: join(root, "service"),
     uninstalledFile: join(root, "uninstalled.json"),
     updateTransactionFile: join(root, "update-transaction.json"),
+    updateLockFile: join(runDir, "update.lock"),
+    supervisorStartupFailureFile: join(runDir, "supervisor-startup-failure.json"),
   };
 }
 
-export async function resolveCanonicalServerRoot(serverRoot = getDefaultServerDataRoot()): Promise<string> {
+export async function resolveCanonicalServerRoot(
+  serverRoot = getDefaultServerDataRoot(),
+): Promise<string> {
   // 安装前 server root 可能尚不存在；向上找到最近的存在祖先做 realpath，再拼回缺失段，
   // 这样既能收敛已有符号链接，也不会因为 ENOENT 让首次安装失效。
   let candidate = assertServerDataRoot(serverRoot);
@@ -69,7 +80,9 @@ export async function resolveCanonicalServerRoot(serverRoot = getDefaultServerDa
   }
 }
 
-export async function resolveCanonicalServerLayout(serverRoot = getDefaultServerDataRoot()): Promise<ServerLayout> {
+export async function resolveCanonicalServerLayout(
+  serverRoot = getDefaultServerDataRoot(),
+): Promise<ServerLayout> {
   return resolveServerLayout(await resolveCanonicalServerRoot(serverRoot));
 }
 
@@ -106,7 +119,10 @@ export interface UninstallTargetValidation {
   canonicalPath?: string;
 }
 
-export function validateUninstallTarget(serverRoot: string, target: string): UninstallTargetValidation {
+export function validateUninstallTarget(
+  serverRoot: string,
+  target: string,
+): UninstallTargetValidation {
   if (!isAbsolute(target)) {
     return { ok: false, reason: "non-absolute" };
   }

@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { ConfigScope, DefaultRuntimeConfig } from "@zcode/contracts";
+import { describe, expect, it, vi } from "vitest";
+import type { Logger, LoggerFactory } from "@zcode/contracts";
+import { withFileLock } from "@zcode/shared/node";
 import {
   createConfig,
-  updateCodingPlanProviderInFileConfig,
-  updateModelSelectionInFileConfig,
+  createConfigWithPluginMigrations,
+  resolveWorkspaceStorageDir,
   updateUiLocaleInFileConfig,
 } from "../src/config/index.js";
 import { parseEnvConfig } from "../src/config/env-config.adapter.js";
@@ -15,12 +16,399 @@ import {
   updatePluginEnabledInFileConfig,
   updatePluginOptionsInFileConfig,
 } from "../src/config/file-config.adapter.js";
-import { ModelCatalogService } from "../src/model/catalog.js";
+import * as fsPromises from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
+
+vi.mock("../src/config/file-config.adapter.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/config/file-config.adapter.js")>();
+  return { ...actual, loadFileConfig: vi.fn(actual.loadFileConfig) };
+});
+vi.mock("@zcode/shared/node", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@zcode/shared/node")>();
+  return { ...actual, withFileLock: vi.fn(actual.withFileLock) };
+});
+
+function captureConfigLogger() {
+  const warn = vi.fn();
+  const logger: Logger = { debug() {}, info() {}, error() {}, warn, child: () => logger };
+  const loggerFactory: LoggerFactory = {
+    createLogger: () => logger,
+    withContext: () => logger,
+    setLevel() {},
+  };
+  return { loggerFactory, warn };
+}
+
 describe("config adapters", () => {
+  it("resets legacy visualize flags per config once and preserves later opt-in", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zcode-visualize-migration-"));
+    const userConfigPath = join(root, "user.json");
+    const projectConfigPath = join(root, ".zcode", "config.json");
+    const id = "visualize@zcode-plugins-official";
+    const original = {
+      keep: "unknown",
+      plugins: { enabledPlugins: { [id]: true, "other@fixture": true } },
+    };
+    try {
+      await mkdir(join(root, ".zcode"));
+      await writeFile(userConfigPath, JSON.stringify(original));
+      await writeFile(projectConfigPath, JSON.stringify(original));
+      const options = { env: {}, userConfigPath, workingDirectory: root };
+      const migrated = await createConfigWithPluginMigrations(options);
+      expect(migrated.config.plugins.enabledPlugins[id]).toBe(false);
+      for (const path of [userConfigPath, projectConfigPath]) {
+        expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+          ...original,
+          plugins: {
+            visualizeDefaultOffMigrated: true,
+            enabledPlugins: { [id]: false, "other@fixture": true },
+          },
+        });
+      }
+      await updatePluginEnabledInFileConfig(projectConfigPath, id, true);
+      const bytes = await readFile(projectConfigPath, "utf8");
+      const reloaded = await Promise.all(
+        Array.from({ length: 4 }, () => createConfigWithPluginMigrations(options)),
+      );
+      expect(reloaded.every((result) => result.config.plugins.enabledPlugins[id])).toBe(true);
+      expect(await readFile(projectConfigPath, "utf8")).toBe(bytes);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a first enable racing with migration and other config writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zcode-visualize-race-"));
+    const userConfigPath = join(root, "user.json");
+    const id = "visualize@zcode-plugins-official";
+    try {
+      const options = { env: {}, userConfigPath };
+      await createConfigWithPluginMigrations(options);
+      await expect(readFile(userConfigPath)).rejects.toMatchObject({ code: "ENOENT" });
+      await writeFile(
+        userConfigPath,
+        JSON.stringify({ plugins: { enabledPlugins: { [id]: true } } }),
+      );
+      await Promise.all([
+        createConfigWithPluginMigrations(options),
+        updatePluginEnabledInFileConfig(userConfigPath, id, true),
+        updateUiLocaleInFileConfig(userConfigPath, "zh-CN"),
+      ]);
+      const result = await createConfigWithPluginMigrations(options);
+      expect(result.config.plugins.enabledPlugins[id]).toBe(true);
+      expect(result.config.ui.locale).toBe("zh-CN");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["rename", "lock"])(
+    "continues with a disabled layer when migration %s fails",
+    async (stage) => {
+      const root = await mkdtemp(join(tmpdir(), "zcode-visualize-write-failure-"));
+      const userConfigPath = join(root, "user.json");
+      const id = "visualize@zcode-plugins-official";
+      const original = JSON.stringify({ plugins: { enabledPlugins: { [id]: true } } });
+      const { loggerFactory, warn } = captureConfigLogger();
+      const code = stage === "rename" ? "EACCES" : "ZCODE_FILE_LOCK_TIMEOUT";
+      try {
+        await writeFile(userConfigPath, original);
+        const operation =
+          stage === "rename" ? vi.mocked(fsPromises.rename) : vi.mocked(withFileLock);
+        operation.mockRejectedValueOnce(Object.assign(new Error("migration blocked"), { code }));
+        try {
+          const result = await createConfigWithPluginMigrations({
+            env: {},
+            userConfigPath,
+            loggerFactory,
+          });
+          expect(result.config.plugins.enabledPlugins[id]).toBe(false);
+          expect(result.configPort.getAll().plugins.enabledPlugins[id]).toBe(false);
+          expect(warn).toHaveBeenCalledExactlyOnceWith(
+            expect.any(String),
+            expect.objectContaining({ configPath: userConfigPath, errorCode: code }),
+          );
+        } finally {
+          operation.mockRestore();
+        }
+        expect(await readFile(userConfigPath, "utf8")).toBe(original);
+        expect(await readdir(root)).toEqual(["user.json"]);
+        expect(
+          (await createConfigWithPluginMigrations({ env: {}, userConfigPath })).config.plugins
+            .enabledPlugins[id],
+        ).toBe(false);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["user", "project", "ancestor", "explicit"])(
+    "keeps scope priority when the %s migration fails",
+    async (scope) => {
+      const root = await mkdtemp(join(tmpdir(), "zcode-visualize-layer-failure-"));
+      const id = "visualize@zcode-plugins-official";
+      const userConfigPath = join(root, "user.json");
+      const parentPath = join(root, ".zcode", "config.json");
+      const child = join(root, "child");
+      const childPath = join(child, ".zcode", "config.json");
+      const explicitPath = join(root, "explicit.json");
+      const paths = {
+        user: userConfigPath,
+        project: parentPath,
+        ancestor: parentPath,
+        explicit: explicitPath,
+      };
+      const failedPath = paths[scope as keyof typeof paths];
+      const config = (migrated: boolean) =>
+        JSON.stringify({
+          plugins: {
+            ...(migrated ? { visualizeDefaultOffMigrated: true } : {}),
+            enabledPlugins: { [id]: true, "other@fixture": true },
+          },
+        });
+      const { loggerFactory, warn } = captureConfigLogger();
+      try {
+        await mkdir(join(root, ".git"));
+        await mkdir(join(root, ".zcode"));
+        await mkdir(join(child, ".zcode"), { recursive: true });
+        await writeFile(userConfigPath, config(true));
+        await writeFile(parentPath, config(true));
+        if (scope === "ancestor") await writeFile(childPath, config(true));
+        await writeFile(failedPath, config(false));
+        vi.mocked(fsPromises.rename).mockRejectedValueOnce(
+          Object.assign(new Error("read only"), { code: "EROFS" }),
+        );
+        try {
+          const result = await createConfigWithPluginMigrations({
+            env: {},
+            userConfigPath,
+            workingDirectory: scope === "ancestor" ? child : root,
+            ...(scope === "explicit"
+              ? {
+                  projectConfigPath: explicitPath,
+                  cliOverrides: { plugins: { enabledPlugins: { [id]: true } } },
+                }
+              : {}),
+            loggerFactory,
+          });
+          expect(result.config.plugins.enabledPlugins[id]).toBe(scope !== "project");
+          expect(result.config.plugins.enabledPlugins["other@fixture"]).toBe(true);
+          expect(warn).toHaveBeenCalledExactlyOnceWith(
+            expect.any(String),
+            expect.objectContaining({ configPath: failedPath, errorCode: "EROFS" }),
+          );
+          expect(await readFile(failedPath, "utf8")).toBe(config(false));
+        } finally {
+          vi.mocked(fsPromises.rename).mockRestore();
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("warns once when the same file is used by user and project scopes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zcode-visualize-shared-config-"));
+    const userConfigPath = join(root, "config.json");
+    const id = "visualize@zcode-plugins-official";
+    const { loggerFactory, warn } = captureConfigLogger();
+    try {
+      await writeFile(
+        userConfigPath,
+        JSON.stringify({ plugins: { enabledPlugins: { [id]: true } } }),
+      );
+      vi.mocked(fsPromises.rename).mockRejectedValue(
+        Object.assign(new Error("read only"), { code: "EROFS" }),
+      );
+      const result = await createConfigWithPluginMigrations({
+        env: {},
+        userConfigPath,
+        projectConfigPath: userConfigPath,
+        loggerFactory,
+      });
+      expect(result.config.plugins.enabledPlugins[id]).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.mocked(fsPromises.rename).mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["invalid", "unchanged", "migration"])(
+    "reads config once and reports diagnostics once: %s",
+    async (kind) => {
+      const root = await mkdtemp(join(tmpdir(), "zcode-config-single-read-"));
+      const userConfigPath = join(root, "user.json");
+      const { loggerFactory, warn } = captureConfigLogger();
+      try {
+        await writeFile(
+          userConfigPath,
+          kind === "invalid"
+            ? "{"
+            : JSON.stringify({
+                plugins: {
+                  ...(kind === "unchanged" ? { visualizeDefaultOffMigrated: true } : {}),
+                  enabledPlugins: { "visualize@zcode-plugins-official": true },
+                },
+                ...(kind === "migration"
+                  ? { mcp: { servers: { broken: { type: "stdio", args: [] } } } }
+                  : {}),
+              }),
+        );
+        vi.mocked(loadFileConfig).mockClear();
+        await createConfigWithPluginMigrations({ env: {}, userConfigPath, loggerFactory });
+        expect(loadFileConfig).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledTimes(kind === "unchanged" ? 0 : 1);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["zcode.json", ".zcode/config.json", "explicit-project.json"])(
+    "restricts project runtime parameters while retaining extension settings in %s",
+    async (fileName) => {
+      const root = await mkdtemp(join(tmpdir(), "zcode-project-runtime-boundary-"));
+      const userPath = join(root, ".zcode", "cli", "config.json");
+      const projectPath = join(root, fileName);
+      const skillPath = join(root, "skills", "demo", "SKILL.md");
+      const commandPath = join(root, "commands", "demo.md");
+      const userConfig = {
+        network: { httpProxy: "http://user.example:8080", caCertFile: join(root, "user-ca.pem") },
+        storage: { dir: join(root, "user-storage"), sessionDbPath: join(root, "user.sqlite") },
+        permission: { mode: "plan", autoApproveHighRisk: false },
+        plugins: {
+          dirs: [join(root, "installed-plugin")],
+          enabledPlugins: { "demo@fixture": false },
+        },
+      };
+      const projectConfig = {
+        network: {
+          httpProxy: "http://project.example:8080",
+          caCertFile: "./repo-ca.pem",
+          noProxy: "*",
+          timeout: 1,
+        },
+        storage: { dir: "./fake-user-storage", sessionDbPath: "./fake-session.sqlite" },
+        permission: { mode: "yolo", autoApproveHighRisk: true },
+        modelStream: { idleTimeoutMs: 1 },
+        features: { mcp: false, subagent: false, memory: false, skill: false },
+        memory: { use: false },
+        logging: { level: "error", format: "text" },
+        ui: { locale: "zh-CN", theme: "light" },
+        toolConcurrency: { maxConcurrency: 1 },
+        modelAnomalyGuard: { toolCallWarningThreshold: 1 },
+        skills: { enabled: false, roots: ["./extra-skills"], [skillPath]: { enable: false } },
+        command: { [commandPath]: { enable: false } },
+        plugins: {
+          enabled: false,
+          dirs: ["./fake-plugin"],
+          suppressedBuiltins: ["builtin@fixture"],
+          extraKnownMarketplaces: {
+            fake: { source: { source: "directory", path: "./fake-market" } },
+          },
+          enabledPlugins: { "demo@fixture": true },
+          options: { "demo@fixture": { format: "compact" } },
+        },
+        mcp: { servers: { demo: { type: "stdio", command: "node", cwd: "./tools" } } },
+        hooks: {
+          events: {
+            SessionStart: [{ hooks: [{ type: "command", command: "echo project-hook" }] }],
+          },
+        },
+      };
+      try {
+        vi.stubEnv("HOME", root);
+        vi.stubEnv("USERPROFILE", root);
+        await mkdir(join(root, ".git"));
+        await mkdir(join(root, ".zcode", "cli"), { recursive: true });
+        await writeFile(userPath, JSON.stringify(userConfig));
+        await writeFile(projectPath, JSON.stringify(projectConfig));
+        const baseline = createConfig({ env: {}, userConfigPath: userPath });
+        const result = createConfig({
+          env: {},
+          userConfigPath: userPath,
+          workingDirectory: root,
+          ...(fileName === "explicit-project.json" ? { projectConfigPath: projectPath } : {}),
+        });
+        for (const field of [
+          "network",
+          "storage",
+          "permission",
+          "modelStream",
+          "features",
+          "memory",
+          "logging",
+          "ui",
+          "toolConcurrency",
+          "modelAnomalyGuard",
+          "skills",
+        ] as const) {
+          expect(result.config[field], field).toEqual(baseline.config[field]);
+        }
+        expect(result.config.plugins).toEqual({
+          ...baseline.config.plugins,
+          enabledPlugins: { "demo@fixture": true },
+          options: { "demo@fixture": { format: "compact" } },
+        });
+        expect(result.config.mcp.servers.demo).toMatchObject({
+          command: "node",
+          cwd: join(root, "tools"),
+        });
+        expect(result.sources.mcp.serverSources.demo).toBe("project");
+        expect(result.config.hooks).toEqual(baseline.config.hooks);
+        expect(result.sources.project.workspaceHookSnapshot).toBeDefined();
+        expect(result.config.skillOverrides[skillPath]).toEqual({ enable: false });
+        expect(result.config.commandOverrides[commandPath]).toEqual({ enable: false });
+        expect(result.sources.project.hasUiLocale).toBe(false);
+        expect(result.sources.project.hasUiTheme).toBe(false);
+        expect(resolveWorkspaceStorageDir({ env: {}, workingDirectory: root })).toBe(
+          userConfig.storage.dir,
+        );
+      } finally {
+        vi.unstubAllEnvs();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("ignores invalid project runtime fields before validating extension settings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zcode-project-runtime-invalid-"));
+    const projectPath = join(root, "zcode.json");
+    const skillPath = join(root, "SKILL.md");
+    try {
+      await mkdir(join(root, ".git"));
+      await writeFile(
+        projectPath,
+        JSON.stringify({
+          network: { caCertFile: 123 },
+          storage: null,
+          permission: { mode: "invalid" },
+          skills: { enabled: "invalid", roots: 123, [skillPath]: { enable: false } },
+          plugins: { dirs: 123, enabled: "invalid", enabledPlugins: { "demo@fixture": true } },
+          mcp: { servers: { demo: { type: "http", url: "https://example.com/mcp" } } },
+        }),
+      );
+      const result = createConfig({ env: {}, skipUserConfig: true, workingDirectory: root });
+      expect(result.sources.project.loaded).toBe(true);
+      expect(result.sources.project.diagnostics).toEqual([]);
+      expect(result.config.network.caCertFile).toBeUndefined();
+      expect(result.config.mcp.servers.demo).toMatchObject({ url: "https://example.com/mcp" });
+      expect(result.config.plugins.enabledPlugins["demo@fixture"]).toBe(true);
+      expect(result.config.skillOverrides[skillPath]).toEqual({ enable: false });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("migrates the legacy official CUA plugin id to the canonical id", async () => {
     const dir = await mkdtemp(join(tmpdir(), "zcode-config-cua-identity-"));
     const configPath = join(dir, "config.json");
@@ -116,12 +504,11 @@ describe("config adapters", () => {
         ).suppressed,
       ).toBe(false);
       expect(
-        (
-          await removePluginFromFileConfig(configPath, "computer-use@zcode-plugins-official")
-        ).removedEnabled,
+        (await removePluginFromFileConfig(configPath, "computer-use@zcode-plugins-official"))
+          .removedEnabled,
       ).toBe(true);
       expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual({
-        plugins: { enabledPlugins: {}, suppressedBuiltins: [] },
+        plugins: { enabledPlugins: {}, suppressedBuiltins: [], options: {} },
       });
     } finally {
       await rm(dir, { force: true, recursive: true });
@@ -197,6 +584,7 @@ describe("config adapters", () => {
         workspacePath,
         JSON.stringify({
           plugins: {
+            dirs: ["./workspace-plugin", join(dir, "absolute-workspace-plugin")],
             enabledPlugins: {
               "workspace-plugin@fixture": false,
             },
@@ -249,6 +637,35 @@ describe("config adapters", () => {
       await rm(dir, { force: true, recursive: true });
     }
   });
+
+  it.each(["zcode.json", ".zcode/config.json", "explicit-project.json"])(
+    "ignores plugin directories from project config %s",
+    async (fileName) => {
+      const dir = await mkdtemp(join(tmpdir(), "zcode-project-plugin-dirs-"));
+      const projectConfigPath = join(dir, fileName);
+      try {
+        await mkdir(join(dir, ".git"));
+        await mkdir(join(dir, ".zcode"));
+        await writeFile(
+          projectConfigPath,
+          JSON.stringify({ plugins: { dirs: ["./plugin", join(dir, "absolute-plugin")] } }),
+        );
+        const result = createConfig({
+          env: {},
+          skipUserConfig: true,
+          ...(fileName === "explicit-project.json"
+            ? { projectConfigPath }
+            : { workingDirectory: dir }),
+        });
+        expect(result.sources.project.loaded).toBe(true);
+        expect(result.config.plugins.dirs).toEqual([]);
+        expect(result.sources.plugins.dirs.workspace).toEqual([]);
+        expect(JSON.parse(await readFile(projectConfigPath, "utf8")).plugins.dirs).toHaveLength(2);
+      } finally {
+        await rm(dir, { force: true, recursive: true });
+      }
+    },
+  );
 
   it("keeps Marketplace declarations in the User config layer", async () => {
     const dir = await mkdtemp(join(tmpdir(), "zcode-config-workspace-marketplaces-"));
@@ -310,11 +727,6 @@ describe("config adapters", () => {
     }
   });
 
-  it("keeps Plugin scope priority aligned with User then Workspace", () => {
-    expect(ConfigScope.User).toBe("user");
-    expect(ConfigScope.Project).toBe("project");
-  });
-
   it("parses the supported ZCODE environment surface", () => {
     const config = parseEnvConfig({
       ZCODE_STORAGE_DIR: "/tmp/zcode",
@@ -335,30 +747,6 @@ describe("config adapters", () => {
     expect(config.ui).toBeUndefined();
     expect(config.logging?.format).toBe("json");
     expect(config.logging?.level).toBeUndefined();
-  });
-
-  it("defaults the session database to db/db.sqlite", () => {
-    const result = createConfig({ env: {}, skipUserConfig: true });
-
-    expect(result.config.model).toBeUndefined();
-    expect(DefaultRuntimeConfig.storage.sessionDbPath).toBe("~/.zcode/cli/db/db.sqlite");
-    expect(result.config.storage.sessionDbPath).toBe("~/.zcode/cli/db/db.sqlite");
-  });
-
-  it("defaults model stream idle timeout to ten minutes", () => {
-    const result = createConfig({ env: {}, skipUserConfig: true });
-
-    expect(DefaultRuntimeConfig.modelStream.idleTimeoutMs).toBe(600_000);
-    expect(result.config.modelStream.idleTimeoutMs).toBe(600_000);
-  });
-
-  it("defaults the supported memory switches to enabled", () => {
-    const result = createConfig({ env: {}, skipUserConfig: true });
-
-    expect(result.config.features.memory).toBe(true);
-    expect(result.config.memory).toEqual({
-      use: true,
-    });
   });
 
   it("loads the supported memory config fields", async () => {
@@ -1232,8 +1620,8 @@ describe("config adapters", () => {
       await writeFile(
         projectConfigPath,
         JSON.stringify({
-          ui: {
-            theme: "sepia",
+          hooks: {
+            enabled: "invalid",
           },
         }),
       );
@@ -1248,7 +1636,7 @@ describe("config adapters", () => {
       expect(result.sources.project.diagnostics).toEqual([
         expect.objectContaining({
           code: "config_file_invalid",
-          message: expect.stringContaining("ui.theme: Invalid option: expected one of"),
+          message: expect.stringContaining("hooks.enabled: Invalid input: expected boolean"),
           severity: "error",
         }),
       ]);
@@ -1800,977 +2188,49 @@ describe("config adapters", () => {
     }
   });
 
-  it("rejects inline model target config from file", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
+  // Provider/Model 配置已归 Registry 管理；通用配置忽略退场字段，不得重新推导模型选择。
+  it.each([
+    { model: { provider: "example", model: "example-model", apiKey: "fixture" } },
+    { model: { main: "example/main", lite: "example/lite" } },
+    { model: "example/main", modelSmall: "example/small", smallModel: "example/small" },
+    {
+      provider: {
+        example: {
+          kind: "unsupported",
+          npm: "fixture",
+          models: { tiny: { limit: { context: "invalid" } } },
+        },
+      },
+    },
+    { modelCatalog: { overrides: { "example/model": { supportsReasoning: true } } } },
+  ])(
+    "ignores retired provider config while preserving active configuration: %j",
+    async (legacy) => {
+      const dir = await mkdtemp(join(tmpdir(), "zcode-config-retired-model-"));
+      try {
+        const path = join(dir, "config.json");
+        await writeFile(path, JSON.stringify({ ...legacy, features: { memory: false } }));
+        const result = loadFileConfig(path);
+        expect(result.loaded).toBe(true);
+        expect(result.config).toMatchObject({ features: { memory: false } });
+        for (const key of ["model", "provider", "modelCatalog", "modelSmall", "smallModel"])
+          expect(result.config).not.toHaveProperty(key);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
+  it("rejects invalid active configuration", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "zcode-config-invalid-"));
     try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          model: {
-            provider: "default-deepseek",
-            model: "deepseek-V4-Pro",
-            baseURL: "https://api.deepseek.com",
-            apiKey: "secret",
-            headers: {
-              "X-Title": "Z Code",
-            },
-          },
-        }),
-      );
-
+      const path = join(dir, "config.json");
+      await writeFile(path, JSON.stringify({ network: { timeout: "invalid" } }));
       const result = loadFileConfig(path);
-
       expect(result.loaded).toBe(false);
       expect(result.config).toEqual({});
     } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("loads main and lite model references from provider-first config", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          model: {
-            main: "deepseek/deepseek-v4-pro",
-            lite: "deepseek/deepseek-chat",
-          },
-          provider: {
-            deepseek: {
-              kind: "openai-compatible",
-              name: "DeepSeek",
-              options: {
-                baseURL: "https://api.deepseek.com",
-                apiKey: "secret",
-              },
-              models: {
-                "deepseek-v4-pro": {
-                  name: "DeepSeek V4 Pro",
-                },
-                "deepseek-chat": {
-                  name: "DeepSeek Chat",
-                },
-              },
-            },
-          },
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(result.config.model?.main).toMatchObject({
-        provider: "deepseek",
-        model: "deepseek-v4-pro",
-        kind: "openai-compatible",
-        baseURL: "https://api.deepseek.com",
-        apiKey: "secret",
-      });
-      expect(result.config.model?.lite?.model).toBe("deepseek-chat");
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("patches string model selection in file config without dropping other fields", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          model: "deepseek/deepseek-chat",
-          mcp: {
-            servers: {
-              local: {
-                type: "stdio",
-                command: "node",
-              },
-            },
-          },
-          provider: {
-            deepseek: {
-              kind: "openai-compatible",
-              options: {
-                baseURL: "https://api.deepseek.com",
-                apiKey: "secret",
-              },
-              models: {
-                "deepseek-chat": {},
-                "deepseek-v4-pro": {},
-              },
-            },
-          },
-        }),
-      );
-
-      await updateModelSelectionInFileConfig(path, "deepseek/deepseek-v4-pro");
-
-      const updated = JSON.parse(await readFile(path, "utf-8"));
-      expect(updated.model).toBe("deepseek/deepseek-v4-pro");
-      expect(updated.mcp.servers.local.command).toBe("node");
-      expect(updated.provider.deepseek.options.apiKey).toBe("secret");
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("patches object model main in file config without changing lite", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          model: {
-            main: "deepseek/deepseek-chat",
-            lite: "deepseek/deepseek-lite",
-          },
-          provider: {
-            deepseek: {
-              kind: "openai-compatible",
-              options: {
-                baseURL: "https://api.deepseek.com",
-              },
-              models: {
-                "deepseek-chat": {},
-                "deepseek-lite": {},
-                "deepseek-v4-pro": {},
-              },
-            },
-          },
-        }),
-      );
-
-      await updateModelSelectionInFileConfig(path, "deepseek/deepseek-v4-pro");
-
-      const updated = JSON.parse(await readFile(path, "utf-8"));
-      expect(updated.model).toEqual({
-        main: "deepseek/deepseek-v4-pro",
-        lite: "deepseek/deepseek-lite",
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("patches ZAI Coding Plan provider config with an API key", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            zai: {
-              kind: "openai-compatible",
-              options: {
-                apiKey: "legacy-secret",
-                baseURL: "https://legacy.example/v1",
-                timeout: 30000,
-              },
-              models: {
-                "glm-5.1": {
-                  contextWindow: 200000,
-                },
-              },
-            },
-            deepseek: {
-              kind: "openai-compatible",
-              options: {
-                apiKey: "deepseek-secret",
-                baseURL: "https://api.deepseek.example",
-              },
-              models: {
-                "deepseek-chat": {},
-              },
-            },
-          },
-          model: {
-            main: "deepseek/deepseek-chat",
-            lite: "deepseek/deepseek-chat",
-          },
-        }),
-      );
-
-      const result = await updateCodingPlanProviderInFileConfig({
-        apiKey: "zai-coding-key",
-        filePath: path,
-        providerId: "zai",
-      });
-      const updated = JSON.parse(await readFile(path, "utf-8"));
-
-      expect(result).toEqual({
-        mainModel: "zai/glm-5.1",
-        path,
-        providerId: "zai",
-      });
-      expect(updated.provider.zai.kind).toBe("anthropic");
-      expect(updated.provider.zai.options).toEqual({
-        apiKey: "zai-coding-key",
-        apiKeyRequired: true,
-        baseURL: "https://api.z.ai/api/anthropic",
-        timeout: 30000,
-      });
-      expect(updated.provider.zai.models["glm-5.1"]).toEqual({
-        contextWindow: 200000,
-        name: "GLM-5.1",
-      });
-      expect(updated.provider.deepseek.options.apiKey).toBe("deepseek-secret");
-      expect(updated.model).toEqual({
-        main: "zai/glm-5.1",
-        lite: "deepseek/deepseek-chat",
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("creates default Coding Plan configs when the file is missing", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await updateCodingPlanProviderInFileConfig({
-        apiKey: "bigmodel-coding-key",
-        filePath: path,
-        providerId: "bigmodel",
-      });
-
-      const updated = JSON.parse(await readFile(path, "utf-8"));
-      expect(updated.model).toEqual({
-        main: "bigmodel/glm-5.1",
-        lite: "bigmodel/glm-4.7",
-      });
-      expect(updated.provider.bigmodel).toMatchObject({
-        kind: "anthropic",
-        name: "BigModel Coding Plan",
-        options: {
-          apiKey: "bigmodel-coding-key",
-          apiKeyRequired: true,
-          baseURL: "https://open.bigmodel.cn/api/anthropic",
-        },
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("loads provider map config with model metadata", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          $schema: "https://zcode.ai/schema/config-v2.json",
-          provider: {
-            "provider-auth-zai": {
-              kind: "openai-compatible",
-              name: "Z.AI",
-              options: {
-                baseURL: "https://api.z.ai/api/coding/v1",
-                apiKey: "secret",
-                includeUsage: false,
-              },
-              models: {
-                "glm-5": {
-                  name: "GLM-5",
-                  reasoning: {
-                    enabled: true,
-                    levels: ["low", "medium", "high"],
-                    defaultLevel: "medium",
-                    providerOptionsByLevel: {
-                      high: {
-                        reasoningEffort: "high",
-                      },
-                    },
-                  },
-                  modalities: {
-                    input: ["text", "image", "pdf", "video"],
-                    output: ["text"],
-                  },
-                  limit: {
-                    context: 200000,
-                    output: 8192,
-                  },
-                  tool_call: true,
-                  options: {
-                    reasoningSummary: "auto",
-                  },
-                },
-                "glm-4.7": {
-                  name: "GLM-4.7",
-                  attachment: false,
-                  reasoning: false,
-                  limit: {
-                    context: 128000,
-                    output: 4096,
-                  },
-                },
-              },
-            },
-          },
-          model: {
-            main: "provider-auth-zai/glm-5",
-            lite: "provider-auth-zai/glm-4.7",
-          },
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(result.config.model?.main).toEqual({
-        provider: "provider-auth-zai",
-        model: "glm-5",
-        kind: "openai-compatible",
-        providerName: "Z.AI",
-        baseURL: "https://api.z.ai/api/coding/v1",
-        apiKey: "secret",
-        includeUsage: false,
-        providerOptions: {
-          openaiCompatible: {
-            reasoningSummary: "auto",
-          },
-        },
-      });
-      expect(result.config.model?.lite?.model).toBe("glm-4.7");
-      expect(result.config.model?.lite?.baseURL).toBe("https://api.z.ai/api/coding/v1");
-      expect(
-        result.config.model?.available?.map((target) => `${target.provider}/${target.model}`),
-      ).toEqual(["provider-auth-zai/glm-5", "provider-auth-zai/glm-4.7"]);
-      expect(result.config.modelCatalog?.overrides?.["provider-auth-zai/glm-5"]).toEqual({
-        name: "GLM-5",
-        contextWindow: 200000,
-        maxOutputTokens: 8192,
-        supportsImages: true,
-        supportsPdf: true,
-        supportsVideo: true,
-        supportsReasoning: true,
-        supportsToolCall: true,
-        reasoning: {
-          enabled: true,
-          levels: ["low", "medium", "high"],
-          defaultLevel: "medium",
-          providerOptionsByLevel: {
-            high: {
-              openaiCompatible: {
-                reasoningEffort: "high",
-              },
-            },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["provider-auth-zai/glm-4.7"]).toEqual({
-        name: "GLM-4.7",
-        contextWindow: 128000,
-        maxOutputTokens: 4096,
-        supportsImages: false,
-        supportsReasoning: false,
-        reasoning: {
-          enabled: false,
-        },
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("maps top-level model maxOutputTokens into the existing model capability override", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-model-output-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            "axec-proxy": {
-              kind: "anthropic",
-              name: "AxecProxy",
-              options: {
-                apiKey: "test-key",
-                baseURL: "https://api.infra.example.invalid/v1",
-              },
-              models: {
-                "tob-glm-5.2-cc": {
-                  contextWindow: 1_000_000,
-                  maxOutputTokens: 64_000,
-                  name: "tob-glm-5.2-cc",
-                },
-              },
-            },
-          },
-          model: "axec-proxy/tob-glm-5.2-cc",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(result.config.modelCatalog.overrides["axec-proxy/tob-glm-5.2-cc"]).toMatchObject({
-        contextWindow: 1_000_000,
-        maxOutputTokens: 64_000,
-      });
-      expect(result.config.model?.main).toMatchObject({
-        model: "tob-glm-5.2-cc",
-        provider: "axec-proxy",
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("resolves output budget with limit before options.max_tokens before top-level", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-model-output-precedence-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            compatible: {
-              kind: "openai-compatible",
-              models: {
-                "limit-wins": {
-                  limit: { output: 64_000 },
-                  maxOutputTokens: 16_000,
-                  options: { max_tokens: 32_000 },
-                },
-                "options-wins": {
-                  maxOutputTokens: 16_000,
-                  options: { max_tokens: 48_000 },
-                },
-              },
-            },
-          },
-          model: "compatible/limit-wins",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.config.modelCatalog.overrides["compatible/limit-wins"]?.maxOutputTokens).toBe(
-        64_000,
-      );
-      expect(result.config.modelCatalog.overrides["compatible/options-wins"]?.maxOutputTokens).toBe(
-        48_000,
-      );
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("uses kind-aware Anthropic defaults for configured thinking models", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            zai: {
-              kind: "anthropic",
-              options: {
-                baseURL: "https://api.z.ai/api/anthropic/v1",
-                apiKey: "secret",
-              },
-              models: {
-                "deepseek-v4-pro": {},
-                "glm-5.1": {},
-                "glm-5.2": {},
-                "deepseek-v4-toB-glm-5.3-route": {},
-                "glm-0531[1m]": {},
-                "glm-0606[1m]": {},
-                "kimi-k3": {},
-                k3: {},
-                "k3-256k": {},
-              },
-            },
-          },
-          model: "zai/glm-5.1",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(result.config.modelCatalog?.overrides?.["zai/glm-5.1"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["enabled", "disabled"],
-          defaultLevel: "enabled",
-          providerOptionsByLevel: {
-            enabled: {
-              anthropic: {
-                thinking: {
-                  budgetTokens: 1024,
-                  type: "enabled",
-                },
-              },
-            },
-            disabled: {
-              anthropic: {
-                thinking: {
-                  type: "disabled",
-                },
-              },
-            },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["zai/deepseek-v4-pro"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["high", "max"],
-          defaultLevel: "max",
-          providerOptionsByLevel: {
-            high: {
-              anthropic: {
-                effort: "high",
-                thinking: {
-                  budgetTokens: 1024,
-                  type: "enabled",
-                },
-              },
-            },
-            max: {
-              anthropic: {
-                effort: "max",
-                thinking: {
-                  budgetTokens: 1024,
-                  type: "enabled",
-                },
-              },
-            },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["zai/glm-5.2"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["max", "high", "nothink"],
-          defaultLevel: "max",
-          providerOptionsByLevel: {
-            high: {
-              anthropic: {
-                effort: "high",
-                thinking: {
-                  budgetTokens: 16_000,
-                  type: "enabled",
-                },
-              },
-            },
-            max: {
-              anthropic: {
-                effort: "max",
-                thinking: {
-                  budgetTokens: 32_000,
-                  type: "enabled",
-                },
-              },
-            },
-            nothink: {
-              anthropic: {
-                thinking: {
-                  type: "disabled",
-                },
-              },
-            },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["zai/deepseek-v4-toB-glm-5.3-route"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["low", "high", "max"],
-          defaultLevel: "max",
-          providerOptionsByLevel: {
-            low: {
-              anthropic: {
-                effort: "low",
-                thinking: { budgetTokens: 8_000, type: "enabled" },
-              },
-            },
-            high: {
-              anthropic: {
-                effort: "high",
-                thinking: { budgetTokens: 16_000, type: "enabled" },
-              },
-            },
-            max: {
-              anthropic: {
-                effort: "max",
-                thinking: { budgetTokens: 32_000, type: "enabled" },
-              },
-            },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["zai/glm-0531[1m]"]?.reasoning).toEqual(
-        result.config.modelCatalog?.overrides?.["zai/glm-5.2"]?.reasoning,
-      );
-      expect(result.config.modelCatalog?.overrides?.["zai/glm-0606[1m]"]?.reasoning).toEqual(
-        result.config.modelCatalog?.overrides?.["zai/glm-5.2"]?.reasoning,
-      );
-      expect(result.config.modelCatalog?.overrides?.["zai/kimi-k3"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["low", "high", "max"],
-          defaultLevel: "max",
-          providerOptionsByLevel: {
-            low: { anthropic: { effort: "low" } },
-            high: { anthropic: { effort: "high" } },
-            max: { anthropic: { effort: "max" } },
-          },
-        },
-      });
-      expect(result.config.modelCatalog?.overrides?.["zai/k3"]).toEqual(
-        result.config.modelCatalog?.overrides?.["zai/kimi-k3"],
-      );
-      expect(result.config.modelCatalog?.overrides?.["zai/k3-256k"]).toEqual(
-        result.config.modelCatalog?.overrides?.["zai/kimi-k3"],
-      );
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("maps ox-alpha reasoning by configured transport without injecting unrelated defaults", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-ox-alpha-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            "openrouter-chat": {
-              kind: "openai-compatible",
-              models: {
-                "vendor/ox-alpha-preview": {},
-                "GLM-X-PREVIEW-F": {},
-                "X-pReViEw-F-fReE": {},
-              },
-            },
-            "openrouter-anthropic": {
-              kind: "anthropic",
-              models: {
-                "ox-alpha": {},
-                "gLm-X-pReViEw-F": {},
-                "x-PrEvIeW-f-FrEe": {},
-              },
-            },
-            "openrouter-responses": {
-              kind: "openai",
-              models: { "ox-alpha": {}, "GlM-x-PrEvIeW-f": {} },
-            },
-          },
-          model: "openrouter-chat/vendor/ox-alpha-preview",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(
-        result.config.modelCatalog.overrides["openrouter-chat/vendor/ox-alpha-preview"],
-      ).toEqual({
-        reasoning: {
-          defaultLevel: "max",
-          enabled: true,
-          levels: ["low", "high", "max"],
-          providerOptionsByLevel: {
-            low: { openaiCompatible: { reasoningEffort: "low" } },
-            high: { openaiCompatible: { reasoningEffort: "high" } },
-            max: { openaiCompatible: { reasoningEffort: "max" } },
-          },
-        },
-        supportsReasoning: true,
-      });
-      expect(result.config.modelCatalog.overrides["openrouter-anthropic/ox-alpha"]).toEqual({
-        reasoning: {
-          defaultLevel: "max",
-          enabled: true,
-          levels: ["low", "high", "max"],
-          providerOptionsByLevel: {
-            low: { anthropic: { effort: "low", thinking: { type: "adaptive" } } },
-            high: { anthropic: { effort: "high", thinking: { type: "adaptive" } } },
-            max: { anthropic: { effort: "max", thinking: { type: "adaptive" } } },
-          },
-        },
-        supportsReasoning: true,
-      });
-      expect(result.config.modelCatalog.overrides["openrouter-responses/ox-alpha"]).toEqual({
-        supportsReasoning: false,
-      });
-      expect(result.config.modelCatalog.overrides["openrouter-chat/GLM-X-PREVIEW-F"]).toEqual(
-        result.config.modelCatalog.overrides["openrouter-chat/vendor/ox-alpha-preview"],
-      );
-      expect(result.config.modelCatalog.overrides["openrouter-anthropic/gLm-X-pReViEw-F"]).toEqual(
-        result.config.modelCatalog.overrides["openrouter-anthropic/ox-alpha"],
-      );
-      expect(result.config.modelCatalog.overrides["openrouter-chat/X-pReViEw-F-fReE"]).toEqual(
-        result.config.modelCatalog.overrides["openrouter-chat/vendor/ox-alpha-preview"],
-      );
-      expect(result.config.modelCatalog.overrides["openrouter-anthropic/x-PrEvIeW-f-FrEe"]).toEqual(
-        result.config.modelCatalog.overrides["openrouter-anthropic/ox-alpha"],
-      );
-      expect(result.config.modelCatalog.overrides["openrouter-responses/GlM-x-PrEvIeW-f"]).toEqual(
-        result.config.modelCatalog.overrides["openrouter-responses/ox-alpha"],
-      );
-
-      const catalog = new ModelCatalogService({
-        modelsDev: false,
-        overrides: result.config.modelCatalog.overrides,
-      });
-      expect(catalog.getCapability("openrouter-responses", "ox-alpha")).toMatchObject({
-        reasoning: { enabled: false, levels: [] },
-        supportsReasoning: false,
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects legacy small model config keys", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const smallModelPath = join(dir, "small-model.json");
-    const modelSmallPath = join(dir, "model-small.json");
-
-    try {
-      await writeFile(
-        smallModelPath,
-        JSON.stringify({
-          provider: {
-            openai: {
-              kind: "openai",
-            },
-          },
-          model: "openai/gpt-4o",
-          small_model: "openai/gpt-4o-mini",
-        }),
-      );
-      await writeFile(
-        modelSmallPath,
-        JSON.stringify({
-          provider: {
-            openai: {
-              kind: "openai",
-            },
-          },
-          model: {
-            main: "openai/gpt-4o",
-            small: "openai/gpt-4o-mini",
-          },
-        }),
-      );
-
-      expect(loadFileConfig(smallModelPath).loaded).toBe(false);
-      expect(loadFileConfig(modelSmallPath).loaded).toBe(false);
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("loads selectable models from multiple configured providers", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            zai: {
-              kind: "openai-compatible",
-              name: "Z.AI",
-              options: {
-                baseURL: "https://api.z.ai/api/coding/v1",
-                apiKey: "zai-secret",
-              },
-              models: {
-                "glm-5.1": {
-                  name: "GLM-5.1",
-                },
-                "glm-4.7": {
-                  name: "GLM-4.7",
-                },
-              },
-            },
-            deepseek: {
-              kind: "openai-compatible",
-              name: "DeepSeek",
-              options: {
-                apiKey: "deepseek-secret",
-                baseURL: "https://api.deepseek.example",
-              },
-              models: {
-                "deepseek-v4-pro": {
-                  name: "DeepSeek V4 Pro",
-                },
-              },
-            },
-          },
-          model: "zai/glm-5.1",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(
-        result.config.model?.available?.map((target) => `${target.provider}/${target.model}`),
-      ).toEqual(["zai/glm-5.1", "zai/glm-4.7", "deepseek/deepseek-v4-pro"]);
-      expect(
-        result.config.model?.available?.find((target) => target.provider === "deepseek"),
-      ).toMatchObject({
-        kind: "openai-compatible",
-        apiKey: "deepseek-secret",
-        baseURL: "https://api.deepseek.example",
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects file config that fails the zod schema", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          provider: {
-            local: {
-              models: {
-                tiny: {
-                  limit: {
-                    context: "large",
-                  },
-                },
-              },
-            },
-          },
-          model: "local/tiny",
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(false);
-      expect(result.config).toEqual({});
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects unsupported provider kinds and npm-based provider config", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const unsupportedKindPath = join(dir, "unsupported-kind.json");
-    const npmPath = join(dir, "npm-provider.json");
-
-    try {
-      await writeFile(
-        unsupportedKindPath,
-        JSON.stringify({
-          provider: {
-            local: {
-              kind: "gateway",
-              models: {
-                tiny: { name: "Tiny" },
-              },
-            },
-          },
-          model: "local/tiny",
-        }),
-      );
-      await writeFile(
-        npmPath,
-        JSON.stringify({
-          provider: {
-            local: {
-              npm: "@ai-sdk/openai-compatible",
-              models: {
-                tiny: { name: "Tiny" },
-              },
-            },
-          },
-          model: "local/tiny",
-        }),
-      );
-
-      expect(loadFileConfig(unsupportedKindPath).loaded).toBe(false);
-      expect(loadFileConfig(npmPath).loaded).toBe(false);
-    } finally {
-      await rm(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("loads model catalog reasoning overrides from file config", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "zcode-config-"));
-    const path = join(dir, "config.json");
-
-    try {
-      await writeFile(
-        path,
-        JSON.stringify({
-          modelCatalog: {
-            overrides: {
-              "openai/glm-4.7": {
-                supportsReasoning: true,
-                reasoning: {
-                  enabled: true,
-                  levels: ["low", "medium", "high"],
-                  defaultLevel: "medium",
-                  providerOptionsByLevel: {
-                    high: {
-                      reasoningEffort: "high",
-                    },
-                  },
-                },
-              },
-            },
-          },
-        }),
-      );
-
-      const result = loadFileConfig(path);
-
-      expect(result.loaded).toBe(true);
-      expect(result.config.modelCatalog?.overrides?.["openai/glm-4.7"]).toEqual({
-        supportsReasoning: true,
-        reasoning: {
-          enabled: true,
-          levels: ["low", "medium", "high"],
-          defaultLevel: "medium",
-          providerOptionsByLevel: {
-            high: {
-              reasoningEffort: "high",
-            },
-          },
-        },
-      });
-    } finally {
-      await rm(dir, { force: true, recursive: true });
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

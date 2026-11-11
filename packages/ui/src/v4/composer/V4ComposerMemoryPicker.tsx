@@ -24,7 +24,7 @@ import {
 import { cn } from "@/components/lib/utils.js";
 import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
-import { TID_V4_COMPOSER_INPUT, TID_V4_COMPOSER_MEMORY_PICKER } from "@zcode/shared";
+import { TID_V4_COMPOSER_INPUT, TID_V4_COMPOSER_MEMORY_PICKER } from "@zcode/shared/test-ids";
 import { isCoarseTouchDevice } from "@/lib/pickerFocus.js";
 
 export interface V4ComposerMemoryPickerProps {

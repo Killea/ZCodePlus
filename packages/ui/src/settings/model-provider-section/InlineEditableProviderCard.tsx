@@ -188,6 +188,7 @@ export function InlineEditableProviderCard({
 }) {
   const { intl } = useZCodeIntl();
   const { dismissFeedback, showFeedback } = useProviderDetailFeedback();
+  const [editingName, setEditingName] = useState(false);
   const [nameValue, setNameValue] = useState(getProviderFormLabel(provider));
   const [apiFormat, setApiFormat] = useState<ProviderApiType>(
     provider.config.api?.type ?? "anthropic-messages",
@@ -207,6 +208,7 @@ export function InlineEditableProviderCard({
   const reorderModelIdsTargetRef = useRef(onReorderModelIds);
   reorderModelIdsTargetRef.current = onReorderModelIds;
   const nameCompositionActiveRef = useRef(false);
+  const nameEditProviderIdRef = useRef<string | null>(null);
   const technicalInputCompositionActiveRef = useRef(false);
   const deleteRequestedRef = useRef(false);
   const selfSaveRequestedRef = useRef(false);
@@ -243,7 +245,9 @@ export function InlineEditableProviderCard({
     const resolvedLabel = getProviderFormLabel(provider);
     if (providerIdRef.current !== provider.providerId) {
       providerIdRef.current = provider.providerId;
+      nameEditProviderIdRef.current = null;
       nameCompositionActiveRef.current = false;
+      setEditingName(false);
       draftRevisionRef.current += 1;
       dirtyProviderFieldsRef.current.clear();
       lastSubmittedDraftSignatureRef.current = null;
@@ -523,6 +527,10 @@ export function InlineEditableProviderCard({
   );
 
   const handleNameBlur = useCallback(() => {
+    // Esc/切换供应商先取消编辑意图，随后发生的 blur 不得补发保存。
+    if (nameEditProviderIdRef.current !== provider.providerId) return;
+    nameEditProviderIdRef.current = null;
+    setEditingName(false);
     const trimmed = draftRef.current.nameValue.trim();
     const currentLabel = getProviderFormLabel(provider);
     if (trimmed && trimmed !== currentLabel) {
@@ -546,15 +554,23 @@ export function InlineEditableProviderCard({
         (event.target as HTMLInputElement).blur();
       } else if (action === "cancel") {
         event.preventDefault();
+        nameEditProviderIdRef.current = null;
         nameCompositionActiveRef.current = false;
         const label = getProviderFormLabel(provider);
         draftRef.current.nameValue = label;
         dirtyProviderFieldsRef.current.delete("nameValue");
         setNameValue(label);
+        setEditingName(false);
       }
     },
     [provider],
   );
+
+  const handleStartEditName = useCallback(() => {
+    nameEditProviderIdRef.current = provider.providerId;
+    nameCompositionActiveRef.current = false;
+    setEditingName(true);
+  }, [provider.providerId]);
 
   const saveConnection = useCallback(
     () => void commitPendingDraft("connection-blur").catch(() => undefined),
@@ -759,6 +775,19 @@ export function InlineEditableProviderCard({
         <ProviderCardHeader
           providerName={headerProviderName}
           logo={provider.config.logo}
+          editingName={editingName}
+          nameValue={nameValue}
+          nameEditable={nameEditable}
+          onNameChange={handleNameValueChange}
+          onNameBlur={handleNameBlur}
+          onNameKeyDown={handleNameKeyDown}
+          onNameCompositionStart={() => {
+            nameCompositionActiveRef.current = true;
+          }}
+          onNameCompositionEnd={() => {
+            nameCompositionActiveRef.current = false;
+          }}
+          onStartEditName={handleStartEditName}
           onDelete={onDelete ? handleDeleteProvider : undefined}
           actionsVisible={headerActionsVisible}
           providerToggle={

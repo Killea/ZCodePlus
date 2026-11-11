@@ -1,6 +1,6 @@
 // L2：v4 原生会话管理命令组（renameSession / deleteSession）——验证语义保真：
 // rename 直驱 core runtime.setCustomSessionTitle（titleSource=custom 粘性归 core），
-// delete = closeSession 语义（关闭+清理，非真删 record），经 host.closeSession 过渡钩子。
+// delete = CLI 软删除后关闭运行实例，经 host.deleteSession 过渡钩子。
 // 08-phasing M4 完成定义的 L2 层（命令 → core 调用 → 状态推进，不经旧协议代码）。
 import { describe, expect, it, vi } from "vitest";
 import { SessionEventType } from "@zcode/contracts";
@@ -89,32 +89,32 @@ describe("v4 原生 renameSession", () => {
 });
 
 describe("v4 原生 deleteSession", () => {
-  it("正路径：语义 = closeSession，经 host.closeSession 钩子执行关闭", async () => {
+  it("正路径：语义 = deleteSession，经 host.deleteSession 钩子执行关闭", async () => {
     const record = makeRecord();
-    const closeSession = vi.fn().mockResolvedValue(undefined);
-    await new V4CommandExecutor(makeHost(record, { closeSession })).execute(
+    const deleteSession = vi.fn().mockResolvedValue(undefined);
+    await new V4CommandExecutor(makeHost(record, { deleteSession })).execute(
       envelope("deleteSession", {}),
     );
-    expect(closeSession).toHaveBeenCalledTimes(1);
-    expect(closeSession).toHaveBeenCalledWith("s1");
+    expect(deleteSession).toHaveBeenCalledTimes(1);
+    expect(deleteSession).toHaveBeenCalledWith("s1");
   });
 
-  it("session 不存在：拒绝，且不触碰 closeSession 钩子", async () => {
+  it("session 不存在：拒绝，且不触碰 deleteSession 钩子", async () => {
     const record = makeRecord();
-    const closeSession = vi.fn().mockResolvedValue(undefined);
+    const deleteSession = vi.fn().mockResolvedValue(undefined);
     await expect(
-      new V4CommandExecutor(makeHost(record, { closeSession })).execute(
+      new V4CommandExecutor(makeHost(record, { deleteSession })).execute(
         envelope("deleteSession", {}, "missing"),
       ),
     ).rejects.toThrow(V4SessionNotFoundError);
-    expect(closeSession).not.toHaveBeenCalled();
+    expect(deleteSession).not.toHaveBeenCalled();
   });
 
-  it("closeSession 钩子缺失：显式失败（关闭不能静默降级）", async () => {
+  it("deleteSession 钩子缺失：显式失败（关闭不能静默降级）", async () => {
     const record = makeRecord();
     await expect(
       new V4CommandExecutor(makeHost(record)).execute(envelope("deleteSession", {})),
-    ).rejects.toThrow(/closeSession/);
+    ).rejects.toThrow(/deleteSession/);
   });
 });
 
@@ -127,6 +127,65 @@ describe("v4 原生 createSession", () => {
     const host = makeHost(record, { createSessionRecord });
     return { host, createSessionRecord };
   }
+
+  it("创建前透传 Host 预留的会话 ID 与附加目录", async () => {
+    const record = makeRecord({ persistence: "deferred" });
+    const { host, createSessionRecord } = makeCreateHost(record);
+    await new V4CommandExecutor(host).execute(
+      envelope(
+        "createSession",
+        { workspaceId: "/w", sessionId: "reserved", additionalDirectories: ["/b"] },
+        "draft",
+      ),
+    );
+    expect(createSessionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "reserved", additionalDirectories: ["/b"] }),
+    );
+  });
+
+  it("受管 worktree：透传 cwd，记录 worktreeCreation 等首轮落盘（docs/git/worktree.md §6.6.4）", async () => {
+    const recordPendingWorktreeCreation = vi.fn();
+    const app = makeApp({
+      runtime: { setCustomSessionTitle: vi.fn(), recordPendingWorktreeCreation },
+    });
+    const record = makeRecord({ app, persistence: "deferred" });
+    const { host, createSessionRecord } = makeCreateHost(record);
+    const worktreeCreation = {
+      path: "/wt/3f2a/project",
+      sha: "9e6d2f72d4",
+      ref: "origin/main",
+      output: "HEAD is now at 9e6d2f7\n",
+    };
+    await new V4CommandExecutor(host).execute(
+      envelope(
+        "createSession",
+        { workspaceId: "/w", cwd: "/wt/3f2a/project", worktreeCreation },
+        "draft",
+      ),
+    );
+    expect(createSessionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: "/w", cwd: "/wt/3f2a/project" }),
+    );
+    expect(recordPendingWorktreeCreation).toHaveBeenCalledWith(worktreeCreation);
+  });
+
+  it("worktreeCreation 缺 cwd：创建 record 前拒绝", async () => {
+    const record = makeRecord({ persistence: "deferred" });
+    const { host, createSessionRecord } = makeCreateHost(record);
+    await expect(
+      new V4CommandExecutor(host).execute(
+        envelope(
+          "createSession",
+          {
+            workspaceId: "/w",
+            worktreeCreation: { path: "/wt", sha: "abc", ref: null, output: "" },
+          },
+          "draft",
+        ),
+      ),
+    ).rejects.toThrow(/worktreeCreation requires cwd/);
+    expect(createSessionRecord).not.toHaveBeenCalled();
+  });
 
   it("无 firstInput：只建 draft record（deferred），不起 turn", async () => {
     const app = makeApp({ sendInput: vi.fn() });
@@ -167,39 +226,36 @@ describe("v4 原生 createSession", () => {
     expect(createSessionRecord).toHaveBeenCalledWith({ workspaceId: "/w", mcpServers });
   });
 
-  it.each([false, true])(
-    "Guarded 配置失败会清理新草稿且不执行（首发=%s）",
-    async (withFirstInput) => {
-      const sendInput = vi.fn();
-      const closeSession = vi.fn(async () => {});
-      const app = makeApp({
-        sendInput,
-        runtime: {
-          getSessionModelSelection: () => {
-            throw new Error("config unavailable");
-          },
+  it("Guarded 配置失败会清理新草稿且不执行首条输入", async () => {
+    const sendInput = vi.fn();
+    const deleteSession = vi.fn(async () => {});
+    const app = makeApp({
+      sendInput,
+      runtime: {
+        getSessionModelSelection: () => {
+          throw new Error("config unavailable");
         },
-      });
-      const record = makeRecord({ app, persistence: "deferred" });
-      const { host } = makeCreateHost(record);
-      host.closeSession = closeSession;
-      await expect(
-        new V4CommandExecutor(host).execute(
-          envelope(
-            "createSession",
-            {
-              workspaceId: "/w",
-              config: { mode: "guarded" },
-              ...(withFirstInput ? { firstInput: { text: "do work", mode: "guarded" } } : {}),
-            },
-            "draft",
-          ),
+      },
+    });
+    const record = makeRecord({ app, persistence: "deferred" });
+    const { host } = makeCreateHost(record);
+    host.deleteSession = deleteSession;
+    await expect(
+      new V4CommandExecutor(host).execute(
+        envelope(
+          "createSession",
+          {
+            workspaceId: "/w",
+            config: { mode: "guarded" },
+            firstInput: { text: "do work", mode: "guarded" },
+          },
+          "draft",
         ),
-      ).rejects.toThrow("config unavailable");
-      expect(closeSession).toHaveBeenCalledWith("s1");
-      expect(sendInput).not.toHaveBeenCalled();
-    },
-  );
+      ),
+    ).rejects.toThrow("config unavailable");
+    expect(deleteSession).toHaveBeenCalledWith("s1");
+    expect(sendInput).not.toHaveBeenCalled();
+  });
 
   it("创建 draft record 时透传 Off-Peak 工具面 flag（D49：v4 是桌面新会话的实际创建路径）", async () => {
     const record = makeRecord({ app: makeApp(), persistence: "deferred" });
@@ -306,23 +362,22 @@ describe("v4 原生 createSession", () => {
   });
 
   it("firstInput 启动失败：保留原错误并把 durable admission 收口为 cancelled", async () => {
-    const app = makeApp({ sendInput: vi.fn() });
+    // 首发模型不在 Worker Registry：与 sendText 共用模型准入，在 Core 建模前以 modelUnavailable 拒绝。
+    const app = makeApp({ sendInput: vi.fn(), listModels: () => [] });
     const record = makeRecord({ app, persistence: "deferred" });
-    const inputError = new Error("model unavailable");
     const admitInputCommand = vi.fn().mockResolvedValue({ sourceCommandId: "cmd-1" });
     const cancelInputCommand = vi.fn().mockRejectedValue(new Error("ledger unavailable"));
     const warn = vi.fn();
     const { host } = makeCreateHost(record);
     host.admitInputCommand = admitInputCommand;
     host.cancelInputCommand = cancelInputCommand;
-    host.ensureModelReady = vi.fn().mockRejectedValue(inputError);
     host.logger = { warn };
 
     await expect(
       new V4CommandExecutor(host).execute(
         envelope("createSession", { workspaceId: "/w", firstInput: { text: "首条" } }, "draft"),
       ),
-    ).rejects.toBe(inputError);
+    ).rejects.toMatchObject({ reasonCode: "modelUnavailable" });
     expect(cancelInputCommand).toHaveBeenCalledWith(
       "s1",
       "queue_cmd-1",
@@ -331,7 +386,7 @@ describe("v4 原生 createSession", () => {
     expect(warn).toHaveBeenCalledWith(
       "v4 createSession first input cancellation failed",
       expect.objectContaining({
-        inputError: "model unavailable",
+        inputError: expect.stringContaining("Provider Registry 中不存在 Model"),
         queueItemId: "queue_cmd-1",
       }),
     );
@@ -357,14 +412,5 @@ describe("v4 原生 createSession", () => {
         envelope("createSession", { workspaceId: "/w" }, "draft"),
       ),
     ).rejects.toThrow(/createSessionRecord/);
-  });
-});
-
-describe("supports 分流", () => {
-  it("createSession/renameSession/deleteSession 已原生", () => {
-    const executor = new V4CommandExecutor(makeHost(makeRecord()));
-    expect(executor.supports("createSession")).toBe(true);
-    expect(executor.supports("renameSession")).toBe(true);
-    expect(executor.supports("deleteSession")).toBe(true);
   });
 });

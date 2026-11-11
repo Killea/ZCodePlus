@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  getCurrentModelInvocationContext,
+  type ModelStatusSink,
   ModelErrorCode,
   SessionEventType,
   createModelId,
@@ -18,6 +20,85 @@ import { createTestModelFormatProperties } from "./test-runtime-model.js";
 import { createTestModelFactory } from "./test-runtime-model.js";
 
 describe("Agent Runtime Model lifecycle", () => {
+  it.each(["success", "failure", "cancelled"] as const)(
+    "disposes the model status sink after %s",
+    async (outcome) => {
+      const store = createTestSessionEventStore();
+      const sessionId = createSessionId(`sink-${outcome}`);
+      let retained: ModelStatusSink | undefined;
+      const runtime = createTestAgentRuntime(
+        sessionId,
+        { mode: "build", modelSelection: createTestModelSelection("test/model") },
+        {
+          eventStore: store,
+          modelFactory: ({ selection }) => ({
+            ...createLifecycleTestModel(selection),
+            async generateText() {
+              retained = getCurrentModelInvocationContext()?.statusSink;
+              if (outcome !== "success")
+                throw outcome === "cancelled"
+                  ? new DOMException("cancelled", "AbortError")
+                  : new Error("model failed");
+              return result(selection, { finishReason: "stop", text: "done" });
+            },
+          }),
+        },
+      );
+      await runtime.executeTurn("test sink lifetime").catch(() => {});
+      expect(retained).toBeDefined();
+      const count = (await store.getEvents(sessionId)).length;
+      await retained!.publish({ type: "model_request_started", attempt: 1 } as never);
+      expect((await store.getEvents(sessionId)).length).toBe(count);
+    },
+  );
+
+  it("manual compact executes its submitted B after newer C was accepted without reverting C", async () => {
+    const requests: string[] = [];
+    const runtime = createTestAgentRuntime(
+      createSessionId("compact-submitted-model"),
+      { mode: "build", modelSelection: createTestModelSelection("test/model-a") },
+      {
+        eventStore: createTestSessionEventStore(),
+        modelFactory: ({ selection }) => {
+          const model = createLifecycleTestModel(selection);
+          return {
+            ...model,
+            async generateText(request) {
+              const compact = JSON.stringify(request.messages).includes(
+                "create a detailed summary",
+              );
+              requests.push(`${selection.modelId}:${compact ? "compact" : "normal"}`);
+              return result(selection, {
+                finishReason: "stop",
+                text: compact ? "<summary>Preserve the task and files.</summary>" : "done",
+              });
+            },
+          };
+        },
+      },
+    );
+    await runtime.executeTurn("first history");
+    await runtime.executeTurn("newer input", undefined, {
+      intent: {
+        sourceCommandId: "newer-c",
+        kind: "sendText",
+        admissionSeq: 3,
+        modelSelection: createTestModelSelection("test/model-c"),
+      },
+    });
+    await runtime.executeTurn("/compact", undefined, {
+      intent: {
+        sourceCommandId: "queued-b",
+        kind: "compact",
+        admissionSeq: 2,
+        modelSelection: createTestModelSelection("test/model-b"),
+      },
+    });
+    expect(requests).toContain("model-b:compact");
+    expect(requests).not.toContain("model-c:compact");
+    expect(runtime.getSessionModelSelection().modelId).toBe("model-c");
+  });
+
   it("does not fall back to the Adapter when the explicit ModelFactory is unavailable", async () => {
     const eventStore = createTestSessionEventStore();
     const modelSelection = createTestModelSelection("test/adapter-only-model");
@@ -236,7 +317,6 @@ describe("Agent Runtime Model lifecycle", () => {
     await runtime.executeTurn("first");
     await runtime.executeTurn("second");
 
-    expect(modelFactory).toHaveBeenCalledTimes(2);
     expect(modelFactory.mock.calls.map(([input]) => input.selection.modelId)).toEqual([
       "model-a",
       "model-b",

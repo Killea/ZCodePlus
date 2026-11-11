@@ -9,6 +9,62 @@ import { createMcpConnectionPool } from "../src/mcp/pool.js";
 import { createMcpTelemetryTracker } from "../src/mcp/telemetry.js";
 
 describe("MCP connection pool isolation", () => {
+  it("closing a lease cancels its resource request without cancelling another session", async () => {
+    const adapter = createFakeAdapter("fixture");
+    const signals: AbortSignal[] = [];
+    adapter.readResource = vi.fn(async (_request, options) => {
+      signals.push(options!.signal!);
+      return { contents: [] };
+    });
+    const pool = createMcpConnectionPool({ createAdapter: () => adapter, idleGraceMs: 0 });
+    const a = pool.acquireLease(),
+      b = pool.acquireLease();
+    const config: McpServerConfig = { type: "stdio", command: "fixture", isolation: "workspace" };
+    await Promise.all([a.connectServer("fixture", config), b.connectServer("fixture", config)]);
+    await a.readResource!({ serverName: "fixture", uri: "test://a" });
+    await b.readResource!({ serverName: "fixture", uri: "test://b" });
+    await a.close();
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+    expect(adapter.close).not.toHaveBeenCalled();
+    await b.close();
+    await pool.close();
+  });
+
+  it("shares startup waiters and rejects a released lease while another owner connects", async () => {
+    const ready = Promise.withResolvers<void>();
+    let initialized = false;
+    const source = { identity: "trusted", generation: 1 };
+    const connectServer = vi.fn(async () => {
+      await ready.promise;
+      initialized = true;
+      return { status: "connected" };
+    });
+    const adapter = {
+      connectServer,
+      waitForAppConnection: async () => (initialized ? source : null),
+      close: vi.fn(async () => {}),
+    } as unknown as McpPort;
+    const pool = createMcpConnectionPool({ createAdapter: () => adapter, idleGraceMs: 0 });
+    const a = pool.acquireLease({ sessionId: "a" });
+    const b = pool.acquireLease({ sessionId: "b" });
+    const config: McpServerConfig = { type: "stdio", command: "fixture", isolation: "workspace" };
+    const connecting = Promise.allSettled([
+      a.connectServer("fixture", config),
+      b.connectServer("fixture", config),
+    ]);
+    const released = a.waitForAppConnection!("fixture");
+    const opening = b.waitForAppConnection!("fixture");
+    await a.close();
+    ready.resolve();
+    expect((await connecting).map((result) => result.status)).toEqual(["rejected", "fulfilled"]);
+    expect(await released).toBeNull();
+    expect(await opening).toEqual(source);
+    expect(connectServer).toHaveBeenCalledOnce();
+    await b.close();
+    await pool.close();
+  });
+
   it("reports one startup count snapshot for a session lease", async () => {
     const events: unknown[] = [];
     const telemetry = createMcpTelemetryTracker({
@@ -389,6 +445,66 @@ describe("MCP connection pool isolation", () => {
   });
 });
 
+// 受管 worktree（docs/git/worktree.md §7.2 / §9.3）：连接分组按工作目录，会话 key 只透传给 adapter
+// 用于发往 Host 的官方 MCP 授权头。
+describe("MCP connection pool session workspace key", () => {
+  it("passes the session workspace key to the adapter without changing the pool scope", async () => {
+    const createAdapter = vi.fn(({ serverName }: { serverName: string }) =>
+      createFakeAdapter(serverName),
+    );
+    const pool = createMcpConnectionPool({ createAdapter, idleGraceMs: 0 });
+    const session = pool.acquireLease({ leaseId: "session-a", sessionId: "session-a" });
+
+    await session.connectServer(
+      "node_repl",
+      { command: "node", type: "stdio" },
+      { workingDirectory: "/data/.zcode/worktrees/3f2a/repo", workspaceKey: "/projects/repo" },
+    );
+
+    expect(createAdapter).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionContext: expect.objectContaining({
+          workspaceKey: "/data/.zcode/worktrees/3f2a/repo",
+        }),
+        workingDirectory: "/data/.zcode/worktrees/3f2a/repo",
+        workspaceKey: "/projects/repo",
+      }),
+    );
+    await session.close();
+    await pool.close();
+  });
+
+  it("does not share a workspace connection between sessions with different workspace keys", async () => {
+    const createAdapter = vi.fn(({ serverName }: { serverName: string }) =>
+      createFakeAdapter(serverName),
+    );
+    const pool = createMcpConnectionPool({ createAdapter, idleGraceMs: 0 });
+    const config = { command: "node", type: "stdio" as const, isolation: "workspace" as const };
+    const cwd = "/data/.zcode/worktrees/3f2a/repo";
+    // 同一 cwd：一个是源项目的 worktree 会话，一个把该目录单独添加成项目（MR !3520 review SG-01）。
+    const leases = [
+      pool.acquireLease({ leaseId: "a", sessionId: "a" }),
+      pool.acquireLease({ leaseId: "b", sessionId: "b" }),
+      pool.acquireLease({ leaseId: "c", sessionId: "c" }),
+    ];
+    await leases[0]!.connectServer("shared", config, {
+      workingDirectory: cwd,
+      workspaceKey: "/projects/repo",
+    });
+    await leases[1]!.connectServer("shared", config, { workingDirectory: cwd, workspaceKey: cwd });
+    await leases[2]!.connectServer("shared", config, {
+      workingDirectory: cwd,
+      workspaceKey: "/projects/repo",
+    });
+
+    expect(
+      createAdapter.mock.calls.map(([input]) => (input as { workspaceKey?: string }).workspaceKey),
+    ).toEqual(["/projects/repo", cwd]);
+    for (const lease of leases) await lease.close();
+    await pool.close();
+  });
+});
+
 // Bugfix 回归：设置页刷新走进程级 `protocol-settings` lease，配置不变时命中同一个 pool entry。
 // 过去 acquire 直接返回首次连接那个 resolve 过的 promise，停掉的 HTTP MCP 永远显示已连接。
 describe("MCP connection pool revalidation", () => {
@@ -592,3 +708,52 @@ function createFakeAdapterWithStatus(
     status: vi.fn(async () => ({ [serverName]: status })),
   };
 }
+
+it("cancels one session waiter without cancelling the pooled connection or another waiter", async () => {
+  const connected = Promise.withResolvers<McpServerStatus>();
+  let signal: AbortSignal | undefined;
+  const adapter = {
+    connectServer: vi.fn((_name, _config, options) => {
+      signal = options?.signal;
+      return connected.promise;
+    }),
+    close: vi.fn(async () => {}),
+  } as unknown as McpPort;
+  const pool = createMcpConnectionPool({ createAdapter: () => adapter, idleGraceMs: 0 });
+  const a = pool.acquireLease({ sessionId: "a" }),
+    b = pool.acquireLease({ sessionId: "b" });
+  const abort = new AbortController();
+  const config: McpServerConfig = { type: "stdio", command: "fixture", isolation: "workspace" };
+  const openingA = a.connectServer("fixture", config, { signal: abort.signal });
+  const checked = expect(openingA).rejects.toThrow();
+  const openingB = b.connectServer("fixture", config);
+  abort.abort(new Error("session closed"));
+  expect(signal?.aborted).not.toBe(true);
+  await checked;
+  await a.close();
+  connected.resolve({ status: "connected", transport: "stdio", toolCount: 0, updatedAt: "now" });
+  expect((await openingB).status).toBe("connected");
+  expect(adapter.close).not.toHaveBeenCalled();
+  await expect(a.connectServer("fixture", config)).rejects.toThrow();
+  await b.close();
+  await pool.close();
+});
+
+it("lease close interrupts an in-flight connection wait and forbids late reacquisition", async () => {
+  const connecting = Promise.withResolvers<McpServerStatus>();
+  const adapter = {
+    connectServer: () => connecting.promise,
+    close: async () => {},
+  } as unknown as McpPort;
+  const pool = createMcpConnectionPool({ createAdapter: () => adapter, idleGraceMs: 0 });
+  const lease = pool.acquireLease();
+  const pending = lease.connectServer("fixture", { type: "stdio", command: "fixture" });
+  const checked = expect(pending).rejects.toThrow();
+  await lease.close();
+  await checked;
+  connecting.resolve({ status: "connected", transport: "stdio", toolCount: 0, updatedAt: "now" });
+  await expect(
+    lease.connectServer("fixture", { type: "stdio", command: "fixture" }),
+  ).rejects.toThrow();
+  await pool.close();
+});

@@ -191,6 +191,9 @@ export function createMcpToolEntry(
     inputSchema: createModelFacingMcpInputSchema(descriptor, isCuaAppObservation),
     outputSchema: McpToolOutputJsonSchema,
     metadata: {
+      shouldDefer: true,
+      alwaysLoad: descriptor.alwaysLoad,
+      searchHint: descriptor.searchHint,
       concurrentSafe: readOnly || descriptor.annotations?.idempotentHint === true,
       destructive,
       // 必须把 MCP tool 的 description 透传到 metadata，让 registry 把它带进模型输入，
@@ -256,11 +259,12 @@ export function createMcpToolEntry(
           workspacePath: context.workingDirectory,
           ...(context.remoteSessionId ? { remoteSessionId: context.remoteSessionId } : {}),
           ...(context.workspaceIdentity?.trim()
-            ? {
-                workspaceIdentity: context.workspaceIdentity.trim(),
-                workspaceKey: context.workspaceIdentity.trim(),
-              }
-            : { workspaceKey: context.workingDirectory }),
+            ? { workspaceIdentity: context.workspaceIdentity.trim() }
+            : {}),
+          // 修复原因：本地会话曾一律用工作目录当 key；受管 worktree 会话的工作目录是 worktree，
+          // Host 按 key 隔离的 MCP 找不到所属项目。会话 key 由协议入口给出（docs/git/worktree.md §9.3）。
+          workspaceKey:
+            context.workspaceKey ?? (context.workspaceIdentity?.trim() || context.workingDirectory),
           ...(context.turnId ? { turnId: context.turnId } : {}),
           clientMode: context.clientMode ?? "desktop-continuous",
           deliveryKind: context.deliveryKind ?? "desktop-continuous",

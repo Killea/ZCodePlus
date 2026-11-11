@@ -14,11 +14,14 @@
 // 这里是治理器里**唯一**会碰时钟与定时器的地方：控制器只收 `now`；冷却到期要唤醒等待者，
 // 所以需要一个 setTimeout（可注入，unref）。
 
-import type {
-  ModelNetworkStatusEvent,
-  ModelRequestAdmission,
-  ModelRequestAdmissionTicket,
-  ModelRequestTarget,
+import { resolveWorkflowModelFailurePolicy } from "@zcode/adapters/model";
+import {
+  ModelErrorCode,
+  type ModelNetworkStatusEvent,
+  type ModelRequestAdmission,
+  type ModelRequestAdmissionTicket,
+  type ModelRequestFailedStatusEvent,
+  type ModelRequestTarget,
 } from "@zcode/contracts";
 import {
   ConcurrencyController,
@@ -65,6 +68,13 @@ interface WorkflowConcurrencyGovernor extends WorkflowConcurrencyPort {
    * 且喂信号（它的请求 provider 同样看得见）。主代理的 turn 永不被 workflow 流量阻塞。
    */
   observer(): ModelRequestAdmission;
+  /**
+   * 主代理 subagent（`Agent` 工具，taskType `subagent_child`）用的 admission：和 workflow run 一样
+   * 排队、看冷却、喂信号。一个父会话的全部 subagent 共用**一条**队列（run 身份
+   * `\0subagents:<parentSessionId>`），在轮转里只占一份；不登记上界、不订阅、不进桶的 `runs`，
+   * 会话结束后不留状态（docs/dynamic-workflow/concurrency.md「Where the port is bound」）。
+   */
+  sessionSubagents(parentSessionId: string): ModelRequestAdmission;
   /** 控制器只读快照；没有这个 key 的桶时为 undefined。 */
   snapshot(key: string): ConcurrencyControllerSnapshot | undefined;
 }
@@ -109,7 +119,7 @@ interface Bucket {
   /** 轮转游标：上一次放行的 run，下一次从它之后开始找。 */
   lastGrantedRun?: string;
   /**
-   * 在这个 key 上请求过准入的 run（observer 除外）。增长上限只看它们登记的上界：一个跑在别的
+   * 在这个 key 上请求过准入的 run（observer 与 subagent 池除外）。增长上限只看它们登记的上界：一个跑在别的
    * 模型上的大 run 不该抬这个 key。run 清掉上界时一并移出。
    */
   readonly runs: Set<string>;
@@ -118,6 +128,10 @@ interface Bucket {
 
 /** observer（主代理）的 run 身份：不排队、不订阅，只在扇出过滤里作为「不是任何 run」出现。 */
 const OBSERVER_RUN_ID = "\0observer";
+/** 主代理 subagent 池的 run 身份前缀；`\0` 起头，和任何 workflow run id 都不会撞。 */
+const SESSION_SUBAGENTS_RUN_PREFIX = "\0subagents:";
+/** runner 没给 signal 时的占位：永不 abort（用户取消走请求自己的 signal）。 */
+const NEVER_ABORTED: AbortSignal = new AbortController().signal;
 
 const defaultSchedule = (callback: () => void, delayMs: number): (() => void) => {
   const timer = setTimeout(callback, delayMs);
@@ -272,9 +286,17 @@ export function createWorkflowConcurrencyGovernor(
           case "model_request_failed":
             // retryable:true 的 failed 紧随一条 retry_scheduled——那条才是信号。
             if (event.retryable) return;
+            // Stop 集（配额、认证…）不是并发信号，只终结尝试。曾经配额 429 走下面的限流分支：
+            // 1308 带的 Retry-After 指到额度窗口结束（可达数小时），冷却冻住整个桶、活得比停下的 run
+            // 还久；用户用重置卡恢复额度后 resume，子代理全卡在闸门上一个请求不发，主代理（observer
+            // 不看冷却）却照常工作，换模型（换桶）才继续。何时再试由用户决定，与 driver 读同一张策略表。
+            if (isWorkflowStopFailure(event)) {
+              settle((at) => bucket.controller.ended(at));
+              return;
+            }
             // 不可重试的限流：
             // 主对话 / 工具侧撞上 3008 这类被分类器判终止的 429，仍是一次字面意义上的并发信号——
-            // 只当「链结束」会让 cap 从未因它降过。配额码也走这一支：多减一次半，run 随即停下，无害。
+            // 只当「链结束」会让 cap 从未因它降过。
             if (event.reason === "rate_limited") {
               settle((at) =>
                 bucket.controller.throttled(at, epoch, "rate_limited", event.retryAfterMs),
@@ -342,18 +364,27 @@ export function createWorkflowConcurrencyGovernor(
     armCooldownWake(bucket);
   };
 
-  const tryAdmit: WorkflowConcurrencyPort["tryAdmit"] = (runId, key) => {
-    const bucket = bucketFor(key);
-    noteRunUsed(bucket, runId);
+  /** 快路径的本体；`trackRun` 为 false 时（subagent 池）不把 run 记进桶的 `runs`。 */
+  const tryAdmitIn = (
+    bucket: Bucket,
+    runId: string,
+    trackRun: boolean,
+  ): ModelRequestAdmissionTicket | undefined => {
+    if (trackRun) noteRunUsed(bucket, runId);
     fanOut(bucket, bucket.controller.observe(now()));
     if (waiterCount(bucket) > 0 || !bucket.controller.canAdmit(now())) return undefined;
     return grant(bucket, runId);
   };
 
-  const admit: WorkflowConcurrencyPort["admit"] = (runId, key, signal) => {
-    const bucket = bucketFor(key);
+  /** 排队的本体；`trackRun` 同上。 */
+  const admitIn = (
+    bucket: Bucket,
+    runId: string,
+    signal: AbortSignal,
+    trackRun: boolean,
+  ): Promise<ModelRequestAdmissionTicket> => {
     if (signal.aborted) return Promise.reject(abortedError(signal));
-    noteRunUsed(bucket, runId);
+    if (trackRun) noteRunUsed(bucket, runId);
     return new Promise<ModelRequestAdmissionTicket>((resolve, reject) => {
       const waiter: Waiter = { runId, resolve, reject, signal, onAbort: () => {} };
       waiter.onAbort = () => {
@@ -374,6 +405,12 @@ export function createWorkflowConcurrencyGovernor(
       drain(bucket);
     });
   };
+
+  const tryAdmit: WorkflowConcurrencyPort["tryAdmit"] = (runId, key) =>
+    tryAdmitIn(bucketFor(key), runId, true);
+
+  const admit: WorkflowConcurrencyPort["admit"] = (runId, key, signal) =>
+    admitIn(bucketFor(key), runId, signal, true);
 
   const subscribe: WorkflowConcurrencyPort["subscribe"] = (runId, listener) => {
     const set = listeners.get(runId) ?? new Set();
@@ -407,6 +444,19 @@ export function createWorkflowConcurrencyGovernor(
       Promise.resolve(grant(bucketFor(workflowConcurrencyKey(model)), OBSERVER_RUN_ID)),
   };
 
+  // 修复原因：subagent 曾继承父的 observer，一轮并行十个 Agent 调用就是十路既不排队也不看
+  // Retry-After 的请求，各自退避重试——线上 1302 的最大来源（2026-10-20 抽样占 46%），还连带把
+  // workflow 和用户自己的 turn 一起拒掉。subagent 是委派出去的工作，和 workflow subagent 同类，
+  // 所以过同一道闸门；用户自己的 turn 仍是 observer。
+  const sessionSubagents = (parentSessionId: string): ModelRequestAdmission => {
+    const runId = `${SESSION_SUBAGENTS_RUN_PREFIX}${parentSessionId}`;
+    return {
+      tryAcquire: ({ model }) => tryAdmitIn(bucketFor(workflowConcurrencyKey(model)), runId, false),
+      acquire: ({ model, signal }) =>
+        admitIn(bucketFor(workflowConcurrencyKey(model)), runId, signal ?? NEVER_ABORTED, false),
+    };
+  };
+
   return {
     tryAdmit,
     admit,
@@ -414,10 +464,29 @@ export function createWorkflowConcurrencyGovernor(
     setRunBound,
     clearRunBound,
     observer: () => observerAdmission,
+    sessionSubagents,
     snapshot(key) {
       return buckets.get(key)?.controller.snapshot();
     },
   };
+}
+
+/**
+ * 不可重试的失败是否落在 workflow 策略表的 Stop 集里（docs/dynamic-workflow/concurrency.md
+ * 「Retry budget and the model-error policy」）。runner 与 driver 读的是同一个函数，三层对 Stop 集的
+ * 判断不会分叉；缺 `errorCode` 时按通用请求失败读，配额判定只看业务码。
+ */
+function isWorkflowStopFailure(event: ModelRequestFailedStatusEvent): boolean {
+  return (
+    resolveWorkflowModelFailurePolicy(
+      {
+        code: event.errorCode ?? ModelErrorCode.ModelRequestFailed,
+        reason: event.reason,
+        retryable: event.retryable,
+      },
+      event.providerErrorCode,
+    ).decision === "stop"
+  );
 }
 
 function abortedError(signal: AbortSignal): Error {

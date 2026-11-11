@@ -54,12 +54,6 @@ describe("formatTaskNotification（local_workflow）：三终态词", () => {
     expect(text).not.toContain("resumable as-is");
   });
 
-  it("stopped(model)：你自己 TaskStop 停的", () => {
-    const text = formatTaskNotification({ ...BASE, runStatus: "stopped", stopReason: "model" });
-    expect(text).toContain("<stop-reason>model</stop-reason>");
-    expect(text).toContain("You stopped this workflow with TaskStop.");
-  });
-
   it("stopped(interrupted)：指引直接给出 ResumeWorkflowRun 与 run_id", () => {
     const text = formatTaskNotification({
       ...BASE,
@@ -95,6 +89,30 @@ describe("formatTaskNotification（local_workflow）：三终态词", () => {
     expect(text).toContain("A provider-side error stopped this run");
     expect(text).toContain("resolve the cause with the user before calling ResumeWorkflowRun");
     expect(text).toContain("Do not rebuild the workflow.");
+  });
+
+  it("stopped(provider) 且是带重置时刻的额度停止：指引说会自动续跑，不要抢先 resume", () => {
+    const text = formatTaskNotification({
+      ...BASE,
+      runStatus: "stopped",
+      stopReason: "provider",
+      failure: providerStop({
+        kind: "quota",
+        reason: "rate_limited",
+        providerCode: "1308",
+        resetAt: Date.UTC(2026, 9, 19, 12),
+      }),
+    });
+    expect(text).toContain("The run resumes by itself after the usage cap resets");
+    expect(text).not.toContain("resolve the cause with the user before calling ResumeWorkflowRun");
+    // 没有重置时刻的额度停止（如欠费 1005）照旧：先和用户解决。
+    const noReset = formatTaskNotification({
+      ...BASE,
+      runStatus: "stopped",
+      stopReason: "provider",
+      failure: providerStop({ kind: "quota", reason: "invalid_request", providerCode: "1005" }),
+    });
+    expect(noReset).toContain("resolve the cause with the user before calling ResumeWorkflowRun");
   });
 
   it("errored：指引指向 AmendWorkflow，并明说 ResumeWorkflowRun 会拒绝", () => {
@@ -158,8 +176,10 @@ describe("formatTaskNotification（local_workflow）：三终态词", () => {
     );
   });
 
-  it("stopped(model) 不带 scriptPath：那一句不出现，其余逐字节不变", () => {
+  it("stopped(model) 不带 scriptPath：说明由模型停止、下次直接修订，不给文件路径", () => {
     const text = formatTaskNotification({ ...BASE, runStatus: "stopped", stopReason: "model" });
+    expect(text).toContain("<stop-reason>model</stop-reason>");
+    expect(text).toContain("You stopped this workflow with TaskStop.");
     expect(text).toContain(
       "(Next time, amend the running run directly: AmendWorkflow stops it for you.)",
     );
@@ -235,8 +255,10 @@ describe("formatWorkflowProviderStopError：按 kind 的文案表", () => {
       kind: "quota",
       first:
         /BigModel reports the user's usage cap is reached \(code 1308\); it resets at 2026-09-13T12:00:00\.000Z\./,
+      // 有重置时刻的额度停止会自动续跑（bootstrap 的 dynamic-workflow-quota-resume.ts）：
+      // 主代理该做的是告诉用户、别抢先 Resume。
       second:
-        /Tell the user; after the reset, call ResumeWorkflowRun with run_id="dwfrun-1"\. Do not rebuild the workflow\./,
+        /ZCode resumes this run by itself a minute after the reset, while this session is open or the next time it is opened\. Tell the user; do not call ResumeWorkflowRun before the reset, and do not rebuild the workflow\./,
       extra: { providerCode: "1308", reason: "rate_limited", resetAt: Date.UTC(2026, 8, 13, 12) },
     },
     {

@@ -1,8 +1,43 @@
 # Bots E2E Coverage Matrix
 
+2026-11-10：`bots/delivery/bot-large-attachment.test.ts` 已人工复核并转正，独立夹具与默认回放
+均为 12/12 通过。产物见[转正清单](e2e-business-scenarios.md#2026-11-10-人工复核与转正回放)；
+沿用合成平台及任务服务边界，不代表真实聊天平台投递验收。
+
+## BOT-E2E-AT-01：文件与富文本附件提交
+
+- Spec：`packages/desktop/test/e2e/bots/delivery/bot-large-attachment.test.ts`。
+- Fixture：`packages/desktop/test/e2e/fixtures/bots/large-attachment.json`。
+- 范围：Feishu/Lark × 私聊/群聊，6 MiB 独立文件及 3/6 MiB 富文本文件的原生回调、下载、缓存字节与任务提交；另验下载失败仍拒绝。
+- 运行：2026-11-06 macOS WDIO 12/12 通过，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261106110622857-p85529-6eec272f382c8978`。Node 执行同一 spec 也为 12/12 通过。
+- 回归证据：修改前四个 6 MiB 独立文件场景均返回 5MB 超限；补上富文本场景后，修改前八个 post 场景均未发起附件下载。两处修复后，文件内容、缓存与提交断言全部通过。
+- 检查：根 typecheck、Desktop typecheck:e2e、lint（0 errors，671 项既有 warnings）、architecture 和改动代码格式检查通过。受影响工程测试选择器选中 0/232，未执行工程测试。
+- 状态：covered（合成平台/任务服务边界），保留 manual-review pending。未验证真实租户重发、CLI 实际读取、手机、Windows/Linux；不将 WDIO 启动桌面等同于上述链路通过。首轮 capture 缺少模型入口配置，在业务断言前失败；显式 replay 后通过。
+
+> `retired:` 逐处标记已退役 App 单测，仅供追溯；原通过记录不代表现行覆盖。独立断言缺口需由后续验收补齐。
+
+> 2026-10-26：App 业务单测已按[测试规格](unit-test-quality.md)退役。本文中的相关单测路径和历史通过记录不再代表现行覆盖；CLI/CUA、工程测试、E2E 与浏览器验收证据仍按各自状态解释。未补验收的场景不得自动视为已覆盖。
+
+## 2026-10-21 默认渠道工具暂停
+
+ReplyToChannel 默认注册和发送接线注释停用，MN-02/FN-01 组合 E2E 暂时跳过；
+原用例及 fixture 完整保留，待插件接入后恢复。窗口发送接线用例同样保留并暂时跳过，
+新增断言确认默认 relay 不调用 Bot 发送服务。权限、协议和发送实现的独立测试继续执行。
+TP-04 的身份断言改读有序分工材料，不再依赖发送用 refId 或工具指引。
+下方默认工具发送通过记录仅为历史证据，不计为本次覆盖。
+
+## 2026-10-19 人工复核通过项
+
+7 个 Bot spec 已完成独立 fixture 和默认正式回放，保留正式目录；`bot-deleted-task-recovery` 已修正文件路径，但未完成修复后回放，先保留 pending。
+本轮状态与逐文件证据见[批量清单](./conversation-session-e2e-coverage-matrix.md#2026-10-19-人审通过项迁移清单)。
+`feishu-group-draft-mode` 的业务缺陷继续保留 pending；本轮未改 Bot 业务实现。
+
+BOT-E2E-DT-01 首轮正式回放在读取 fixture 时报告 `ENOENT`，尚未进入业务断言。
+迁移到正式目录后，相对文件路径应同步减少两层；保留原 fixture 和删除恢复、重复投递断言，修正后重新验证。
+
 ## MN-01 / MN-03 转正（2026-10-08）
 
-用户确认将 Feishu/Lark × 群/话题 4 项用例转正，正式入口为 `bots/feishu-channel-mention.test.ts`。
+用户确认将 Feishu/Lark × 群/话题 4 项用例转正，正式入口为 `bots/channels/feishu-channel-mention.test.ts`。
 沿用 Bot 域 `fixtures/bots/feishu-channel-mention.json` 的 synthetic/fast-text 合同，覆盖原生
 提及、包含匹配、多目标、澄清零发送、幂等及普通群机器人原生 @ 回调。无真实模型请求，
 平台 HTTP 在 case 内记录并断言；不将合成环境转正等同于真实租户或手机验证。
@@ -26,7 +61,6 @@
 - 根 typecheck、E2E typecheck、lint（67 项既有警告）、架构门禁、话题 fixture checker 通过。
 - 平台与模型网络为替身；真实租户机器人事件权限及 live 通知仍需验证。群启用消息已补充 include_bot 权限说明。
 - 未更改桌面 continuous、手机 replayable、远程工作区身份隔离、投递 owner 或输入队列；未实测手机及 Windows/Linux。
-
 
 ## MN-03 按名字解析原生提及（2026-10-08）
 
@@ -60,10 +94,10 @@ TP-01 now covers topic start-now admission and original-message presentation thr
 
 ## Topic collaboration (in progress)
 
-| Case          | Status  | Evidence boundary                                                                                                                                                 |
-| ------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| BOT-E2E-TP-01 | pending | `bots/manual-review/pending/feishu-topic-runtime.test.ts`; real Host/CLI and DOM, synthetic topic batch/materials; reuses group-runtime controlled-stream fixture |
-| BOT-E2E-TP-02 | pending | partial native verification: ordinary/dedicated routing, incremental history, long-background summary; remaining native cases below                               |
+| Case          | Status  | Evidence boundary                                                                                                                           |
+| ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| BOT-E2E-TP-01 | pending | `bots/channels/feishu-topic-runtime.test.ts`; real Host/CLI and DOM, synthetic topic batch/materials; reuses group-runtime controlled-stream fixture |
+| BOT-E2E-TP-02 | pending | partial native verification: ordinary/dedicated routing, incremental history, long-background summary; remaining native cases below         |
 
 Provider/service/Agent unit tests cover topic isolation, owner opt-in, message
 boundaries, bounded summary and native API payloads. They do not establish real
@@ -137,7 +171,7 @@ card-control scenarios, Lark, physical mobile remote control and
 Windows/Linux remain unverified. TP-02 stays pending.
 
 The 2026-09-08 evidence-update pre-push attempt stopped with `ENOSPC` while loading
-`zcodeAgentService.v4.test.ts` (22 files / 339 tests passed before the failed suite;
+`retired:packages/services/test/zcodeAgentService.v4.test.ts` (22 files / 339 tests passed before the failed suite;（retired: 为退役历史证据，不计现行覆盖。）
 no tests ran in that suite). Only about 159 MiB remained on the system volume.
 This is an environment failure, not a passing gate or a confirmed implementation
 regression. After disk space recovered to 12 GiB, the complete
@@ -191,31 +225,31 @@ cross-platform cases are still pending; the broader TP-02 case is not promoted.
 
 | Case ID       | Priority | Status | Spec                                                                     | Timing             | Setup / Action / Assertion                                                                                                                |
 | ------------- | -------- | ------ | ------------------------------------------------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| BOT-E2E-SC-01 | P0       | formal | `packages/desktop/test/e2e/bots/feishu-streaming-card-lifecycle.test.ts` | controlled-stream  | Feishu callback 建 task；注入分阶段 stream；断言单卡、时间线、折叠、Typing 与 continuous 订阅                                             |
-| BOT-E2E-AQ-01 | P1       | formal | `packages/desktop/test/e2e/bots/feishu-provider-interactions.test.ts`    | controlled-stream  | pending elicitation；多选/自定义 callback；同一 message_id 原地更新并提交协议响应                                                         |
-| BOT-E2E-IL-01 | P0       | formal | `packages/desktop/test/e2e/bots/feishu-provider-interactions.test.ts`    | controlled-stream  | 阻塞前主卡封口；交互卡推进/终态保留；后续 Agent 输出另起流式卡                                                                            |
-| BOT-E2E-RT-01 | P1       | formal | `packages/desktop/test/e2e/bots/bot-runtime-authority.test.ts`           | controlled-process | owner 持锁；contender 被拒绝；owner 释放后 takeover                                                                                       |
-| BOT-E2E-RT-02 | P0       | formal | `packages/desktop/test/e2e/bots/bot-runtime-authority.test.ts`           | fast-process       | attached remote host；runtime 保持 idle；无 provider 网络请求                                                                             |
-| BOT-E2E-PV-01 | P1       | formal | `packages/desktop/test/e2e/bots/feishu-provider-interactions.test.ts`    | fast-text          | Feishu/Lark 相同 callback；断言各自 OpenAPI origin                                                                                        |
-| BOT-E2E-RW-01 | P0       | formal | `packages/desktop/test/e2e/bots/bot-remote-disconnected.test.ts`         | controlled-stream  | remote workspace disconnected；普通消息被拒绝；不 reconnect、不解析远端 service、不本地执行                                               |
-| BOT-E2E-CR-01 | P0       | formal | `packages/desktop/test/e2e/bots/bot-automation-result-delivery.test.ts`  | controlled-stream  | Feishu 创建 automation；重开 repo；先订阅后派发；complete/error 回推；失效 Bot 降级；Weixin provider 出站由 service integration test 覆盖 |
-| BOT-E2E-CF-01 | P0       | formal | `packages/desktop/test/e2e/bots/feishu-runtime-error-ui.test.ts`         | controlled-process | 已绑定 Feishu 缺少 credential；启用 runtime；重开机器人弹窗并断言绑定保留、连接中断与错误详情                                             |
+| BOT-E2E-SC-01 | P0       | formal | `packages/desktop/test/e2e/bots/delivery/feishu-streaming-card-lifecycle.test.ts` | controlled-stream  | Feishu callback 建 task；注入分阶段 stream；断言单卡、时间线、折叠、Typing 与 continuous 订阅                                             |
+| BOT-E2E-AQ-01 | P1       | formal | `packages/desktop/test/e2e/bots/channels/feishu-provider-interactions.test.ts`    | controlled-stream  | pending elicitation；多选/自定义 callback；同一 message_id 原地更新并提交协议响应                                                         |
+| BOT-E2E-IL-01 | P0       | formal | `packages/desktop/test/e2e/bots/channels/feishu-provider-interactions.test.ts`    | controlled-stream  | 阻塞前主卡封口；交互卡推进/终态保留；后续 Agent 输出另起流式卡                                                                            |
+| BOT-E2E-RT-01 | P1       | formal | `packages/desktop/test/e2e/bots/runtime/bot-runtime-authority.test.ts`           | controlled-process | owner 持锁；contender 被拒绝；owner 释放后 takeover                                                                                       |
+| BOT-E2E-RT-02 | P0       | formal | `packages/desktop/test/e2e/bots/runtime/bot-runtime-authority.test.ts`           | fast-process       | attached remote host；runtime 保持 idle；无 provider 网络请求                                                                             |
+| BOT-E2E-PV-01 | P1       | formal | `packages/desktop/test/e2e/bots/channels/feishu-provider-interactions.test.ts`    | fast-text          | Feishu/Lark 相同 callback；断言各自 OpenAPI origin                                                                                        |
+| BOT-E2E-RW-01 | P0       | formal | `packages/desktop/test/e2e/bots/runtime/bot-remote-disconnected.test.ts`         | controlled-stream  | remote workspace disconnected；普通消息被拒绝；不 reconnect、不解析远端 service、不本地执行                                               |
+| BOT-E2E-CR-01 | P0       | formal | `packages/desktop/test/e2e/bots/delivery/bot-automation-result-delivery.test.ts`  | controlled-stream  | Feishu 创建 automation；重开 repo；先订阅后派发；complete/error 回推；失效 Bot 降级；Weixin provider 出站由 service integration test 覆盖 |
+| BOT-E2E-CF-01 | P0       | formal | `packages/desktop/test/e2e/bots/runtime/feishu-runtime-error-ui.test.ts`         | controlled-process | 已绑定 Feishu 缺少 credential；启用 runtime；重开机器人弹窗并断言绑定保留、连接中断与错误详情                                             |
 
 ## Fixture 合同
 
-BOT-E2E-SR87 位于 `bots/manual-review/pending/bot-effective-selection.test.ts`；synthetic、fast-text。验证菜单/首次派发使用同一有效选择，且查看菜单和无效提交不改原意图。Todo99 追加 BOT-E2E-SR99：绑定后从 Session 原选择解析下一次空闲输入，不重解释已固定执行。共用该 pending spec，未晋级；conversation W99-E03/E06 另在 Pro 验证 Bot→生产 Task adapter→实际 Worker 请求、完整 setter 与冷恢复。证据不覆盖真实 IM 网络或手机/SSH 联合环境。
+BOT-E2E-SR87 位于 `bots/runtime/bot-effective-selection.test.ts`；synthetic、fast-text。验证菜单/首次派发使用同一有效选择，且查看菜单和无效提交不改原意图。Todo99 追加 BOT-E2E-SR99：绑定后从 Session 原选择解析下一次空闲输入，不重解释已固定执行。共用该 pending spec，未晋级；conversation W99-E03/E06 另在 Pro 验证 Bot→生产 Task adapter→实际 Worker 请求、完整 setter 与冷恢复。证据不覆盖真实 IM 网络或手机/SSH 联合环境。
 
 - `feishu-streaming-card-lifecycle.json` 是 case-local synthetic stream fixture。
 - 其余 5 个用例分别使用 `fixtures/bots/` 下同语义命名的 case-local synthetic metadata；所有 fixture 都声明 `syntheticReason` 与 timing 分类。
 - 分类为 `synthetic`，原因：外部 provider replay 只能提供模型 SSE，不能稳定控制 Bot 消费 task event 的逐步观察窗口；该夹具明确生成确定性的 ZCode stream events。
 - Mock Feishu API 必须记录请求而不是只返回成功，以请求次数、URL、method、reaction id 和 Card JSON 作为证据。
-- `bot-automation-result-delivery` 记录 mock Feishu 请求，并用受控 task stream 证明 scheduler 监听早于 prompt 派发；不允许用固定 sleep 代替事件闸门。Weixin `/sendmessage` 由 `packages/services/test/botsService.messageFlow.test.ts` 的共享 watcher/provider service integration test 覆盖，不虚报为 Desktop E2E。
+- `bot-automation-result-delivery` 记录 mock Feishu 请求，并用受控 task stream 证明 scheduler 监听早于 prompt 派发；不允许用固定 sleep 代替事件闸门。Weixin `/sendmessage` 由 `retired:packages/services/test/botsService.messageFlow.test.ts` 的共享 watcher/provider service integration test 覆盖，不虚报为 Desktop E2E。（retired: 为退役历史证据，不计现行覆盖。）
 - 用例已通过人工 review 并移出 `manual-review/pending/`；Bot 域当前没有独立 Docker preset，默认 Desktop WDIO 是正式执行入口。
 - CF-01 使用 case-local synthetic metadata；缺失 credential 只用于确定性触发 runtime error，`syntheticReason` 必须说明它替代真实飞书故障注入；该用例已通过 Desktop 人工验收。
 
 ## BOT-E2E-DT-01 已删除任务自动新建（ZCT-2096089929570893824）
 
-- Status: pending；用例 `packages/desktop/test/e2e/bots/manual-review/pending/bot-deleted-task-recovery.test.ts`。
+- Status: pending；用例 `packages/desktop/test/e2e/bots/runtime/bot-deleted-task-recovery.test.ts`。
 - Setup: 已绑定 Feishu Bot 指向删除 tombstone 中的旧 task，保留旧交互状态；mock provider 记录通知请求。
 - Action: 普通消息进入 provider callback，随后重投相同 message id。
 - Assert: 不恢复旧 task；同工作区只新建并绑定一个 task；清理旧交互；一次提示说明已删除、新建和上下文不继承；只派发一次原消息；Desktop created 广播指向新 task；订阅仍为 bot-channel-continuous。
@@ -231,13 +265,17 @@ Todo103 补充验收：DT-01 的替代任务使用当前 Model Selection View �
 等待后台连接状态投影，不依赖关闭重开来刷新，用于验证新增可见期串行状态轮询。
 下方 2026-09-07 记录是固定 staging 历史证据；本轮运行结果另记 Todo103 账本。
 
-- Status: pending. Spec: `packages/desktop/test/e2e/bots/manual-review/pending/feishu-delivery-error.test.ts`.
+- Status: pending. Spec: `packages/desktop/test/e2e/bots/delivery/feishu-delivery-error.test.ts`.
 - Setup: bound private Feishu bot; synthetic HTTP business failure with code/msg/log_id.
 - Action: private command reply fails, then a subsequent reply succeeds; group input is rejected.
 - Assert: status exposes deliveryError without misreporting a WebSocket failure; error clears after successful delivery; private outbound uses open_id; group creates no task.
 - Evidence: service/provider HTTP and status projection; UI rendering is separately unit-tested. No claim of live Feishu tenant reproduction, mobile device validation, or DOM end-to-end coverage.
 
 DF-01 verification (2026-09-07): macOS Desktop WDIO passed (`desktop-e2e-20260907040958265-p60496-c535b8967f7e59a1`). HTTP 200/400 business failures, body/header log ID, update rejection, streaming circuit status, and localized error rendering are covered by 124 passing unit tests. Typecheck, Desktop E2E typecheck, and lint passed (43 warnings, 0 errors). Pending case is not promoted. Live Feishu, Windows/Linux, mobile devices, and delivery-failure DOM interaction remain unverified; existing connection-error DOM regression CF-01 passed in macOS Desktop WDIO.
+
+## R3 Bot 身份回归（A3）
+
+`BOT-E2E-RW-02`：pending；Host resolver + Bot bridge + Main 精确路由合同与 Bot service synthetic 场景。覆盖 stable/legacy、同路径跨 Source、权限 key、runtime 换代。执行证据见 `packages/desktop/.e2e-artifacts/bot-identity-fix-20260916/`；不包含真实第三方消息投递和手机 relay。
 
 ## Group collaboration additions
 
@@ -250,7 +288,7 @@ DF-01 verification (2026-09-07): macOS Desktop WDIO passed (`desktop-e2e-2026090
 
 Cases remain pending manual review; automated execution evidence is recorded below, without promotion. Continuous Desktop, replayable mobile and independent Bot subscriptions keep their existing delivery boundaries.
 
-2026-09-07 GR-01 provider/service evidence: macOS Desktop WDIO passed both Feishu and Lark cases in `desktop-e2e-20260907080816019-p64763-2c57d53b14b98617`. Pending spec `bots/manual-review/pending/feishu-group-collaboration.test.ts` uses synthetic provider HTTP and controlled task admission; it verifies group routing, independent tasks, owner-only activation/new, exact mention filtering, event deduplication, source metadata and post-admission reactions. Real CLI FIFO and renderer evidence remain separate required checks; no promotion or live tenant validation is claimed.
+2026-09-07 GR-01 provider/service evidence: macOS Desktop WDIO passed both Feishu and Lark cases in `desktop-e2e-20260907080816019-p64763-2c57d53b14b98617`. Pending spec `bots/channels/feishu-group-collaboration.test.ts` uses synthetic provider HTTP and controlled task admission; it verifies group routing, independent tasks, owner-only activation/new, exact mention filtering, event deduplication, source metadata and post-admission reactions. Real CLI FIFO and renderer evidence remain separate required checks; no promotion or live tenant validation is claimed.
 
 GR-02/04 runtime evidence will use the existing E2E-only `window.__testActions` bridge to submit a group message through the real Host BotsService into the real CLI, while Desktop renders its canonical queue. Synthetic bot configuration/group association is seeded only in the isolated E2E data directory; no live bot credentials or tenant messages are used. The bridge remains gated by `shouldExposeE2EStoreBridge` in production builds.
 
@@ -526,7 +564,7 @@ separate on the server.
 TP-01 passed again with the cold-subscription fix in
 `desktop-e2e-20260908031650082-p95172-4bf16d8330951c84` (one case, one spec).
 The final three unit suites passed 212 tests. A broad pre-push run had one unrelated
-20 ms timing assertion fail in `v4SessionPaneModelSwitchRecovery.test.ts`, with
+20 ms timing assertion fail in `retired:packages/ui/test/v4SessionPaneModelSwitchRecovery.test.ts`, with（retired: 为退役历史证据，不计现行覆盖。）
 9,818 tests passing; its isolated rerun passed all 53 tests. The full `pnpm verify:pre-push` rerun passed before commit. Native Lark, mobile Web and other OS coverage remain
 unverified for this correction; earlier platform coverage is not relabelled.
 
@@ -632,7 +670,7 @@ worker heap exhaustion; both files passed in isolation (79 tests). The full
 
 继续发送 /stop 前 Mac 锁屏，Computer Use 返回无法自动解锁；未将尚未确认发送的停止命令记为成功。历史文件下载、最终字段回复及最终表情归属仍需解锁并重启新代码后重测，不能用单测或先前 Host 下载哈希验证替代端到端结果。
 
-本地检查：当前资源桥、资源授权、附件上传与 task adapter 共 122 条测试通过，根目录 typecheck、lint 通过（lint 43 个 warning）。本轮完整 pre-push 曾在 `subagentsSection.test.ts` 的保存后刷新失败场景失败，单独重跑该场景通过，尚未取得新一轮完整 pre-push 成功。扩展 Agent 全量测试仍有 CUA、文件行数及外部 conformance 路径等失败；未宣称全量通过。当前修改暂未提交，远程 Host 转发、真实手机和 Lark 仍待验证／实现。
+本地检查：当前资源桥、资源授权、附件上传与 task adapter 共 122 条测试通过，根目录 typecheck、lint 通过（lint 43 个 warning）。本轮完整 pre-push 曾在 `retired:packages/ui/test/subagentsSection.test.ts` 的保存后刷新失败场景失败，单独重跑该场景通过，尚未取得新一轮完整 pre-push 成功。扩展 Agent 全量测试仍有 CUA、文件行数及外部 conformance 路径等失败；未宣称全量通过。当前修改暂未提交，远程 Host 转发、真实手机和 Lark 仍待验证／实现。（retired: 为退役历史证据，不计现行覆盖。）
 
 ### 2026-09-08 后续代码与受控远程链路检查
 
@@ -646,7 +684,7 @@ worker heap exhaustion; both files passed in isolation (79 tests). The full
 
 ### BOT-E2E-TP-03 话题交互卡（pending）
 
-- 用例：`bots/manual-review/pending/feishu-topic-interactions.test.ts`，case-local synthetic metadata。
+- 用例：`bots/channels/feishu-topic-interactions.test.ts`，case-local synthetic metadata。
 - Setup：启用群并提交话题输入，使用受控 task service 与记录式 Feishu/Lark HTTP。
 - Action：发出权限与普通问答事件。
 - Assert：卡片只 POST 原话题根消息的 reply，携带 reply_in_thread；回调保留群、话题、任务和授权版本。
@@ -676,7 +714,7 @@ pnpm dev:desktop。修复后原生读取、返回文件内容及最终表情仍�
 
 ### Standalone Core WebSocket resource routing regression
 
-`coreHttp.test.ts` now exercises two real loopback WebSocket Desktop peers through
+`retired:packages/zcode-server-cli/test/coreHttp.test.ts` now exercises two real loopback WebSocket Desktop peers through（retired: 为退役历史证据，不计现行覆盖。）
 capability-authenticated `/ws/host`. Reverse requests reach only the matching
 workspaceIdentity + remoteSessionId; closing one peer removes only that route. A normal
 `/ws` connection does not attach a private resource peer. All 7 Core HTTP tests passed.
@@ -732,7 +770,7 @@ Desktop 与手机远控分别验证（窄 Desktop 不代替手机）；窄屏机
 ## BOT-UI-TP-PREPARATION：准备态消息气泡
 
 - 候选：`packages/ui/test/browser/manual-review/pending/topic-preparation.test.mjs`，同目录 case-local fixture。
-- 单测：`packages/ui/test/v4BotTopicPreparation.test.ts`；覆盖原始消息 ID 去重、合批 ID、同正文不同 ID 保留、空白正文无气泡、来源行加载图标及 hover/focus tooltip。
+- 单测：`retired:packages/ui/test/v4BotTopicPreparation.test.ts`；覆盖原始消息 ID 去重、合批 ID、同正文不同 ID 保留、空白正文无气泡、来源行加载图标及 hover/focus tooltip。（retired: 为退役历史证据，不计现行覆盖。）
 - 浏览器：桌面/手机宽度 × 中英文 × 深浅主题，真实组件和样式；准备、等待、失败移除及接收重叠；正文沿用正式消息折叠/展开，loading 位于渠道/姓名旁。
 - 真实 Desktop/手机远控/飞书 E2E 待验证，不将窄屏 Chrome 计为真实手机验收。
 
@@ -746,15 +784,30 @@ Desktop 与手机远控分别验证（窄 Desktop 不代替手机）；窄屏机
 
 ## 单聊持续回传
 
-| Case          | 状态    | 用例                                                                                 | 证据边界                                                                                   |
-| ------------- | ------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| BOT-E2E-PS-01 | pending | `packages/desktop/test/e2e/bots/manual-review/pending/bot-private-task-sync.test.ts` | controlled-stream，三渠道出站 HTTP、连续 desktop/mobile 来源轮次与停用；真实 IM/手机未验证 |
+| Case          | 状态    | 用例                                                           | 证据边界                                                                                   |
+| ------------- | ------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| BOT-E2E-PS-01 | pending | `packages/desktop/test/e2e/bots/delivery/bot-private-task-sync.test.ts` | controlled-stream，三渠道出站 HTTP、连续 desktop/mobile 来源轮次与停用；真实 IM/手机未验证；三渠道私聊输入的命令信封 clientId 均为 `bot:<botId>:<chatId>:<userId>`（CLI 据此不对 IM 用户声明设计模式），去掉该字段变红 `desktop-e2e-20261104075020271-p67472-2346b7cc39b45101`，恢复后绿 `desktop-e2e-20261104075146936-p69418-40b2f88dd72d2984` |
+| BOT-E2E-RW-03 | pending | `packages/desktop/test/e2e/conversation-session/remote/configuration/manual-review/pending/conversation-session-r3-bot-private-client-id.test.ts` | SSH 远端（`harness/remote/run-local-docker.mjs`，队列 `r3-server-qa-botprivateclientid`）：Telegram 私聊经本机 Host Bot 服务投到远端任务，命令信封 clientId 为 `bot:<botId>:<chatId>:<userId>`（`formatBotInputClientId`），远端 CLI 执行该轮、远端输入账本记下 bot 形状 clientId，不被 terminal-client clientId 一致性检查拒绝；passed `local-docker-20261104090411-72d33e`。用例经 `__testActions.sendBotMessage` 输入前先切回本地 tab（测试入口按当前 workspace 取服务）。 |
 
 服务补充：多目标共享订阅、自动任务去重、微信 token 更新/重启读取/显式重试、换绑隔离。UI 补充：重试按钮仅显式触发、发送中禁用、成功隐藏及错误可见。均不替代真实渠道人工验收。
 
+## 私聊重投与轮询退避
+
+| Case          | 状态   | 用例                                                                       | 证据边界                                                                                          |
+| ------------- | ------ | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| BOT-E2E-RD-01 | formal | `packages/desktop/test/e2e/bots/delivery/bot-private-redelivery.test.ts`   | 三渠道私聊重投复用 commandId；duplicate 后空闲收口、运行中不误停；附件保留随机 ID；未运行真实 CLI |
+| BOT-E2E-RD-02 | formal | `packages/desktop/test/e2e/bots/runtime/bot-polling-retry-backoff.test.ts` | 微信/Telegram 失败日志与退避递增；成功提交后清零；退避中 dispose 立即返回；未验证真实渠道网络     |
+
+- 运行：2026-11-10 macOS WDIO。manual-review 阶段 5/5 通过，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-093041-172`；rebase 到 staging `58b809c7b7` 后重新构建再跑 5/5 通过，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-095047-489`。manual-review 默认 capture 缺少模型入口，会在 root hook 失败；这两个用例不调用模型，当时改用显式 replay（`E2E_PROVIDER_REPLAY_FIXTURE_PATH=…/fixtures/upstream/common.json`）。转正后在正式路径按默认模式（不设 replay 变量）运行 5/5 通过，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-100558-858`。
+- 回归证据：撤掉 `packages/services/src/bots` 的修复后 5/5 失败，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-093358-861`。RD-01 中同一条消息两次得到不同的随机 UUID；RD-02 中第 2 次重试间隔仍为 5000ms。
+- 2026-11-10 评审 CR-01（duplicate 后 Typing 与运行状态残留）：扩展后 RD-01 7 项、RD-02 3 项，重新构建后 10/10 通过，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-111249-139`。撤掉本轮 services 改动（ACK 返回、duplicate 收口、附件随机 ID）后，3 个空闲重投用例因“没有向桌面广播 completed”失败，附件用例因“两次 ID 相同”失败，产物 `packages/desktop/.e2e-artifacts/desktop-e2e-20261110-111552-414`；3 个运行中重投用例修复前也通过，它们防止误停，不是缺陷复现。修复前的临时验证中，Telegram/微信在 duplicate 后每 4 秒继续发 Typing，飞书 reaction 不删，桌面只收到 `resumed`/`prompt_sent`。
+- 时序约束：Bot 自己发起的一轮未结束时，私聊新消息会被“任务运行中”拒绝，不会提交。RD-01 先结束首轮，再模拟重投；duplicate 收口以任务快照为准（`completed`/`error` 为空闲）。
+- 状态：formal，用户于 2026-11-10 确认转正；covered（任务服务替身与 runtime 依赖注入边界）。未验证真实 CLI 对同一 commandId 的 duplicate 回复、真实渠道重投、手机、Windows/Linux；未加入 Docker 准入集。
+- 状态：formal，用户于 2026-11-10 确认转正；covered（任务服务替身与 runtime 依赖注入边界）。未验证真实 CLI 对同一 commandId 的 duplicate 回复、真实渠道重投、手机、Windows/Linux；未加入 Docker 准入集。
+
 ## Native channel mention reply
 
-BOT-E2E-MN-01: `bots/feishu-channel-mention.test.ts`，
+BOT-E2E-MN-01: `bots/channels/feishu-channel-mention.test.ts`，
 synthetic service/provider 验证当前输入节点、正文原生 at、固定会话、幂等及未知目标拒绝。
 CLI 工具父消息绑定、协议与客户端节点显示分别由单测覆盖；真实飞书验证由用户进行。
 
@@ -771,15 +824,16 @@ CLI 工具契约、当前执行输入绑定、来源持久化、反向协议，�
 证据必须分别标记 service synthetic、真实 CLI、Desktop DOM、手机 replayable 与 live tenant；
 本轮证据如下，不沿用旧通过次数。没有重新开启重复成功回执修复。
 
+| Case                        | 当前证据                                                                                                                                              | 结论                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| MN-02 / FN-01               | `conversation-session-bot-channel-worker.test.ts`：真实 CLI 工具、反向 RPC、两次原生提及、无来源桌面续聊；真实 text delta 丢帧，终态仍完整回传一次    | passed，formal           |
+| TP-04 / TP-05               | `conversation-session-bot-topic-worker.test.ts`：收到真实流后自动停止，完成停止后才提交下一条；真实 ReadSessionContext 结果、落盘文件字节及跨任务拒绝 | passed，formal           |
+| GR-02 正常晋升 / PS-01      | `conversation-session-bot-continuous-worker.test.ts`：群排队自然晋升并引用正确消息；真实 IM 首轮及 desktop service 续聊各回传一次                     | passed，formal           |
+| GR-UI-01                    | `feishu-bound-groups-ui.test.ts`：Desktop 实际点击、RPC 保存、话题计数和其他群/机器人不变                                                             | passed，formal           |
+| TP-03                       | 飞书/Lark × 是否明确提及共四场景：可信消息边界、真实 run 来源、引用当前提问、审批 @ 管理员、问答按提及决定 @                                          | passed，pending          |
+| GR-02/04 旧 Desktop runtime | v3 状态文件、职业引导和新 Provider 分组夹具已更新；队列展示、取消、来源详情与已收到操作执行至通过；群草稿 `/mode yolo` 失败                           | failed，不算全 case 通过 |
 
-| Case | 当前证据 | 结论 |
-| --- | --- | --- |
-| MN-02 / FN-01 | `conversation-session-bot-channel-worker.test.ts`：真实 CLI 工具、反向 RPC、两次原生提及、无来源桌面续聊；真实 text delta 丢帧，终态仍完整回传一次 | passed，formal |
-| TP-04 / TP-05 | `conversation-session-bot-topic-worker.test.ts`：收到真实流后自动停止，完成停止后才提交下一条；真实 ReadSessionContext 结果、落盘文件字节及跨任务拒绝 | passed，formal |
-| GR-02 正常晋升 / PS-01 | `conversation-session-bot-continuous-worker.test.ts`：群排队自然晋升并引用正确消息；真实 IM 首轮及 desktop service 续聊各回传一次 | passed，formal |
-| GR-UI-01 | `feishu-bound-groups-ui.test.ts`：Desktop 实际点击、RPC 保存、话题计数和其他群/机器人不变 | passed，formal |
-| TP-03 | 飞书/Lark × 是否明确提及共四场景：可信消息边界、真实 run 来源、引用当前提问、审批 @ 管理员、问答按提及决定 @ | passed，pending |
-| GR-02/04 旧 Desktop runtime | v3 状态文件、职业引导和新 Provider 分组夹具已更新；队列展示、取消、来源详情与已收到操作执行至通过；群草稿 `/mode yolo` 失败 | failed，不算全 case 通过 |
+2026-11-03 起 TP-05 改用 `ReadTopicResource` 下载历史话题资源（ReadSessionContext 已删除）。上表 TP-05 证据来自 2026-09-23 的 ReadSessionContext 运行，不代表新工具的运行结果。新工具的运行证据：`desktop-e2e-20261103013357670-p39238-6e019240fc443c4e` 中 `conversation-session-bot-topic-worker.test.ts` 2/2 通过，TP-05 的真实 ReadTopicResource 工具结果为 completed，Host 资源端口收到 1 次读取，托管文件内容与平台夹具一致。首轮 `desktop-e2e-20261103010238669-p10892-abb86846fee45c92` 失败于 tool not found：工具名被误放进动态工作流灰度名单，机器人会话关闭灰度时一并下架；已修复并补 core 回归。未验证：真实飞书、远端 Source Server、Windows/Linux。
 
 新 worker case 的实际路径为 `packages/desktop/test/e2e/conversation-session/manual-review/pending/`；
 其他候选在 `packages/desktop/test/e2e/bots/manual-review/pending/`。
@@ -800,7 +854,6 @@ checker 对结果 marker 的提示不代表输入匹配缺失，结果 marker �
 3. 实际手机 replayable、SSH、Windows/Linux、真实飞书/Lark 租户通知与另一机器人响应未验证。成功的 Node Host/CLI 测试不冒充 Electron UI，窄窗口不冒充手机。
 4. 初始验证时所有新增 case 保持 pending；随后用户确认转正，最终状态见下节。必要检查仍有失败，因此不自动 commit。
 
-
 GR-UI-01 最终隔离配置保留缺密钥的绑定引用，避免自动触发扫码注册；
 `desktop-e2e-20260923072504683-p46231-87bcca99bca1deb4` 中该项通过，截图可见两群开关与 2/0 话题数。
 TP-03 更新当前历史边界、从根引用改为当前消息引用，并补上真实入站字段 `mentionedBot` 与 run/input 来源；
@@ -814,10 +867,10 @@ TP-03 最终四场景在 `desktop-e2e-20260923073023766-p58398-07c97a81dceae606`
 
 用户确认后，四份新增 spec（六条测试）进入正式目录：
 
-- `conversation-session/conversation-session-bot-channel-worker.test.ts`
-- `conversation-session/conversation-session-bot-topic-worker.test.ts`
-- `conversation-session/conversation-session-bot-continuous-worker.test.ts`
-- `bots/feishu-bound-groups-ui.test.ts`
+- `conversation-session/session-control/conversation-session-bot-channel-worker.test.ts`
+- `conversation-session/session-control/conversation-session-bot-topic-worker.test.ts`
+- `conversation-session/session-control/conversation-session-bot-continuous-worker.test.ts`
+- `bots/channels/feishu-bound-groups-ui.test.ts`
 
 前三份采用独立 common + case-local 回放夹具；UI 用例使用隔离配置，无模型请求。已有 `/mode yolo` 失败用例仍保持 pending。此次没有 Docker 验证或 CI 准入，不代表真实飞书租户、手机或其他桌面系统验收。
 

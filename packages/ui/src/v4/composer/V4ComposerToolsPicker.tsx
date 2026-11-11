@@ -36,7 +36,7 @@ import {
   pluginToolSelectionId,
   type ComposerToolPickerEntry,
 } from "@/v4/composer/composerToolRecommendations.js";
-import { TID_V4_COMPOSER_INPUT } from "@zcode/shared";
+import { TID_V4_COMPOSER_INPUT } from "@zcode/shared/test-ids";
 import { isCoarseTouchDevice } from "@/lib/pickerFocus.js";
 
 export interface V4ComposerToolsPickerProps {

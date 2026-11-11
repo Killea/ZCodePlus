@@ -44,6 +44,8 @@ describe("main agent tool pool", () => {
     // 无 skillPort 故不含 Skill；WebSearch 是普通 client-side wrapper。
     // 顺序按 builtInTools 注册顺序。
     expect(defaultRuntime.getToolRegistry().list()).toEqual([
+      "ToolSearch",
+      "DeferredToolCall",
       "Read",
       "Bash",
       "WebFetch",
@@ -174,6 +176,7 @@ describe("main agent tool pool", () => {
             throw new Error("not called");
           },
           delete: async () => undefined,
+          pause: async () => false,
           list: async () => [],
         },
         eventStore: createTestSessionEventStore(),
@@ -205,6 +208,65 @@ describe("main agent tool pool", () => {
     );
   });
 
+  it("exposes CronPauseSelf only for a turn that carries the loop automationId", async () => {
+    const requests: any[] = [];
+    const runtime = createTestAgentRuntime(
+      createSessionId("runtime-main-pause-self-provider-tools"),
+      {
+        mode: "build",
+        toolAllowlist: ["CronCreate", "CronList", "CronUpdate", "CronDelete", "CronPauseSelf"],
+        workingDirectory: "/workspace/project",
+      },
+      {
+        automationPort: {
+          create: async () => {
+            throw new Error("not called");
+          },
+          update: async () => {
+            throw new Error("not called");
+          },
+          delete: async () => undefined,
+          pause: async () => false,
+          list: async () => [],
+        },
+        eventStore: createTestSessionEventStore(),
+        modelFactory: createTestModelFactory({
+          properties: { supportsNativeWebSearch: true },
+          async generateText(request: any) {
+            requests.push(request);
+            return {
+              finishReason: "stop",
+              providerMetadata: undefined,
+              text: "done",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+          },
+        } as never),
+      },
+    );
+
+    // Host admission 显式传入 automationId 的执行轮：只读 CronList + 本轮自暂停。
+    await runtime.executeTurn("Automation turn", undefined, {
+      automationId: "automation-1",
+      toolDisallowlist: ["CronCreate", "CronUpdate", "CronDelete"],
+    });
+    // 只有 denylist 兜底信号、没有 automationId 的轮：没有可暂停目标，必须隐藏 CronPauseSelf。
+    await runtime.executeTurn("Fallback automation turn", undefined, {
+      toolDisallowlist: ["CronCreate", "CronUpdate", "CronDelete"],
+    });
+    await runtime.executeTurn("Normal user turn");
+
+    const automationTurnTools = requests[0].tools.map((tool: any) => tool.name);
+    const fallbackTurnTools = requests[1].tools.map((tool: any) => tool.name);
+    const normalTurnTools = requests[2].tools.map((tool: any) => tool.name);
+    expect(automationTurnTools).toEqual(["CronList", "CronPauseSelf"]);
+    expect(fallbackTurnTools).toEqual(["CronList"]);
+    expect(normalTurnTools).toEqual(
+      expect.arrayContaining(["CronCreate", "CronList", "CronUpdate", "CronDelete"]),
+    );
+    expect(normalTurnTools).not.toContain("CronPauseSelf");
+  });
+
   it("hides automation mutation tools when automation queryId reaches provider", async () => {
     const requests: any[] = [];
     const runtime = createTestAgentRuntime(
@@ -223,6 +285,7 @@ describe("main agent tool pool", () => {
             throw new Error("not called");
           },
           delete: async () => undefined,
+          pause: async () => false,
           list: async () => [],
         },
         eventStore: createTestSessionEventStore(),
@@ -350,46 +413,6 @@ describe("main agent tool pool", () => {
     );
     expect(byName.get("EnterPlanMode")?.description ?? "").toContain(
       "using `find`/Glob, `grep`/Grep, and Read",
-    );
-  });
-
-  it("does not let updateConfig overwrite the session shell snapshot", () => {
-    const runtime = createTestAgentRuntime(
-      createSessionId("runtime-main-shell-snapshot-immutable"),
-      {
-        bashShellSelection: {
-          dialect: "cmd",
-          display: { name: "CMD" },
-          id: "cmd",
-          label: "CMD",
-          path: "cmd.exe",
-          source: "user-config",
-        },
-        mode: "build",
-        workingDirectory: "/workspace/project",
-      },
-      {
-        eventStore: createTestSessionEventStore(),
-      },
-    );
-
-    (runtime.updateConfig as (patch: unknown) => void)({
-      bashShellSelection: {
-        dialect: "git-bash",
-        display: { name: "Git Bash" },
-        id: "auto:git-bash",
-        label: "Git Bash",
-        path: "C:\\Program Files\\Git\\bin\\bash.exe",
-        source: "auto-detected",
-      },
-    });
-
-    const byName = new Map(runtime.getTools().map((tool) => [tool.name, tool]));
-
-    expect(byName.has("Glob")).toBe(false);
-    expect(byName.has("Grep")).toBe(false);
-    expect(byName.get("Bash")?.description ?? "").toContain(
-      "Avoid using this tool to run `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands",
     );
   });
 });

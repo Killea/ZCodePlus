@@ -92,6 +92,7 @@ stateDiagram-v2
 ## v1 方法
 
 - session: `create`、`resume`、`list`、`read`、`messages`、`events`、`subscribe`、`send`、`stop`、`setModel`、`setThoughtLevel`、`setMode`、`close`
+- `session/releaseUnderDirectory { directory }`：选出 cwd（`record.workspace.workspacePath`）位于该目录内的全部驻留会话。任一会话忙（驻留阻塞工作、待处理交互或排队命令，与彻底删除数据的判定相同）时全部不卸载，返回 `{ released: [], busy }`；否则全部做驻留去激活，返回 `{ released, busy: [] }`。不删除持久会话，不发 `session.removed`。Host 删除受管 worktree 前使用（`docs/git/worktree.md` §8.3），随 `worktreeCwd` 能力提供。
 - workspace: `readState`
 - process: `childProcesses`——返回 MCP tracker 内存里仍有存活进程的 MCP 子进程 `{ pid, serverName, mcpSource, pluginName? }`。纯内存、无 I/O；`pluginName` 来自 `plugin:<name>:<key>` 命名空间，官方插件由 host CLI 注入的 MCP（如 `node_repl`）按 `OFFICIAL_PLUGIN_DEFINITIONS.hostMcpServerNames` 反查。桌面资源管理器用它把 Host 侧 `ps` 进程树上的 pid 归到内置 / 社区插件（见桌面仓库 `docs/electron/resource-manager.md`），CPU/内存采样不在 CLI 内完成。
 - blocking request: 后续由 `interaction/requestPermission`、`interaction/requestUserInput` 通过 server-to-client request 扩展
@@ -116,3 +117,10 @@ stateDiagram-v2
 - CLI protocol 入口测试覆盖三方代码调用 `console.debug` 时 stdout 仍为空且日志进入 stderr，并验证命令结束后 console 恢复。
 - 真实子进程回归使用不声明 `tools` capability 的 MCP server，约束 `mcp/list` 返回合法 JSON 且 transport 不出现 `protocol_parse_error`。
 - app 联调烟测覆盖 `IZCodeAgentService.initialize()` 启动 stdio agent、`session/create` 返回 snapshot、`session/read` 读取同一 session。
+
+### 扫码远控执行遥测来源
+
+Host 在 V4 command envelope 注入可选 `inputOrigin=desktop|mobile`，CLI 复用 input intent
+保存到各类新输入（首发、goal、edit/retry）；queue promotion 保留原 intent 来源。TurnStarted
+遥测仅投影来源和无正文的运行配置，不传输入正文。历史 hydration/recovery 不生成遥测。
+执行服务消费 live fact 收口远控 completion/step；手机 replayable 和桌面 continuous 的交付不变。

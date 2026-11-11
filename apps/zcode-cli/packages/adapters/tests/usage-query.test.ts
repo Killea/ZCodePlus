@@ -17,7 +17,7 @@ describe("queryAppUsage", () => {
   it("aggregates tokens, tools, and per-day buckets within range", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "zcode-usage-query-"));
     const dbPath = join(tempRoot, "session.sqlite");
-    const store = createSqliteSessionStore({ dbPath });
+    const store = await createSqliteSessionStore({ dbPath });
     const sessionID = createSessionId("uq");
     const turnID = createTurnId("uq-turn");
     const now = 1_900_000_000_000; // 固定基准，避免依赖 Date.now()
@@ -130,14 +130,14 @@ describe("queryAppUsage", () => {
     }
   });
 
-  it("supports all-time app usage queries without the default 30 day cutoff", async () => {
+  it("retains usage older than a year across updates and reopening with query-only time filters", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "zcode-usage-all-query-"));
     const dbPath = join(tempRoot, "session.sqlite");
-    const store = createSqliteSessionStore({ dbPath });
+    let store = await createSqliteSessionStore({ dbPath });
     const sessionID = createSessionId("uq-all");
     const oldTurnID = createTurnId("uq-all-old");
     const newTurnID = createTurnId("uq-all-new");
-    const now = 1_900_000_000_000;
+    const now = Date.now();
     try {
       await store.createSession({
         id: sessionID,
@@ -156,7 +156,7 @@ describe("queryAppUsage", () => {
         providerId: "p",
         modelId: "model-old",
         status: "completed",
-        startedAt: now - 45 * DAY,
+        startedAt: now - 400 * DAY,
         inputTokens: 100,
         outputTokens: 20,
         computedTotalTokens: 120,
@@ -179,7 +179,7 @@ describe("queryAppUsage", () => {
         sessionID,
         turnID: oldTurnID,
         status: "completed",
-        startedAt: now - 45 * DAY,
+        startedAt: now - 400 * DAY,
         durationMs: 3000,
         computedTotalTokens: 120,
       });
@@ -192,15 +192,84 @@ describe("queryAppUsage", () => {
         computedTotalTokens: 40,
       });
 
+      for (const [id, turnID, startedAt] of [
+        ["all-old-tool", oldTurnID, now - 400 * DAY],
+        ["all-new-tool", newTurnID, now - DAY],
+      ] as const) {
+        await store.upsertToolUsage({
+          id,
+          sessionID,
+          turnID,
+          toolCallID: createToolCallId(id),
+          toolName: "Read",
+          status: "completed",
+          startedAt,
+        });
+      }
+      // 旧实现会在用量写入时删除历史；真实关闭再打开也必须保留三类事实。
+      store.close();
+      store = await createSqliteSessionStore({ dbPath });
+      expect(store.debugCounts(sessionID)).toMatchObject({
+        modelUsage: 2,
+        turnUsage: 2,
+        toolUsage: 2,
+      });
+      await store.recordModelUsage({
+        id: "all-old-model",
+        logicalRequestId: "all-old-request",
+        sessionID,
+        turnID: oldTurnID,
+        querySource: "main_turn",
+        providerId: "p",
+        modelId: "model-old",
+        status: "completed",
+        startedAt: now - 400 * DAY,
+        inputTokens: 110,
+        outputTokens: 20,
+      });
+      await store.upsertTurnUsage({
+        sessionID,
+        turnID: oldTurnID,
+        status: "completed",
+        startedAt: now - 400 * DAY,
+        durationMs: 3000,
+        computedTotalTokens: 130,
+      });
+      await store.upsertToolUsage({
+        id: "all-old-tool",
+        sessionID,
+        turnID: oldTurnID,
+        toolCallID: createToolCallId("all-old-tool"),
+        toolName: "Read",
+        status: "completed",
+        startedAt: now - 400 * DAY,
+        outputBytes: 12,
+      });
+
       const result = await store.queryAppUsage({
         since: 0,
         until: now,
         tzOffsetMs: 0,
       });
 
-      expect(result.totals.totalTokens).toBe(160);
+      expect(result.totals.totalTokens).toBe(170);
       expect(result.turnTotals.totalTurns).toBe(2);
       expect(result.turnTotals.longestSessionMs).toBe(7000);
+      expect(result.toolTotals.toolCallCount).toBe(2);
+      expect(store.debugCounts(sessionID)).toMatchObject({
+        modelUsage: 2,
+        turnUsage: 2,
+        toolUsage: 2,
+      });
+      const recent = await store.queryAppUsage({
+        since: now - 30 * DAY,
+        until: now,
+        tzOffsetMs: 0,
+      });
+      expect(recent.totals.totalTokens).toBe(40);
+      expect(recent.turnTotals.totalTurns).toBe(1);
+      expect(recent.toolTotals.toolCallCount).toBe(1);
+      expect((await store.queryTaskUsage({ sessionID })).modelRequestCount).toBe(2);
       expect(result.models.map((model) => model.modelId)).toEqual(["model-old", "model-new"]);
     } finally {
       store.close();
@@ -213,7 +282,7 @@ describe("queryTaskUsage", () => {
   it("aggregates model usage by session id", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "zcode-task-usage-query-"));
     const dbPath = join(tempRoot, "session.sqlite");
-    const store = createSqliteSessionStore({ dbPath });
+    const store = await createSqliteSessionStore({ dbPath });
     const sessionID = createSessionId("task-usage");
     const otherSessionID = createSessionId("task-usage-other");
     const turnID = createTurnId("task-usage-turn");
@@ -301,7 +370,7 @@ describe("queryTaskUsage", () => {
   it("counts repeated context sources by incremental input and survives compaction resets", async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), "zcode-task-usage-incremental-"));
     const dbPath = join(tempRoot, "session.sqlite");
-    const store = createSqliteSessionStore({ dbPath });
+    const store = await createSqliteSessionStore({ dbPath });
     const sessionID = createSessionId("task-usage-incremental");
     const turnID = createTurnId("task-usage-incremental-turn");
     const now = Date.now();

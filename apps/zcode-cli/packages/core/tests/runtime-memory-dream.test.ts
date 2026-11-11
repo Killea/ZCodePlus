@@ -268,17 +268,66 @@ describe("AgentRuntime Dream handler", () => {
 
     await runtime.executeTurn("next");
     const expectedUpdate = MEMORY_UPDATE_FIXTURE.replaceAll("<MEMORY_ROOT>", memoryRoot);
+    // 同一条 MCS system 里，轮首的 token 预算提醒排在 memory_update 之前。
+    const expectedSystem = `<total_tokens>15000000 tokens left</total_tokens>\n\n${expectedUpdate}`;
     const nextRequest = mainRequests[1] ?? [];
     const updateIndex = nextRequest.findIndex(
-      (message) => message.role === "system" && message.content === expectedUpdate,
+      (message) => message.role === "system" && message.content === expectedSystem,
     );
     expect(updateIndex).toBe(nextRequest.length - 1);
-    expect(nextRequest[updateIndex]).toEqual({ role: "system", content: expectedUpdate });
+    expect(nextRequest[updateIndex]).toEqual({ role: "system", content: expectedSystem });
     expect((runtime as any).pendingMemoryUpdate).toBeUndefined();
 
     await runtime.executeTurn("again");
-    expect(mainRequestTexts[2]).not.toContain("Background memory consolidation updated");
+    // memory_update 是输入附件，写入历史后留在前缀里，不再重复产出。
+    expect(mainRequestTexts[2]?.match(/Background memory consolidation updated/g)).toHaveLength(1);
     expect(dreamTurn).toBe(2);
+  });
+
+  it("keeps a memory update for the next request when persisting it fails", async () => {
+    const sessionStore = createMemorySessionStore([]);
+    const savePart = sessionStore.savePart!.bind(sessionStore);
+    let failMemoryUpdateWrite = true;
+    sessionStore.savePart = async (part) => {
+      const isMemoryUpdate = JSON.stringify(part.metadata ?? {}).includes('"memory_update"');
+      if (failMemoryUpdateWrite && isMemoryUpdate) {
+        failMemoryUpdateWrite = false;
+        throw new Error("injected memory_update write failure");
+      }
+      await savePart(part);
+    };
+    const requestTexts: string[] = [];
+    const runtime = createTestAgentRuntime(
+      createSessionId("memory-update-persist-failure"),
+      { mode: "yolo", workingDirectory: WORKSPACE_PATH },
+      {
+        eventStore: createTestSessionEventStore(),
+        modelFactory: createTestModelFactory({
+          async generateText(request, observation) {
+            requestTexts.push(providerMessagesToText(request.messages));
+            return textResult(observation.model, "ok");
+          },
+        }),
+        now: () => new Date(NOW),
+        sessionStore,
+        toolRegistry: createToolRegistry(),
+      },
+    );
+    (runtime as any).pendingMemoryUpdate = {
+      inContextPaths: [],
+      paths: ["/memory/fact.md"],
+      source: "dream",
+      summary: "Updated fact",
+    };
+
+    await runtime.executeTurn("first").catch(() => undefined);
+    // 写库失败的轮次不发请求；这条一次性更新留到下一次收集。
+    expect(requestTexts).toHaveLength(0);
+    await runtime.executeTurn("second");
+    expect(requestTexts.at(-1)).toContain(
+      "Background memory consolidation updated your memory directory: Updated fact",
+    );
+    expect((runtime as any).pendingMemoryUpdate).toBeUndefined();
   });
 
   it("requires five transcript files newer than the last consolidation", async () => {
@@ -362,6 +411,16 @@ function createMemorySessionStore(seedSessions: SessionInfo[]): SessionStorePort
         ...input,
         taskType: input.taskType ?? "interactive",
         time: { created: NOW, updated: NOW },
+      };
+      return currentSession;
+    },
+    // 终态结果由 CLI 存储维护；夹具也须更新同一条会话记录。
+    async updateSession(input) {
+      if (!currentSession || currentSession.id !== input.id) throw new Error("Session not found");
+      currentSession = {
+        ...currentSession,
+        ...input,
+        time: { ...currentSession.time, ...input.time },
       };
       return currentSession;
     },

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-send-message-resume-stop",
-  "spec": "./test/e2e/conversation-session/conversation-session-send-message-resume-stop.test.ts",
+  "spec": "./test/e2e/conversation-session/execution/conversation-session-send-message-resume-stop.test.ts",
   "fixtures": [
     {
       "id": "send-message-resume-stop-title",
@@ -131,10 +131,7 @@
       "match": {
         "method": "POST",
         "pathIncludes": "/messages",
-        "bodyIncludes": [
-          "E2E_SEND_MESSAGE_RESUME_STOP_RESUME",
-          "agentId: agent_"
-        ],
+        "bodyIncludes": ["E2E_SEND_MESSAGE_RESUME_STOP_RESUME", "agentId: agent_"],
         "bodyExcludes": [
           "resumed it in the background",
           "Generate a concise title",
@@ -149,7 +146,6 @@
           "inputTokens": 32,
           "input": {
             "to": "{{latestAgentId}}",
-            "summary": "resume stopped agent for stop check",
             "message": "You MUST invoke the Bash tool with command \"sleep 120\". Do not send any text before the Bash tool finishes. After it finishes, reply with exactly E2E_SEND_MESSAGE_RESUME_STOP_CHILD_DONE."
           }
         }
@@ -168,12 +164,9 @@
       "match": {
         "method": "POST",
         "pathIncludes": "/messages",
-        "bodyIncludes": [
-          "E2E_SEND_MESSAGE_RESUME_STOP_RESUME",
-          "resumed it in the background"
-        ],
+        "bodyIncludes": ["E2E_SEND_MESSAGE_RESUME_STOP_RESUME", "resumed it in the background"],
         "bodyExcludes": [
-          "<status>stopped</status>",
+          "<status>killed</status>",
           "Generate a concise title",
           "CRITICAL: Respond with TEXT ONLY"
         ]
@@ -200,20 +193,14 @@
       "match": {
         "method": "POST",
         "pathIncludes": "/messages",
-        "lastUserMessageIncludes": [
-          "<task-notification>",
-          "<status>stopped</status>"
-        ],
+        "lastUserMessageIncludes": ["<task-notification>", "<status>killed</status>"],
         "bodyIncludes": [
           "E2E_SEND_MESSAGE_RESUME_STOP_PARENT",
           "<task-notification>",
           "<tool-use-id>toolu_e2e_send_message_resume_stop_send_message</tool-use-id>",
-          "<status>stopped</status>"
+          "<status>killed</status>"
         ],
-        "bodyExcludes": [
-          "Generate a concise title",
-          "CRITICAL: Respond with TEXT ONLY"
-        ]
+        "bodyExcludes": ["Generate a concise title", "CRITICAL: Respond with TEXT ONLY"]
       },
       "response": {
         "statusCode": 200,
@@ -246,7 +233,7 @@
         "bodyExcludes": [
           "E2E_SEND_MESSAGE_RESUME_STOP_RESUME",
           "resumed it in the background",
-          "<status>stopped</status>"
+          "<status>killed</status>"
         ]
       },
       "response": {
@@ -276,7 +263,7 @@
           "E2E_SEND_MESSAGE_RESUME_STOP_RESUME",
           "agentId: agent_"
         ],
-        "bodyExcludes": ["<status>stopped</status>"]
+        "bodyExcludes": ["<status>killed</status>"]
       },
       "response": {
         "statusCode": 200,
@@ -307,7 +294,7 @@
           "resumed it in the background",
           "agentId: agent_"
         ],
-        "bodyExcludes": ["<status>stopped</status>"]
+        "bodyExcludes": ["<status>killed</status>"]
       },
       "response": {
         "statusCode": 200,

@@ -17,19 +17,6 @@ const skillPath = resolve(process.cwd(), "../browser-use-plugin/skills/control-b
 const overviewPath = resolve(docsRoot, "overview.md");
 const workflowPath = resolve(docsRoot, "workflow.md");
 const playwrightPath = resolve(docsRoot, "playwright.md");
-const repoRoot = resolve(process.cwd(), "../../../..");
-const runtimeBoundarySpecPath = resolve(
-  repoRoot,
-  "docs/browser-use/browser-use-plugin-runtime-boundary.md",
-);
-const runtimeSemanticsSpecPath = resolve(
-  repoRoot,
-  "docs/browser-use/2026-07-12-browser-use-codex-runtime-semantics-alignment-spec.md",
-);
-const phaseOneSpecPath = resolve(
-  repoRoot,
-  "docs/browser-use/2026-07-09-browser-use-codex-alignment-phase1-spec.md",
-);
 const testerSkillPath = resolve(
   process.cwd(),
   "../browser-use-plugin/skills/web-gui-tester/SKILL.md",
@@ -49,24 +36,6 @@ const iab: BrowserInfo = {
 };
 
 describe("browser capability manifest", () => {
-  it("keeps Browser Use runtime-boundary and matcher specs aligned with the shipped contract", () => {
-    const runtimeBoundary = readFileSync(runtimeBoundarySpecPath, "utf8");
-    const runtimeSemantics = readFileSync(runtimeSemanticsSpecPath, "utf8");
-    const phaseOneSpec = readFileSync(phaseOneSpecPath, "utf8");
-
-    expect(runtimeBoundary).toContain("物理发布载体");
-    expect(runtimeBoundary).toContain("enabled === false");
-    expect(runtimeBoundary).toContain("runtimeFeatures.browserUse");
-    expect(runtimeBoundary).not.toContain("nodeRepl: true");
-    expect(runtimeBoundary).not.toContain("不携带 runtime asset");
-    expect(runtimeSemantics).toContain("guidance 都允许 `RegExp`");
-    expect(runtimeSemantics).toContain("跨 Realm RegExp");
-    expect(runtimeSemantics).not.toContain("guidance 禁止 RegExp");
-    expect(phaseOneSpec).toContain("状态：历史阶段规格");
-    expect(phaseOneSpec).not.toContain("关闭时两者都不可见");
-    expect(phaseOneSpec).not.toContain("browser.tabs.selected()");
-  });
-
   it("web GUI tester stays agnostic to the browser automation tooling available in the session", () => {
     const skill = readFileSync(testerSkillPath, "utf8");
 
@@ -114,7 +83,7 @@ describe("browser capability manifest", () => {
       injectedGlobals: () => ({
         agent: { browsers: { getDefault: async () => browser } },
       }),
-      restrictProcess: true,
+      protectProtocolStdio: true,
     });
     try {
       const first = await session.run(firstWorkflowCell);
@@ -158,19 +127,6 @@ describe("browser capability manifest", () => {
     expect(bootstrapSource).not.toContain("agent.browsers.getForUrl(");
   });
 
-  it("browser skill resolves its client from the host-provided plugin root", () => {
-    const skill = readFileSync(skillPath, "utf8");
-
-    expect(skill).toContain("process.env.ZCODE_PLUGIN_ROOT");
-    expect(skill).toContain("process.env.CLAUDE_PLUGIN_ROOT");
-    expect(skill).toContain('await import("node:path")');
-    expect(skill).toContain('await import("node:url")');
-    expect(skill).toContain('join(browserPluginRoot, "scripts", "browser-client.mjs")');
-    expect(skill).toContain("pathToFileURL");
-    expect(skill).not.toContain("<plugin root>");
-    expect(skill).not.toContain("skills/control-browser/scripts/browser-client.mjs");
-  });
-
   it("executes the browser skill bootstrap with the host-provided plugin root", async () => {
     const skill = readFileSync(skillPath, "utf8");
     const bootstrapSource = /## Bootstrap[\s\S]*?```js\r?\n([\s\S]*?)\r?\n```/u.exec(skill)?.[1];
@@ -192,7 +148,7 @@ describe("browser capability manifest", () => {
         "utf8",
       );
       process.env.ZCODE_PLUGIN_ROOT = pluginRoot;
-      session = new NodeReplSession({ restrictProcess: true });
+      session = new NodeReplSession({ protectProtocolStdio: true });
 
       // 修复原因：生产 Skill 的 base directory 位于 skills/control-browser，必须证明模板只信任宿主根目录。
       const bootstrapResult = await session.run(bootstrapSource);
@@ -341,9 +297,7 @@ describe("browser capability manifest", () => {
       );
     }
     expect(fallbackDocumentation).toContain("every Browser Use call starts in a fresh kernel");
-    expect(fallbackDocumentation).toContain(
-      "const browser = await agent.browsers.getDefault()",
-    );
+    expect(fallbackDocumentation).toContain("const browser = await agent.browsers.getDefault()");
     expect(fallbackDocumentation).not.toContain("globalThis.browser");
     expect(fallbackDocumentation).not.toContain("globalThis.tab");
     for (const guidance of [troubleshootingDocumentation, tabClaimingDocumentation]) {

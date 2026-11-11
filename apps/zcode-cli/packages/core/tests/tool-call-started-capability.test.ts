@@ -15,12 +15,14 @@ import {
   createTurnId,
   isWorkspaceMutatingToolCall,
   type SessionEvent,
+  type ExecutionShellSelection,
   type ToolCallStartedPayload,
 } from "@zcode/contracts";
 import { PermissionService, defaultPermissionConfig } from "../src/permission/service.js";
 import { createToolExecutor } from "../src/tool/executor.js";
 import { createToolRegistry } from "../src/tool/registry.js";
 import type { ToolEntry } from "../src/tool/types.js";
+import { bashToolEntry } from "../src/tool/handlers/bash.js";
 
 function probeEntry(overrides: Partial<ToolEntry>): ToolEntry {
   return {
@@ -62,7 +64,12 @@ function probeEntry(overrides: Partial<ToolEntry>): ToolEntry {
   };
 }
 
-async function run(entry: ToolEntry, input: Record<string, unknown>, name: string) {
+async function run(
+  entry: ToolEntry,
+  input: Record<string, unknown>,
+  name: string,
+  bashShellSelection?: ExecutionShellSelection,
+) {
   const sessionId = createSessionId(name);
   const turnId = createTurnId(name);
   const traceContext = createRootTraceContext({ sessionId, turnId });
@@ -82,6 +89,7 @@ async function run(entry: ToolEntry, input: Record<string, unknown>, name: strin
       events.push(event);
     },
     mode: "yolo",
+    bashShellSelection,
     permissionBroker: {
       async requestPermission() {
         return { decision: "allow" as const };
@@ -99,10 +107,20 @@ async function run(entry: ToolEntry, input: Record<string, unknown>, name: strin
     { traceContext },
   );
   const started = events.find((event) => event.type === SessionEventType.ToolCallStarted);
-  return { payload: started?.payload as ToolCallStartedPayload | undefined, order };
+  return { payload: started?.payload as ToolCallStartedPayload | undefined, order, events };
 }
 
 describe("ToolCallStarted carries the resolved side-effect capability", () => {
+  it("keeps explicitly permitted CMD commands marked as system side effects", async () => {
+    const entry = { ...bashToolEntry, handler: async () => ({}) };
+    const { payload } = await run(entry, { command: "type README.md" }, "cmd-capability", {
+      dialect: "cmd",
+      source: "user-config",
+      display: { name: "CMD" },
+    });
+    expect(payload).toMatchObject({ readOnly: false, sideEffectScope: "system" });
+  });
+
   it("declares the metadata flags on the payload, before the handler runs", async () => {
     const { payload, order } = await run(probeEntry({}), {}, "cap-meta");
     expect(payload).toMatchObject({
@@ -137,4 +155,31 @@ describe("ToolCallStarted carries the resolved side-effect capability", () => {
     expect(payload).toMatchObject({ readOnly: true, sideEffectScope: "none" });
     expect(isWorkspaceMutatingToolCall(payload!)).toBe(false);
   });
+});
+
+describe("MCP execution attribution", () => {
+  it.each([false, true])(
+    "keeps actual plugin ownership on terminal events (failure=%s)",
+    async (fails) => {
+      const entry = probeEntry({});
+      entry.metadata.mcpPresentation = {
+        pluginId: "actual@market",
+        serverName: "server",
+        toolName: "tool",
+      };
+      entry.handler = async () => {
+        if (fails) throw new Error("tool failed");
+        // 注册表在执行期间变化，也不能丢失本次执行的归属。
+        entry.metadata.mcpPresentation!.pluginId = "changed@market";
+        return { ok: true };
+      };
+      const { events } = await run(entry, {}, "mcp-owner");
+      const terminal = events.filter(
+        (event) =>
+          event.type === (fails ? SessionEventType.ToolCallError : SessionEventType.ToolCallResult),
+      );
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0].payload).toMatchObject({ pluginId: "actual@market" });
+    },
+  );
 });

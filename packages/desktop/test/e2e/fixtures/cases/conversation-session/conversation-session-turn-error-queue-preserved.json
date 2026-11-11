@@ -1,13 +1,20 @@
 {
   "version": 1,
   "caseName": "conversation-session-turn-error-queue-preserved",
-  "spec": "./test/e2e/conversation-session/conversation-session-turn-error-queue-preserved.test.ts",
+  "spec": "./test/e2e/conversation-session/queue/conversation-session-turn-error-queue-preserved.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-turn-error-queue-preserved.json"
   ],
   "fileFixtures": [],
   "requests": [
+    {
+      "id": "turn-error-queue-preserved-title-sidecar",
+      "kind": "common",
+      "source": "synthetic",
+      "timingPolicy": "fast-text",
+      "syntheticReason": "运行时证据显示 session_title 旁路缺少 fixture；固定标题响应隔离标题生成，主用例不验证标题内容。"
+    },
     {
       "id": "turn-error-queue-preserved-source-500",
       "description": "N05：主 turn 在 queue 入队窗口后返回 500 JSON error。",

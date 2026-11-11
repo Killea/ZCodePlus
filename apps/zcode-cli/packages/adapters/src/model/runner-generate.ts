@@ -22,6 +22,7 @@ import { createGenerateTextOptions } from "./runner-options.js";
 import { detectProviderBusinessFinishError } from "./provider-finish-business-error.js";
 import {
   normalizeReasoning,
+  orderGeneratedContent,
   normalizeSources,
   normalizeToolCalls,
   normalizeToolResults,
@@ -33,6 +34,7 @@ import {
   shouldRecordModelIO,
 } from "./runner-debug.js";
 import {
+  createEmptyContextExceededError,
   getGenerateTextResultMetadata,
   isZeroOutputModelCompletion,
   logGenerateTextDiagnostics,
@@ -60,9 +62,15 @@ import type {
 } from "./runner-runtime.js";
 import { AccountRequestRetry } from "./account-request-retry.js";
 import { resolveModelForAttempt, RuntimeHeadersRefreshError } from "./runner-runtime-headers.js";
-import { retryAllowedByFailurePolicy } from "./workflow-model-failure-policy.js";
+import {
+  nextUnrecognizedCodeStreak,
+  retryAllowedByFailurePolicy,
+} from "./workflow-model-failure-policy.js";
 import { modelFailureStatusFields, providerRequestIdFromHeaders } from "./runner-telemetry.js";
-import { repairReasoningHistoryAfterSignatureRejection } from "./reasoning-history-normalization.js";
+import {
+  repairReasoningHistoryAfterSignatureRejection,
+  thinkingSignatureRejectionEvidence,
+} from "./reasoning-history-normalization.js";
 import { admitAttempt, type AttemptAdmission } from "./request-admission.js";
 import {
   retryAttemptLoopContinues,
@@ -104,6 +112,8 @@ export async function runGenerateText(input: {
   let modalityRepairCount = 0;
   const authRetry = new AccountRequestRetry(input.request, input.resolved, input.logger);
   let emptyCompletionRetryCount = 0;
+  // 不认识的业务码在本次请求里连续出现的次数：workflow 策略表据此停下，见 workflow-model-failure-policy.ts。
+  let unrecognizedCodeStreak = 0;
 
   for (
     let attempt = 1;
@@ -243,6 +253,18 @@ export async function runGenerateText(input: {
         ? serializeStructuredOutput(result)
         : result.text;
       const reasoning = normalizeReasoning(result.reasoning);
+      const contextError = createEmptyContextExceededError({
+        finishReason: result.finishReason,
+        rawFinishReason: result.rawFinishReason ?? result.providerMetadata?.rawFinishReason,
+        hasAssistantContent:
+          text.length > 0 ||
+          (reasoning ?? []).some(
+            (block) => block.text.length > 0 || Object.keys(block.providerOptions ?? {}).length > 0,
+          ),
+        toolCallCount: toolCalls?.length ?? 0,
+        usage,
+      });
+      if (contextError) throw contextError;
       const reasoningLength = (reasoning ?? []).reduce(
         (total, block) => total + block.text.length,
         0,
@@ -251,6 +273,9 @@ export async function runGenerateText(input: {
         input.request.preserveProviderStreamBoundaries !== true &&
         isZeroOutputModelCompletion({
           finishReason: result.finishReason,
+          rawFinishReason:
+            result.rawFinishReason ??
+            (result.providerMetadata as Record<string, unknown> | undefined)?.rawFinishReason,
           reasoningLength,
           textLength: text.length,
           toolCallCount: toolCalls?.length ?? 0,
@@ -338,8 +363,13 @@ export async function runGenerateText(input: {
         statusPublishOptions(input, admission),
       );
 
+      // 结构化输出的 text 是序列化结果，不对应模型块，不编号。
+      const textBlocks = input.request.responseJsonSchema
+        ? undefined
+        : orderGeneratedContent(result, { text, reasoning, toolCalls });
       return {
         text,
+        ...(textBlocks ? { textBlocks } : {}),
         finishReason: result.finishReason,
         usage,
         reasoning,
@@ -347,6 +377,8 @@ export async function runGenerateText(input: {
         toolResults,
         sources,
         providerMetadata: result.providerMetadata as Record<string, unknown> | undefined,
+        // 修复后的重试成功：core 在产出的 assistant 上记标记，之后的请求不再发被拒的块。
+        ...(signatureRepairAttempted ? { signedReasoningReset: true } : {}),
       };
     } catch (error) {
       // 合并后鉴权解析进入 attempt try；与 stream 一致保留网络前凭据缺失的类型化错误。
@@ -359,7 +391,7 @@ export async function runGenerateText(input: {
       const classified = classifyModelFailure(error, input.request.abortSignal);
       if (error instanceof RuntimeHeadersRefreshError) {
         classified.message = error.message;
-        classified.retryable = false;
+        classified.retryable = error.retryable;
       }
       // off-peak 特判（仅 idle plan provider，见 offpeak-retry.ts）：排队 429 豁免预算、
       // 3102（兼容旧 3001）以稳定标记落败触发 desktop 侧续跑。
@@ -378,6 +410,12 @@ export async function runGenerateText(input: {
           : offPeak?.kind === "queued"
             ? { ...classified, retryable: true, retryReason: ModelRetryReason.OffpeakQueued }
             : classified;
+      const providerCode = inspectProviderFailure(error).providerErrorCode;
+      unrecognizedCodeStreak = nextUnrecognizedCodeStreak(
+        unrecognizedCodeStreak,
+        failure,
+        providerCode,
+      );
       const responseHeaders = sanitizeModelNetworkHeaders(
         getResponseHeaders(unwrapRetryError(error)),
       );
@@ -428,11 +466,7 @@ export async function runGenerateText(input: {
           ? true
           : retryBudgetAllows(retryBudget, retryBudgetAttempt, input.retry.maxAttempts) &&
             // workflow 流量（无上限预算）读策略表而不是分类器的 retryable；有界预算逐字不变。
-            retryAllowedByFailurePolicy(
-              failure,
-              retryBudget,
-              inspectProviderFailure(error).providerErrorCode,
-            );
+            retryAllowedByFailurePolicy(failure, retryBudget, providerCode, unrecognizedCodeStreak);
       const retryWithAuth = authRetry.claim(error, options === undefined);
       if (retryWithAuth)
         statusContext = {
@@ -476,6 +510,7 @@ export async function runGenerateText(input: {
           ...modelFailureStatusFields(error, failure, options ? "response" : "prepare"),
           timestamp: new Date(completedAt).toISOString(),
           type: "model_request_failed",
+          ...(error instanceof AiSdkModelAdapterError && error.usage ? { usage: error.usage } : {}),
         },
         {
           ...statusPublishOptions(input, admission),
@@ -494,6 +529,7 @@ export async function runGenerateText(input: {
         });
         throw toAdapterError(error, failure, statusContext, attempt, {
           errorPhase: requestInvocationCompleted ? "response" : "prepare",
+          unrecognizedCodeStreak,
         });
       }
 
@@ -525,6 +561,8 @@ export async function runGenerateText(input: {
             rejectedModality,
             requestId: statusContext.requestId,
             status: "waiting",
+            // 记下 provider 原文和 prefix 不一致响应头：写明哪一块、因为什么被拒，排查前缀变化时用。
+            ...thinkingSignatureRejectionEvidence(error, responseHeaders),
           },
         );
         await publishRetryScheduledStatus(

@@ -493,11 +493,6 @@ describe("cold conversation three-source merge", () => {
     const messages = vi.fn(async () => [oldUser, oldAssistant, rewindNotice, newAssistant]);
     const readTarget = vi.fn(async () => target);
     const sessionEntries = vi.fn(async () => []);
-    const loadPersistedConversationMaterialization = (coldEventMerge as Record<string, unknown>)
-      .loadPersistedConversationMaterialization;
-
-    expect(loadPersistedConversationMaterialization).toBeTypeOf("function");
-    if (typeof loadPersistedConversationMaterialization !== "function") return;
     const loaded = await loadPersistedConversationMaterialization({
       memoryEvents: [],
       sessionId: "s1",
@@ -1405,6 +1400,54 @@ describe("cold conversation three-source merge", () => {
     });
     // compact 维护 turn 上没有任何 Hook row。
     expect(hookRows.map((row) => row.turnId)).not.toContain("runtime-turn-compact");
+  });
+
+  it("keeps the edit lock of a pending queue item and drops it once the item is discarded", () => {
+    // 冷合并只读当前进程的内存事件，与 runtime 锁表同源；项出队后锁事件随之丢弃，
+    // 不能让已结算项的旧锁回到投影（docs/ui/composer-edit-mode.md）。
+    const queued = event(
+      1,
+      SessionEventType.TurnSteerQueued,
+      {
+        pendingInputId: "queue-locked",
+        input: "edit me",
+        inputPreview: "edit me",
+        inputSize: 7,
+        targetTurnId: "turn-live",
+        queueLength: 1,
+        delivery: "queue",
+      },
+      "turn-live",
+    );
+    const locked = event(2, SessionEventType.TurnSteerEditLockChanged, {
+      pendingInputId: "queue-locked",
+      targetTurnId: "turn-live",
+      editLock: { editorId: "editor-a", clientId: "desktop" },
+    });
+    const discarded = event(3, SessionEventType.TurnSteerDiscarded, {
+      pendingInputIds: ["queue-locked"],
+      reason: "session_resumed",
+      targetTurnId: "turn-live",
+    });
+
+    const pending = mergeColdConversationEvents({
+      memoryEvents: [queued, locked],
+      messages: [],
+      sessionId: "s1",
+    });
+    expect(reduce(pending.events).getSnapshot().queue.items).toMatchObject([
+      { queueItemId: "queue-locked", editLock: { editorId: "editor-a", clientId: "desktop" } },
+    ]);
+
+    const settled = mergeColdConversationEvents({
+      memoryEvents: [queued, locked, discarded],
+      messages: [],
+      sessionId: "s1",
+    });
+    expect(reduce(settled.events).getSnapshot().queue.items).toEqual([]);
+    expect(
+      settled.events.some((item) => item.type === SessionEventType.TurnSteerEditLockChanged),
+    ).toBe(false);
   });
 
   it("treats SessionInputPromoted as a known queue terminal during cold merge", () => {

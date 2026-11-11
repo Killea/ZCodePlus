@@ -98,13 +98,21 @@ The child is started as `node --max-old-space-size=256 <entry>` in development, 
 
 ### The vm cell
 
-Inside the child, the code runs in a `vm.createContext` whose global object exposes exactly five host functions: `__send`, `__argsJson`, `__deliver`, `__execute`, `__checkStalled`. The facade object `__host` is built inside the cell from those. `args` is `Object.freeze(JSON.parse(__argsJson))`, a shallow freeze. Three sources of non-determinism are banned and throw: `Date.now`, `new Date()` without arguments, and `Math.random`; dynamic `import()` throws as well. Everything the script can observe about the world therefore comes through Boundary A and is journaled.
+Inside the child, the code runs in a `vm.createContext` built from a null-prototype object, so the cell's global inherits nothing from the outer realm. The outer realm puts four values on it: two strings, `__argsJson` and `__runJson`, and two host functions, `__send(line)` and `__finish()`. The bootstrap's first statement moves both functions into a closure and deletes them from the global, before any other code runs. The script therefore never holds a function from the outer realm.
+
+The realm boundary holds these rules:
+
+- Only strings cross from the cell to the outer realm. The cell-side wrapper passes `__send` a string and catches anything the host function throws. It then throws a context-native `Error` instead, because a host error (a stack overflow on entry, for example) would carry the outer realm's `Function` constructor. The host side writes a line only when it receives a string and never coerces any other value.
+- The outer realm calls the cell only through `__deliver`, `__checkStalled` and `__execute`. It reads them once, after the bootstraps and before the lowered body is compiled, and calls them unbound. A script that reassigns them changes nothing, and no host object is passed as `this`.
+- No promise crosses the boundary. The outer realm does not call `then` on the promise that `__execute` returns, because the script can replace `Promise.prototype.then` and receive the host callbacks. Instead, `__execute` catches everything and calls `__finish` once, at its end.
+
+The facade object `__host` is built inside the cell. Node `vm` is still not a security boundary. These rules close the known ways out of the realm, but they do not make the cell a sandbox for untrusted code. `args` is `Object.freeze(JSON.parse(__argsJson))`, a shallow freeze. Three sources of non-determinism are banned and throw: `Date.now`, `new Date()` without arguments, and `Math.random`; dynamic `import()` throws as well. Everything the script can observe about the world therefore comes through Boundary A and is journaled.
 
 **Holes are evaluated in the cell, at the site.** `__host.hole(siteId, name, prompt, evaluate, body?)` with a `body` calls it and sends nothing. Without one it looks in the cell's fill table — a site filled earlier in this life and reached again — and otherwise sends `request {type: "hole", siteId, name, prompt}` and parks the promise; a parked hole is a request in flight, so the stall detector does not fire and every other branch keeps running. The answer `{code}` is stored by site id and handed to `evaluate`, whose direct `eval` produces an async function closed over the bindings the author's code has at that point, `__host` included; the shim calls it and settles the hole with its result. The evaluator is created anew at every reach, which is what gives a hole in a loop each iteration's bindings. `eval` and `Function` are bound to the context's globals as the spec allows, and the runtime bans apply inside the body as everywhere else.
 
 **Channels and futures live in the cell** (`docs/dynamic-workflow/authoring.md`, "Streams"). `__host.channel(name?)` builds a context-native object: an item queue and a receiver queue, both arrays read through a head index so that neither `send` nor a receive is ever a shift over the buffer; the buffer is compacted once the consumed prefix outgrows the live part. `send` hands the item straight to the longest-waiting receiver when one is parked, otherwise appends; `close` resolves every parked receiver with the end marker and makes later sends throw a `ChannelClosed` error whose message names the channel. The async iterator serves buffered items through already-resolved promises and parks only on an empty, open channel. `__host.future(body)` calls `body` synchronously and returns its promise, turning a synchronous throw into a rejection. Neither crosses the wire: nothing is journaled, nothing is emitted, and a replayed run reproduces every delivery because the order of host settlements is what it depends on.
 
-**The stall detector** is the cell's one asynchronous self-observation. The cell counts requests in flight (`__pending`) and receivers parked on channels. The outer realm calls `__checkStalled` from a `setImmediate` scheduled after `__execute` starts and after every delivered response line, which is the first moment at which every continuation the response could have triggered has run, because the realm has no timers and no I/O of its own. If the script has not completed and no request is in flight, nothing can ever wake it: the cell emits an error `complete` (`ChannelDeadlock`, naming each channel with waiting receivers and their count, when receivers are parked; `ScriptStalled` otherwise) and the outer realm closes its reader. `__complete` is idempotent, so a script that could somehow complete afterwards emits nothing more. The detector has no timeout and no heuristic: it fires exactly when the run has provably nothing left to do.
+**The stall detector** is the cell's one asynchronous self-observation. The cell counts requests in flight (`__pending`) and receivers parked on channels. The outer realm calls its captured `__checkStalled` from a `setImmediate` scheduled after `__execute` starts and after every delivered response line, which is the first moment at which every continuation the response could have triggered has run, because the realm has no timers and no I/O of its own. If the script has not completed and no request is in flight, nothing can ever wake it: the cell emits an error `complete` (`ChannelDeadlock`, naming each channel with waiting receivers and their count, when receivers are parked; `ScriptStalled` otherwise) and the outer realm closes its reader. `__complete` is idempotent, so a script that could somehow complete afterwards emits nothing more. The detector has no timeout and no heuristic: it fires exactly when the run has provably nothing left to do.
 
 ### Wire protocol
 
@@ -314,7 +322,7 @@ A persona that names a model is the most specific statement there is: it is writ
 
 The engine takes no part in any of this. It records the persona's `model` name and never interprets it, and it never reads `subagentModel` or `modelBindings`: the strings travel the host-metadata road, from the run service through the harness into the engine config, and are recorded once on the `run-launched` event beside the launch anchor and the phase names, in the run-creating life only. There is no column for it. The head of the event log is where the host reads it back, which is why a resume, a detail read and a cold replay all recover the same choice for free.
 
-The subagent's tool surface is the parent's minus tools that would let it steer the parent or start workflows of its own: `EnterPlanMode`, `ExitPlanMode`, `CreateWorkflow`, `ReadSessionContext`, `ResolveWorkflowQuestion` are removed by the driver, and the child runtime's allowlist additionally excludes `SaveWorkflow` and `ResumeWorkflowRun`. `submit_result` is registered when the runtime was given a submit port, `escalate` when it was given an escalate port; the driver always injects both ports, so every subagent has `escalate`, and every non-`untyped` subagent has `submit_result`. `AskUserQuestion` stays: its questions reach the user through the parent session like the subagent's permission asks (`docs/dynamic-workflow/launch.md`, "Permissions inside a run").
+The subagent's tool surface is the parent's minus tools that would let it steer the parent, reach the user past the main agent, or start workflows of its own: `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`, `CreateWorkflow`, `ReadTopicResource`, `ResolveWorkflowQuestion` are removed by the driver, and the child runtime's allowlist additionally excludes `SaveWorkflow` and `ResumeWorkflowRun`. `submit_result` is registered when the runtime was given a submit port, `escalate` when it was given an escalate port; the driver always injects both ports, so every subagent has `escalate`, and every non-`untyped` subagent has `submit_result`. A subagent that needs a person's judgment calls `escalate`; the main agent decides whether to ask the user (`docs/dynamic-workflow/launch.md`, "Permissions inside a run").
 
 **Browser Use.** A subagent can drive the built-in browser (`mcp__node_repl__js` with `agent.browsers`), and it does so under its **own** session id, which the browser backend uses as the tab owner. A subagent gets its own set of tabs, separate from the main agent's and from every other subagent's, in the one browser the window has (`docs/browser-use/2026-07-14-browser-tab-conversation-isolation-spec.md`). The storage partition is shared: logins, cookies and local storage are the app's, not the subagent's.
 
@@ -362,12 +370,12 @@ Caps are enforced in the driver by asking for one more than the cap, so "exactly
 | `files.grep` serialized bytes | 256 KB |
 | `git.diff` bytes | 512 KB |
 | `git.log` count | default 20, maximum 100 |
-| `world.run` stdout, stderr | 256 KB each |
+| `world.run` stdout, stderr | 16 MiB each with `output: "full"` (the default); `"discard"` and `{ tail: n }` have no limit on what the process prints, and n is at most 16 MiB |
 | `world.run` timeout | default 300 s, no maximum |
 
 Glob results are workspace-relative and sorted, so a journaled list does not depend on modification times.
 
-`world.run(cmd, args?, opts?)` differs from `git.*` in three deliberate ways. A non-zero exit is a value (`{exitCode, stdout, stderr}`), not an error, so a gating loop does not need exception control flow. The command is re-checked against the set of commands the compiler collected from literals and the user confirmed at submit; a command outside that set, or a missing set, is a `DriverError` naming a wiring error. The timeout has no upper bound. Authorization and the facade shape belong to `authoring.md`.
+`world.run(cmd, args?, opts?)` differs from `git.*` in three deliberate ways. A non-zero exit is a value (`{exitCode, stdout, stderr}`), not an error, so a gating loop does not need exception control flow. The command is authorized at compile time only (a string literal the user confirmed at submit); the driver keeps no second, runtime list. Output is bounded where the script declares it (`opts.output`), never by the driver, because the journal replays the result as stored and the script must see the same bytes. The timeout has no upper bound. Authorization and the facade shape belong to `authoring.md`.
 
 ### Artifact publish
 
@@ -545,7 +553,7 @@ The driver classifies every rejected model turn with `resolveWorkflowModelFailur
 
 | Verdict | Engine-side effect |
 | --- | --- |
-| stop, kind `auth`, `not_configured`, `model_unavailable`, `invalid_request`, `quota`, or `other` | `sink.stopRun(ProviderStop)`; the whole run becomes `stopped(provider)`. The error message is `Subagent <name> hit a permanent model-side error (<reason> [<code>]): <raw>` and carries `ProviderStopDetails`. |
+| stop, kind `auth`, `not_configured`, `model_unavailable`, `invalid_request`, `quota`, or `other` | `sink.stopRun(ProviderStop)`; the whole run becomes `stopped(provider)`. The error message is `Subagent <name> hit a permanent model-side error (<reason> [<code>]): <raw>` and carries `ProviderStopDetails`. Kind `other` is a provider code the classifier does not know, returned 10 times in a row within one request (`concurrency.md`, "The policy table"). |
 | `context_exceeded` | the ask fails with `ContextLimit`: "Subagent <name> exceeded the model's context window even after compaction. Give this ask a smaller input or split the work across subagents." The script may catch it; the run continues. |
 | anything else | the driver redrives the turn after a backoff (2 s doubling to 60 s, jittered by half, or the provider's `Retry-After`), reporting `askWaiting {cause: "backoff"}` meanwhile; the script never sees the failure |
 
@@ -579,6 +587,40 @@ A cancel travels one path regardless of who asked: the run service's `cancel(run
 `ResumeWorkflowRun {run_id}` is the model's entry; the CLI and the GUI reach the same port method. The gate is the table under "Resume by replay", plus one rule read from the settlement: a run stopped as `superseded` is refused with `superseded` and the successor's id, because its unfinished work now belongs to that successor and replaying it would do the same work twice against a workspace the successor is changing. One more rule is read from the script: the stored text is type-checked against the **current** facade before anything is touched, and a script that no longer compiles (the facade changed after the run) is refused with `compile_failed` and a bounded diagnostics message. Replaying it verbatim could only fail; the way forward is a script rewritten for the current facade and submitted with `AmendWorkflow`, which keeps the finished work. Success starts the run in the background and returns `{ok: true, runId, status: "backgrounded", backgroundTaskId}`; the tool card joins the resumed run to the original `CreateWorkflow` call through the journaled `toolCallId`. Whether a run is resumable is computed once, in the CLI, by `isResumableSettlement`, and shipped as a boolean: on the `run-settled` progress payload as `resumable: true`, and on each row of the session's run list. Neither the projection nor the UI derives it from status.
 
 Resuming re-arms the run in the background-task tracker: the terminal fields of the previous settlement are cleared when the `run-started` event of the resumed run arrives, so the card does not show a stale failure beside a running lamp.
+
+### Resuming after a quota reset
+
+A run stopped because the user's usage cap was reached (`stopped(provider)`, kind `quota`) resumes by itself once the cap resets, when the stop recorded a reset time. Before this, the main agent or the user had to remember to call `ResumeWorkflowRun` hours later; in one heavy user's 20 days of logs, 22 runs stopped on a cap, 17 were resumed by hand, and 5 were left.
+
+The reset time is `providerStop.resetAt`. The adapter takes it from the provider's `Retry-After` header when there is one, and otherwise from the message: BigModel writes `您的限额将在 YYYY-MM-DD HH:MM:SS 重置`, a time without a zone that is read as Beijing time (UTC+8). Both sources go through the same window, from one day ago to 35 days ahead: a `Retry-After` that lands outside it (an abnormal or hostile header, such as a value of years) is ignored and the message is read instead, and a message time outside it is ignored too. A quota stop without a reset time (an exhausted balance, `1005`) is not resumed by itself.
+
+The host module is `bootstrap/src/app/dynamic-workflow-quota-resume.ts`. It resumes the run `WORKFLOW_QUOTA_RESUME_MARGIN_MS` (one minute) after the reset, through the same path as the app's Resume (the session's execution boundary, `port.resume`, then the runtime re-arms tracking), so the resumed run has its terminal notification, its background-task entry and its residency.
+
+```text
+ run stops on 1308 ──► row: stopped(provider) { kind: quota, resetAt: T }
+        │
+        │ run-settled (this process)          session App constructed (cold start)
+        ▼                                                 │
+   read row ──► arm timer at T + 1 min ◄── scan the session's recent rows
+        │                                                 │ (T + 1 min already past → fire now)
+        ▼
+   timer fires ──► read row again
+        ├── still stopped(provider, quota) with the same T ──► resume (same path as the app's Resume)
+        ├── another T ──► arm again at the new T + 1 min
+        └── anything else (resumed by hand, superseded, …) ──► nothing
+```
+
+Seven rules keep it honest:
+
+- **The run row is the only source of truth.** The timer only wakes the module; the decision is made by reading the row when it fires.
+- **It lives in the session App.** A stopped run does not keep its App resident, so an idle session is closed after ten minutes and its timer with it. The scan at App construction is the catch-up: the run resumes the next time the session is opened. Nothing resumes a run of a session nobody opens.
+- **No loop.** When a resumed run stops on the same reset time again (or an earlier one), the module does not resume it again in that process, drops any retry still pending for it, and logs `dynamic_workflow.quota_resume.not_advancing`. A later reset time is a new window and is resumed as usual.
+- **Repeated resumes are spaced.** In one process, each auto-resume of a run pushes the earliest next one further out: `WORKFLOW_QUOTA_RESUME_MIN_SPACING_MS` (10 minutes) after the previous start, doubling each time, at most `WORKFLOW_QUOTA_RESUME_MAX_SPACING_MS` (one hour). The no-loop rule catches a reset time that does not move; this one catches a reset time that moves but is wrong, such as a provider that answers a quota stop with a `Retry-After` of a few seconds, which would otherwise resume the run and hit the cap once a minute. Real quota windows are hours apart, so the spacing does not delay them.
+- **A transient refusal is retried, a few times.** The resume can fail for reasons that pass: `already_running` (the run is in flight in this process, such as the user pressing Resume at the same moment), or a thrown error (the execution boundary, a close race). The module tries again `WORKFLOW_QUOTA_RESUME_MARGIN_MS` later, at most `WORKFLOW_QUOTA_RESUME_RETRY_LIMIT` (2) times, and each retry reads the row again like any firing, so a run that did start in the meantime is left alone. The other refusals (`not_found`, `not_resumable`, `superseded`, `script_missing`, `script_mismatch`, `compile_failed`) say the run cannot be resumed as it is, and are logged and not retried. After the last retry the module logs `dynamic_workflow.quota_resume.gave_up`; the row is still a quota stop, so the next cold start of the session tries again.
+- **A failed read ends the attempt, not the process.** Every journal read on the timer and run-settled paths is guarded like the cold-start scan: an exception is logged as `dynamic_workflow.quota_resume.read_failed` with a clipped message, and that run is not resumed this time. The module never lets an exception escape a timer callback or a subscription.
+- **Close stops it first.** App close disposes the module before it closes the run service, so a timer never fires into a closed service.
+
+The stop notification says the run resumes by itself after the reset and tells the main agent not to call `ResumeWorkflowRun` before then (`docs/dynamic-workflow/transcript-and-notifications.md`).
 
 ## Engine ownership
 
@@ -717,6 +759,20 @@ A subagent that is blocked by something outside its reach asks the main agent in
 
 The engine core is unaware of escalation: it happens inside the driver's execution of one ask, writes no node row, and leaves the ask's `inputHash` untouched. After a resume, an ask that was waiting on a question re-executes and the subagent asks again under a new `qid`. The notification the main agent receives, and the GUI's question row, are described in `transcript-and-notifications.md`.
 
+## Search budget
+
+Each ask may make a bounded number of `WebSearch` calls (`docs/dynamic-workflow/authoring.md`, "A subagent's search budget"). Like escalation, the budget lives inside the driver's execution of one ask: the engine core never sees it, it writes no node row and no run event, and it leaves the ask's `inputHash` untouched.
+
+| Element | Behaviour |
+| --- | --- |
+| Limit | `persona.budget.webSearch` when present, else `DEFAULT_WEB_SEARCH_BUDGET_PER_ASK = 128`; read once when the driver creates the subagent session |
+| Count | `webSearchesUsed` on the driver's session state; set to 0 by `startAsk`, not by a nudge or a repair turn |
+| Charge | `WorkflowWebSearchBudgetPort.charge()` is called by the `WebSearch` handler before it sends its request; it is synchronous, so parallel calls in one batch are counted exactly. A call outside an ask is not charged and runs, the same as in a session without the port |
+| Over budget | `charge()` returns `{kind: "exhausted", limit, message}`; the handler returns a tool error with `WEB_SEARCH_BUDGET_EXHAUSTED_ERROR_CODE` and that message, and sends no request |
+| Injection | the driver builds the port per subagent session and passes it through the runtime factory with the submit and escalate ports; a runtime without the port has no budget |
+
+The refusal is an error result rather than a normal one because the `WebSearch` output schema has no field for it, and because the tool error is what usage records count (`tool_usage.status = 'error'`), which makes budget hits visible without a new event. The message asks the subagent to say in its result that its search was cut short; that is how a hit reaches the main agent.
+
 ## Holes
 
 A hole is a request from the script to the main agent for code (`docs/dynamic-workflow/authoring.md`, "Holes"). Unlike an escalation, which lives inside the driver's execution of one ask and which the engine core never sees, a hole is a Boundary A call: the script itself waits on it, so the engine owns it the way it owns an ask, minus the driver.
@@ -770,10 +826,15 @@ Every `WorkflowError` and `DriverError` message the engine or the driver produce
 ## Engine-side persona
 
 ```ts
-export interface PersonaSpec { name?: string; system?: string; model?: string }
+export interface PersonaSpec {
+  name?: string;
+  system?: string;
+  model?: string;
+  budget?: { webSearch?: number };
+}
 ```
 
-The author's `AgentPersona` is `{ system?: string; model?: ModelRef | string }` (`authoring.md`); a bare string is the system prompt, and `model` arrives as the name string (a `ModelRef` is lowered to its name). The engine normalizes the second and third arguments of `createActor` into one `PersonaSpec`, carrying the `name` argument into `persona.name` when the persona has none. The effective name is frozen at creation and is what `DuplicateActorName`, the import cache, escalation payloads, and the `ProviderStop` details use. The persona is journaled as JSON on `dwf_actor.persona_json` and compared by canonical JSON, `model` left out, when matching an imported subagent. There is no model tier and no tool profile on the persona: every subagent has the same tool surface, and the model is the one its persona names, else inherited unless pinned (see "Subagent sessions").
+The author's `AgentPersona` is `{ system?: string; model?: ModelRef | string; budget?: { webSearch?: number } }` (`authoring.md`); a bare string is the system prompt, and `model` arrives as the name string (a `ModelRef` is lowered to its name). The engine normalizes the second and third arguments of `createActor` into one `PersonaSpec`, carrying the `name` argument into `persona.name` when the persona has none. The effective name is frozen at creation and is what `DuplicateActorName`, the import cache, escalation payloads, and the `ProviderStop` details use. `budget.webSearch` is kept only when it is an integer from 0 to 1024, and a `budget` with nothing kept is dropped. The persona is journaled as JSON on `dwf_actor.persona_json` and compared by canonical JSON, `model` and `budget` left out, when matching an imported subagent: like a model change, a budget change is the user's choice about the work still to come, and must not rerun finished work. There is no model tier and no tool profile on the persona: every subagent has the same tool surface, and the model is the one its persona names, else inherited unless pinned (see "Subagent sessions").
 
 ## How progress and completion reach the app and the main agent
 
@@ -792,7 +853,7 @@ export interface DynamicWorkflowRunProgressPayload {
 
 Two enrichments happen at this seam: an event that names a subagent gains `actorSessionId`, minted by the same function the driver uses, so the GUI can open that subagent's transcript — `actor-created`, an ask's `node-dispatched`, and a cached ask's `node-settled`, the last two carrying the same `actor` ref and minting the same id; `run-settled` gains `resumable: true` when the status is `stopped`; `actor-created` gains `model` and an ask's `node-dispatched` gains `actorModel`, the canonical string the run's `modelBindings` give the persona's model name (absent when the persona names none). Cold replay casts its payloads through this same function, so a dispatch read back from the journal arrives in the identical envelope. The progress sink checks that the event belongs to the session it was created for and never throws into the engine.
 
-Notifications are enqueued by the core for `escalation-raised` (kind `escalation`), `run-stalled` (kind `stall`), and settlement (`completed`, `errored`, `stopped` with the initiator and, for `provider`, the `ProviderStopDetails`); their texts, the `<task-notification>` envelope, and the delivery rules are in `transcript-and-notifications.md`. The main agent can also poll: the run snapshot exposes `runStatus`, `stopReason`, `failure`, `reports`, `artifacts`, and `pendingQuestions`, and the event log is readable by cursor through `listEvents`.
+Notifications are enqueued by the core for `escalation-raised` (kind `escalation`), `hole-reached` (kind `hole`), `run-stalled` (kind `stall`), and settlement (`completed`, `errored`, `stopped` with the initiator and, for `provider`, the `ProviderStopDetails`); their texts, the `<task-notification>` envelope, and the delivery rules are in `transcript-and-notifications.md`. One more notice, the reminder, comes from no run event: the core reminds the main agent when the parent session has stayed idle while a live run has an open question or a waiting hole. The engine and the journal know nothing of it; it reads the run snapshot's `pendingQuestions` and `holes`, and its rules are in the same document under "Reminding an idle main agent". The main agent can also poll: the run snapshot exposes `runStatus`, `stopReason`, `failure`, `reports`, `artifacts`, and `pendingQuestions`, and the event log is readable by cursor through `listEvents`.
 
 ## Token telemetry for subagents
 
@@ -856,7 +917,7 @@ Shapes are small scripts that differ only in parallelism, subagent count, and as
 | zero requests after stop | any request that reaches the server after `run-settled` plus a 10 ms wire grace is matched by a `cancelled` echo from the runner |
 | in-flight bound | the server's peak in-flight count never exceeds the cell's ceiling (8) |
 
-Two lifecycle cells exercise "Engine ownership" on the same bed: B18 closes the service under a live run, B19 writes a foreign terminal row under a live engine. The quick matrix runs in the default bootstrap suite; the full matrix runs when `ZCODE_FAULT_MATRIX=full` is set, with a 30 s ceiling per cell. Two production seams exist for this bed: the driver clock (`now`, `schedule`, `stallAfterMs`, `quiesceMs`) is injectable, and the adapter keeps `retryAfterMs` on its normalized error.
+The quota cell (B11) also checks what a resume will meet: right after the stop, a new request on the same provider and model is admitted at once, because a `stop`-class failure moves neither the governor's cap nor its cooldown (`docs/dynamic-workflow/concurrency.md`, "Reading a ticket"). Two lifecycle cells exercise "Engine ownership" on the same bed: B18 closes the service under a live run, B19 writes a foreign terminal row under a live engine. The quick matrix runs in the default bootstrap suite; the full matrix runs when `ZCODE_FAULT_MATRIX=full` is set, with a 30 s ceiling per cell. Two production seams exist for this bed: the driver clock (`now`, `schedule`, `stallAfterMs`, `quiesceMs`) is injectable, and the adapter keeps `retryAfterMs` on its normalized error.
 
 ## Alternatives not taken
 

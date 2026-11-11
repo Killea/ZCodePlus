@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HookEventName,
   SessionEventType,
+  createSessionEvent,
   createSessionId,
   createTurnId,
   modelMessageContentToText,
-  type AgentOutput,
   type BackgroundResultOriginMeta,
   type CreateSessionInput,
   type ModelMessageContent,
@@ -21,7 +21,10 @@ import {
   type TodoItem,
 } from "@zcode/contracts";
 import { formatTaskNotification } from "../src/runtime-task/notification.js";
-import { formatLocalAgentTaskNotification } from "../src/subagent/completion-notification.js";
+import {
+  formatLocalAgentTaskNotification,
+  localAgentSubagentResult,
+} from "../src/subagent/completion-notification.js";
 import { createTestAgentRuntime } from "./test-agent-runtime.js";
 import { createRuntimeCommandId } from "../src/runtime/command-queue.js";
 import type { PromptRuntimeCommand } from "../src/runtime/command-queue.js";
@@ -30,6 +33,15 @@ import { createInMemoryHookRunner } from "../src/hooks/index.js";
 import { createExploreSubagentPort } from "../src/subagent/runner.js";
 import { createTestSessionEventStore } from "./test-event-store.js";
 import { createTestModelFactory } from "./test-runtime-model.js";
+import {
+  waitForCondition,
+  createSubagentRunRequest,
+  createDeferred,
+} from "./subagent-background-fixture.js";
+
+// 后台 agent 通知的固定 <note>；测试里写死，锁定字节。
+const LOCAL_AGENT_NOTE =
+  "A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.";
 
 describe("subagent background notifications", () => {
   it("formats local_agent task notification as user-role XML", () => {
@@ -55,14 +67,13 @@ describe("subagent background notifications", () => {
         "<tool-use-id>toolu_123</tool-use-id>",
         "<output-file>/tmp/zcode-agents/sess/agent/output.txt</output-file>",
         "<status>completed</status>",
-        "<summary>Agent &quot;Audit tests&quot; completed</summary>",
+        '<summary>Agent "Audit tests" completed</summary>',
+        `<note>${LOCAL_AGENT_NOTE}</note>`,
         "<result>child result</result>",
         "<usage><subagent_tokens>9</subagent_tokens><tool_uses>2</tool_uses><duration_ms>42</duration_ms></usage>",
         "</task-notification>",
       ].join("\n"),
     );
-    expect(notification).not.toContain("[SYSTEM NOTIFICATION");
-    expect(notification).not.toContain("<task-type>local_agent</task-type>");
   });
 
   it("omits unavailable local_agent usage fields", () => {
@@ -82,19 +93,27 @@ describe("subagent background notifications", () => {
     expect(notification).not.toContain("tool_uses");
   });
 
-  it("formats completed, failed, and stopped local-agent notifications through one helper", () => {
+  // summary 措辞、每条都带 <note>、只转义 & < >、不输出 <error>；
+  // failed / killed 不带 usage，killed 按停止者措辞。
+  it("formats completed, failed, and killed local-agent notifications with the terminal notification shape", () => {
     const base = {
       agentId: "agent_helper",
-      agentType: "custom-reviewer",
-      description: "Review changes",
+      description: 'Review "auth" changes',
       outputFile: "/tmp/agent_helper/output.txt",
       parentToolCallId: "toolu_helper",
       totalDurationMs: 12,
     };
+    const header = [
+      "<task-notification>",
+      "<task-id>agent_helper</task-id>",
+      "<tool-use-id>toolu_helper</tool-use-id>",
+      "<output-file>/tmp/agent_helper/output.txt</output-file>",
+    ];
+    const note = `<note>${LOCAL_AGENT_NOTE}</note>`;
 
     const completed = formatLocalAgentTaskNotification({
       ...base,
-      result: "looks good",
+      result: 'It\'s done <ok> & "clean".',
       status: "completed",
       totalTokens: 7,
       totalToolUseCount: 1,
@@ -104,29 +123,80 @@ describe("subagent background notifications", () => {
       error: "child failed",
       status: "failed",
     });
-    const stopped = formatLocalAgentTaskNotification({
+    const failedWithoutReason = formatLocalAgentTaskNotification({
       ...base,
-      status: "stopped",
+      error: "",
+      status: "failed",
+    });
+    const stoppedByModel = formatLocalAgentTaskNotification({
+      ...base,
+      status: "killed",
+      stoppedBy: "model",
+    });
+    const stoppedByUser = formatLocalAgentTaskNotification({
+      ...base,
+      status: "killed",
+      stoppedBy: "user",
+    });
+    const stoppedBySystem = formatLocalAgentTaskNotification({
+      ...base,
+      status: "killed",
     });
 
-    expect(completed).toContain("<status>completed</status>");
-    expect(completed).toContain("<result>looks good</result>");
-    expect(completed).toContain(
-      "<summary>Agent custom-reviewer task &quot;Review changes&quot; completed.</summary>",
+    expect(completed).toBe(
+      [
+        ...header,
+        "<status>completed</status>",
+        '<summary>Agent "Review "auth" changes" finished</summary>',
+        note,
+        '<result>It\'s done &lt;ok&gt; &amp; "clean".</result>',
+        "<usage><subagent_tokens>7</subagent_tokens><tool_uses>1</tool_uses><duration_ms>12</duration_ms></usage>",
+        "</task-notification>",
+      ].join("\n"),
     );
-    expect(completed).not.toContain("<error>");
-    expect(completed).toContain("<subagent_tokens>7</subagent_tokens>");
-    expect(failed).toContain("<status>failed</status>");
-    expect(failed).toContain(
-      "<summary>Agent custom-reviewer task &quot;Review changes&quot; failed. child failed</summary>",
+    expect(failed).toBe(
+      [
+        ...header,
+        "<status>failed</status>",
+        '<summary>Agent "Review "auth" changes" failed: child failed</summary>',
+        note,
+        "</task-notification>",
+      ].join("\n"),
     );
-    expect(failed).toContain("<error>child failed</error>");
-    expect(stopped).toContain("<status>stopped</status>");
-    expect(stopped).toContain(
-      "<summary>Agent custom-reviewer task &quot;Review changes&quot; stopped.</summary>",
+    expect(failedWithoutReason).toContain(
+      '<summary>Agent "Review "auth" changes" failed: Unknown error</summary>',
     );
-    expect(stopped).not.toContain("<error>");
-    expect(stopped).not.toContain("Explore");
+    // 只有空白的失败原因与空串相同：summary 和结构化 error 都用 Unknown error。
+    const blankError = { error: " \n\t", status: "failed" as const };
+    expect(formatLocalAgentTaskNotification({ ...base, ...blankError })).toContain(
+      '<summary>Agent "Review "auth" changes" failed: Unknown error</summary>',
+    );
+    expect(localAgentSubagentResult(blankError)).toEqual({
+      status: "failed",
+      error: "Unknown error",
+    });
+    // 结构化 error 进入每一帧快照，需要上限；截断点落在代理对中间时丢掉半个字符。
+    const longError = `${"x".repeat(1998)}😀${"y".repeat(600)}`;
+    const longResult = localAgentSubagentResult({ error: longError, status: "failed" });
+    expect(longResult.error).toBe(`${"x".repeat(1998)}…`);
+    expect(
+      formatLocalAgentTaskNotification({ ...base, error: longError, status: "failed" }),
+    ).toContain(longError);
+    expect(stoppedByModel).toBe(
+      [
+        ...header,
+        "<status>killed</status>",
+        '<summary>Agent "Review "auth" changes" was stopped by ZCode</summary>',
+        note,
+        "</task-notification>",
+      ].join("\n"),
+    );
+    expect(stoppedByUser).toContain(
+      '<summary>Agent "Review "auth" changes" was stopped by user</summary>',
+    );
+    expect(stoppedBySystem).toContain(
+      '<summary>Agent "Review "auth" changes" was stopped</summary>',
+    );
   });
 
   it("drains pending background notifications as strict snapshot batches", async () => {
@@ -264,7 +334,7 @@ describe("subagent background notifications", () => {
     expect(notificationTexts[2]).not.toContain("<task-id>agent_idle_3</task-id>");
     const firstNotificationMessage = notificationInputs[0];
     expect(firstNotificationMessage?.role).toBe("user");
-    expect(modelMessageContentToText(firstNotificationMessage?.content)).not.toContain(
+    expect(modelMessageContentToText(firstNotificationMessage?.content)).toContain(
       "<system-reminder>",
     );
     expect(hookEvents).toEqual([]);
@@ -272,15 +342,24 @@ describe("subagent background notifications", () => {
     const backgroundMessages = sessionStore.savedMessages.filter(
       (message) => message.source === "background_task",
     );
-    expect(backgroundMessages).toHaveLength(3);
+    // 每批一条消息；第二批的两条通知是同一条消息的两个文本 part（存储没有事务入口时逐条写入）。
+    const notification = (id: number) =>
+      `<task-notification>\n<task-id>agent_idle_${id}</task-id>\n</task-notification>`;
     expect(
-      sessionStore.savedParts.filter(
-        (part) =>
-          part.type === "text" &&
-          part.metadata?.source === "background_task" &&
-          part.metadata?.visibility === "model-only",
-      ),
-    ).toHaveLength(3);
+      sessionStore.savedParts
+        .filter(
+          (part) =>
+            part.type === "text" &&
+            part.metadata?.source === "background_task" &&
+            part.metadata?.visibility === "model-only",
+        )
+        .map((part) => [part.messageID, part.type === "text" ? part.text : ""]),
+    ).toEqual([
+      [backgroundMessages[0]!.id, notification(1)],
+      [backgroundMessages[1]!.id, notification(2)],
+      [backgroundMessages[1]!.id, notification(3)],
+      [backgroundMessages[2]!.id, notification(4)],
+    ]);
     expect(backgroundMessages.map((message) => message.metadata?.originMeta)).toEqual([
       {
         backgroundSource: "subagent",
@@ -323,6 +402,12 @@ describe("subagent background notifications", () => {
       )
       .filter((payload) => payload.inputSource === "background_task");
     expect(wakeTurns).toHaveLength(3);
+    // 这一轮的输入文本仍以 "\n\n" 相连，App 据此逐条解析任务卡片。
+    expect(wakeTurns.map((turn) => (turn as { input?: string }).input)).toEqual([
+      notification(1),
+      `${notification(2)}\n\n${notification(3)}`,
+      notification(4),
+    ]);
     expect(new Set(wakeTurns.map((turn) => turn.inputId)).size).toBe(3);
     for (const turn of wakeTurns) {
       expect(turn.inputId).toMatch(
@@ -1343,12 +1428,15 @@ describe("subagent background notifications", () => {
         backgroundSource: "subagent",
         title: "Auto background test",
         workId: "agent_auto_background",
+        subagentResult: { status: "completed" },
       },
       taskId: "agent_auto_background",
     });
     expect(notifications[0]?.text).toContain("<task-id>agent_auto_background</task-id>");
     expect(notifications[0]?.text).toContain("<status>completed</status>");
-    expect(notifications[0]?.text).toContain("auto background child finished");
+    // 框架只用于同步返回的工具结果；后台完成通知里的报告原样放进 <result>。
+    expect(notifications[0]?.text).toContain("<result>auto background child finished</result>");
+    expect(notifications[0]?.text).not.toContain("[Subagent hand-back]");
   });
 
   it("preserves the provider cause across failed background local-agent surfaces", async () => {
@@ -1360,6 +1448,7 @@ describe("subagent background notifications", () => {
     const sessionId = createSessionId("subagent-background-rate-limit");
     const turnId = createTurnId("subagent-background-rate-limit-turn");
     const notifications: string[] = [];
+    const notificationOriginMetas: unknown[] = [];
     const emittedEvents: SessionEvent[] = [];
     const providerError = Object.assign(new Error(providerMessage), {
       code: "model_rate_limited",
@@ -1375,8 +1464,9 @@ describe("subagent background notifications", () => {
       emitParentEvent: async (event) => {
         emittedEvents.push(event);
       },
-      enqueueParentTaskNotification: ({ text }) => {
+      enqueueParentTaskNotification: ({ originMeta, text }) => {
         notifications.push(text);
+        notificationOriginMetas.push(originMeta);
       },
       runExploreAgent: async (request) => {
         await request.onSessionReady?.();
@@ -1392,10 +1482,19 @@ describe("subagent background notifications", () => {
 
     const notification = notifications[0]!;
     expect(notification).toContain(
-      `<summary>Agent general-purpose task &quot;Auto background test&quot; failed. ${providerMessage}</summary>`,
+      `<summary>Agent "Auto background test" failed: ${providerMessage}</summary>`,
     );
-    expect(notification).toContain(`<error>${providerMessage}</error>`);
+    expect(notification).not.toContain("<error>");
     expect(notification).not.toContain("Turn execution failed");
+    // child 没写过正文，失败通知不带部分报告。
+    expect(notification).not.toContain("<result>");
+    // 失败原文结构化下发，App 不从 summary 文本解析。
+    expect(notificationOriginMetas).toEqual([
+      expect.objectContaining({
+        backgroundSource: "subagent",
+        subagentResult: { status: "failed", error: providerMessage },
+      }),
+    ]);
     expect(await port.getTask?.("agent_background_rate_limit")).toMatchObject({
       status: "failed",
       error: providerMessage,
@@ -1409,6 +1508,74 @@ describe("subagent background notifications", () => {
         }),
       }),
     );
+  });
+
+  it("adds the partial report to failed background notifications", async () => {
+    // 回归：后台失败通知原来不带 <result>。现在取本次运行最近一段非空 step 正文，
+    // 原样放进 <result>（不套框架）；sink 转发的其他 session 事件不算。
+    const notifications: string[] = [];
+    const port = createExploreSubagentPort({
+      createAgentId: () => "agent_background_partial",
+      emitParentEvent: async () => {},
+      enqueueParentTaskNotification: ({ text }) => {
+        notifications.push(text);
+      },
+      runExploreAgent: async (request) => {
+        await request.onSessionReady?.();
+        request.onEvent?.(subagentModelStep(request.sessionId, "Interim findings: module A."));
+        request.onEvent?.(subagentModelStep(request.sessionId, ""));
+        request.onEvent?.(
+          subagentModelStep(createSessionId("subagent-background-other"), "Foreign findings."),
+        );
+        throw new Error("Requests are too frequent.");
+      },
+    });
+
+    await port.start?.(
+      createSubagentRunRequest({
+        sessionId: createSessionId("subagent-background-partial"),
+        turnId: createTurnId("subagent-background-partial-turn"),
+      }),
+    );
+    await waitForCondition(() => notifications.length === 1);
+
+    expect(notifications[0]).toContain("<status>failed</status>");
+    expect(notifications[0]).toContain("<result>Interim findings: module A.</result>");
+    expect(notifications[0]).not.toContain("Foreign findings.");
+    expect(notifications[0]).not.toContain("[Subagent hand-back]");
+  });
+
+  it("adds the partial report when an auto-backgrounded local agent fails", async () => {
+    // 转后台前写的正文也属于本次运行，转后台后失败时同样带上。
+    const childGate = createDeferred<void>();
+    const notifications: string[] = [];
+    const port = createExploreSubagentPort({
+      autoBackgroundMs: 1,
+      createAgentId: () => "agent_auto_background_partial",
+      emitParentEvent: async () => {},
+      enqueueParentTaskNotification: ({ text }) => {
+        notifications.push(text);
+      },
+      runExploreAgent: async (request) => {
+        await request.onSessionReady?.();
+        request.onEvent?.(subagentModelStep(request.sessionId, "Findings before backgrounding."));
+        await childGate.promise;
+        throw new Error("Requests are too frequent.");
+      },
+    });
+
+    const output = await port.run(
+      createSubagentRunRequest({
+        sessionId: createSessionId("subagent-auto-background-partial"),
+        turnId: createTurnId("subagent-auto-background-partial-turn"),
+      }),
+    );
+    expect(output).toMatchObject({ status: "async_launched" });
+    childGate.resolve();
+    await waitForCondition(() => notifications.length === 1);
+
+    expect(notifications[0]).toContain("<status>failed</status>");
+    expect(notifications[0]).toContain("<result>Findings before backgrounding.</result>");
   });
 
   it("queues parent notification before emitting background completion", async () => {
@@ -1465,17 +1632,17 @@ describe("subagent background notifications", () => {
     expect(stoppedIndex).toBeGreaterThan(completedIndex);
   });
 
-  it("keeps the auto-background timeout referenced until it fires", async () => {
+  it("auto-backgrounds with a referenced timeout and publishes the child result", async () => {
     const sessionId = createSessionId("subagent-auto-background-timeout-ref");
     const turnId = createTurnId("subagent-auto-background-timeout-ref-turn");
     const childGate = createDeferred<void>();
-    const notifications: string[] = [];
+    const notifications: Array<Record<string, unknown>> = [];
     const port = createExploreSubagentPort({
       autoBackgroundMs: 1,
       createAgentId: () => "agent_auto_background_timeout_ref",
       emitParentEvent: async () => {},
-      enqueueParentTaskNotification: ({ text }) => {
-        notifications.push(text);
+      enqueueParentTaskNotification: (notification) => {
+        notifications.push(notification);
       },
       runExploreAgent: async (request) => {
         await request.onSessionReady?.();
@@ -1505,6 +1672,19 @@ describe("subagent background notifications", () => {
     expect(unrefRecorder.calls).toEqual([]);
     childGate.resolve();
     await waitForCondition(() => notifications.length === 1);
+    expect(notifications[0]).toMatchObject({
+      originMeta: {
+        backgroundSource: "subagent",
+        title: "Auto background test",
+        workId: "agent_auto_background_timeout_ref",
+      },
+      taskId: "agent_auto_background_timeout_ref",
+    });
+    expect(notifications[0]?.text).toContain(
+      "<task-id>agent_auto_background_timeout_ref</task-id>",
+    );
+    expect(notifications[0]?.text).toContain("<status>completed</status>");
+    expect(notifications[0]?.text).toContain("auto background timeout ref child finished");
   });
 
   it("does not mark background local agents notified without a parent notification queue", async () => {
@@ -1586,77 +1766,6 @@ describe("subagent background notifications", () => {
     expect(task?.notified).not.toBe(true);
   });
 
-  it("cancels auto-background timeout when a foreground local agent completes first", async () => {
-    const sessionId = createSessionId("subagent-auto-background-cancelled");
-    const turnId = createTurnId("subagent-auto-background-cancelled-turn");
-    const blockedArtifactWrite = createDeferred<void>();
-    let outputWriteStarted = false;
-    const notifications: string[] = [];
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-    vi.resetModules();
-    vi.doMock("node:fs/promises", () => ({
-      ...actualFs,
-      writeFile: vi.fn(async (...args: Parameters<typeof actualFs.writeFile>) => {
-        const [path] = args;
-        if (String(path).endsWith("/output.txt") && !outputWriteStarted) {
-          outputWriteStarted = true;
-          await blockedArtifactWrite.promise;
-        }
-        return actualFs.writeFile(...args);
-      }),
-    }));
-
-    try {
-      const { createExploreSubagentPort: createPortWithBlockedArtifactWrite } =
-        await import("../src/subagent/runner.js");
-      const port = createPortWithBlockedArtifactWrite({
-        autoBackgroundMs: 1,
-        createAgentId: () => "agent_auto_background_cancelled",
-        emitParentEvent: async () => {},
-        enqueueParentTaskNotification: ({ text }) => {
-          notifications.push(text);
-        },
-        runExploreAgent: async (request) => {
-          await request.onSessionReady?.();
-          return {
-            events: [],
-            response: "foreground child beat timeout",
-            traceId: "trace_subagent_auto_background_cancelled",
-          };
-        },
-      });
-
-      const outputPromise = port.run(createSubagentRunRequest({ sessionId, turnId }));
-      await waitForCondition(() => outputWriteStarted);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      const taskWhileArtifactWriteIsPending = await port.getTask?.(
-        "agent_auto_background_cancelled",
-      );
-      blockedArtifactWrite.resolve();
-
-      const output = await outputPromise;
-      expect(output).toMatchObject({
-        status: "completed",
-        agentId: "agent_auto_background_cancelled",
-      });
-      expect(taskWhileArtifactWriteIsPending).toMatchObject({
-        status: "running",
-        isBackgrounded: false,
-      });
-
-      const task = await port.getTask?.("agent_auto_background_cancelled");
-      expect(task).toMatchObject({
-        status: "completed",
-        isBackgrounded: false,
-      });
-      expect(notifications).toEqual([]);
-    } finally {
-      blockedArtifactWrite.resolve();
-      vi.doUnmock("node:fs/promises");
-      vi.resetModules();
-    }
-  });
-
   it("keeps foreground local agents inline when auto-background timeout is not configured", async () => {
     const sessionId = createSessionId("subagent-no-auto-background");
     const turnId = createTurnId("subagent-no-auto-background-turn");
@@ -1683,9 +1792,58 @@ describe("subagent background notifications", () => {
       status: "completed",
       agentId: "agent_no_auto_background",
     });
-    expect((output as AgentOutput).status).toBe("completed");
     expect(notifications).toEqual([]);
   });
+
+  it.each(["explicit", "profile", "timeout"])(
+    "supports off-peak background model overrides: %s",
+    async (kind) => {
+      const gate = createDeferred<void>();
+      const calls: unknown[] = [];
+      const port = createExploreSubagentPort({
+        createAgentId: () => "idle-background",
+        ...(kind === "timeout" ? { autoBackgroundMs: 1 } : {}),
+        emitParentEvent: async () => {},
+        profiles: [
+          {
+            name: "Idle Reviewer",
+            description: "Review",
+            source: "user",
+            systemPrompt: "Review",
+            tools: ["Read"],
+            background: kind === "profile",
+          },
+        ],
+        runExploreAgent: async (request, options) => {
+          calls.push(options);
+          await request.onSessionReady?.();
+          await gate.promise;
+          return { events: [], response: "done", traceId: "idle-background-trace" };
+        },
+      });
+      const modelOverride = {
+        selection: { providerId: "idle", modelId: "model" },
+        background: "allow" as const,
+      };
+      try {
+        const output = await port.launch(
+          {
+            ...createSubagentRunRequest({
+              sessionId: createSessionId("idle-parent"),
+              turnId: createTurnId("idle-turn"),
+            }),
+            agentType: "Idle Reviewer",
+            runInBackground: kind === "explicit",
+          },
+          { modelOverride },
+        );
+        expect(output.status).toBe("async_launched");
+        expect(calls).toEqual([expect.objectContaining({ modelOverride })]);
+      } finally {
+        gate.resolve();
+      }
+    },
+  );
 
   it("rejects background launch when an execution model override is present", async () => {
     const sessionId = createSessionId("subagent-background-turn-execution-model");
@@ -1755,17 +1913,6 @@ describe("subagent background notifications", () => {
   });
 });
 
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((innerResolve) => {
-    resolve = innerResolve;
-  });
-  return { promise, resolve };
-}
-
 function modelTextResult(text: string) {
   return {
     finishReason: "stop",
@@ -1788,15 +1935,6 @@ async function waitForMacrotask(): Promise<void> {
   await new Promise<void>((resolve) => {
     setTimeout(resolve, 0);
   });
-}
-
-async function waitForCondition(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 1000) {
-    if (await predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("Timed out waiting for condition");
 }
 
 async function waitForAbort(signal?: AbortSignal): Promise<void> {
@@ -1860,26 +1998,13 @@ function recordSetTimeoutCalls(): {
   };
 }
 
-function createSubagentRunRequest(input: {
-  sessionId: SessionId;
-  turnId: ReturnType<typeof createTurnId>;
-}) {
-  return {
-    agentType: "general-purpose",
-    description: "Auto background test",
-    parentToolCallId: "call_auto_background",
-    prompt: "Run slowly",
-    sessionId: input.sessionId,
-    trace: {
-      traceId: "trace_subagent_auto_background_parent",
-      spanId: "span_subagent_auto_background_parent",
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-    },
-    turnId: input.turnId,
-    workingDirectory: "/tmp/zcode-subagent-auto-background",
-    workspaceRoot: "/tmp/zcode-subagent-auto-background",
-  };
+// 子代理自己主循环的一个模型 step（querySource: "subagent"），runner 从这类事件取部分报告。
+function subagentModelStep(sessionId: SessionId, text: string) {
+  return createSessionEvent(SessionEventType.ModelComplete, sessionId, {
+    content: text,
+    querySource: "subagent",
+    toolCallCount: 1,
+  });
 }
 
 class RecordingSessionStore {
@@ -1937,8 +2062,6 @@ class RecordingSessionStore {
           input.timeCompacting === null
             ? undefined
             : (input.timeCompacting ?? session.time.compacting),
-        archived:
-          input.timeArchived === null ? undefined : (input.timeArchived ?? session.time.archived),
       },
     };
     this.sessions.set(input.id, next);

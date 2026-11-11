@@ -3,6 +3,7 @@ import { modelSelectionSchema, type ModelSelection } from "@zcode/shared/model-s
 import { submissionModeSchema, type SubmissionMode } from "@zcode/shared/zcode-protocol-v4";
 import type { ModelSelectionView } from "@zcode/services";
 import { logger } from "@/logger.js";
+import { composerScopeKey, type ComposerScope } from "@/v4/composer/composerDraftStore.js";
 
 // 沿用旧 key，读取时兼容只保存 ModelSelection 的历史记录。
 const COMPOSER_RECENT_KEY_PREFIX = "zcode-model-selection-recent-v1";
@@ -17,10 +18,86 @@ interface ComposerRecent {
   readonly mode?: SubmissionMode;
 }
 
+interface RecentScopeReceipt {
+  scope: ComposerScope;
+  order: number;
+}
+
+export interface FullAccessRecentReceipt extends RecentScopeReceipt {
+  mode: "yolo" | "guarded";
+}
+
+export interface ComposerRecentReceipt extends RecentScopeReceipt {
+  selection: { modelSelection: ModelSelection; mode: SubmissionMode };
+}
+let lastReceiptOrder = 0;
+export function captureRecentOrder(): number {
+  lastReceiptOrder = Math.max(Date.now() * 1000, lastReceiptOrder + 1);
+  return lastReceiptOrder;
+}
+
+export function prepareComposerRecentReceipt(
+  scope: ComposerScope,
+  selection: ComposerRecentReceipt["selection"],
+): ComposerRecentReceipt {
+  return {
+    scope: { ...scope },
+    selection: JSON.parse(JSON.stringify(selection)),
+    order: captureRecentOrder(),
+  };
+}
+export function acceptComposerRecentReceipt(
+  receipt: ComposerRecentReceipt | FullAccessRecentReceipt,
+  storage: StorageLike | null = browserStorage(),
+): boolean {
+  if (!storage) return false;
+  const submission = "selection" in receipt ? receipt.selection : undefined;
+  const selection = modelSelectionSchema.safeParse(submission?.modelSelection);
+  const mode = submissionModeSchema.safeParse("mode" in receipt ? receipt.mode : submission?.mode);
+  if (
+    !mode.success ||
+    (submission && (!selection.success || isHighspeedProviderId(selection.data.providerId)))
+  )
+    return true;
+  const key = resolveComposerRecentKey("", undefined, receipt.scope);
+  try {
+    let previous: { order?: number; modeOrder?: number } | null = null;
+    try {
+      previous = JSON.parse(storage.getItem(key) ?? "null");
+    } catch {
+      /* 损坏偏好可被真实接纳替换。 */
+    }
+    // 回执/查询/快照可能重复到达；持久化顺序让刷新后的旧回执也不能回滚默认配置。
+    if (typeof previous?.order === "number" && previous.order >= receipt.order) return true;
+    // 授权只推进权限顺序。较早提交的回执仍可补齐模型，但不能撤销较新的授权。
+    const updateMode = receipt.order > (previous?.modeOrder ?? previous?.order ?? -1);
+    if (!submission && !updateMode) return true;
+    storage.setItem(
+      key,
+      JSON.stringify({
+        ...previous,
+        ...(submission && selection.success
+          ? { modelSelection: selection.data, order: receipt.order }
+          : {}),
+        ...(updateMode ? { mode: mode.data, modeOrder: receipt.order } : {}),
+      }),
+    );
+    return true;
+  } catch (error) {
+    logger.warn("[ComposerRecent] 接纳配置交接失败，保留命令恢复线索", error);
+    return false;
+  }
+}
+
 let submissionSequence = 0;
 const acceptedSequences = new WeakMap<StorageLike, Map<string, number>>();
 
-function resolveComposerRecentKey(workspacePath: string, workspaceIdentity?: string): string {
+function resolveComposerRecentKey(
+  workspacePath: string,
+  workspaceIdentity?: string,
+  scope?: ComposerScope,
+): string {
+  if (scope) return `zcode-composer-recent:v2:${composerScopeKey(scope)}`;
   const workspaceKey = workspaceIdentity?.trim() || workspacePath;
   return `${COMPOSER_RECENT_KEY_PREFIX}:${workspaceKey}`;
 }
@@ -29,10 +106,11 @@ export function readComposerRecent(
   workspacePath: string,
   workspaceIdentity?: string,
   storage: StorageLike | null = browserStorage(),
+  scope?: ComposerScope,
 ): ComposerRecent | null {
   if (!storage) return null;
   try {
-    const raw = storage.getItem(resolveComposerRecentKey(workspacePath, workspaceIdentity));
+    const raw = storage.getItem(resolveComposerRecentKey(workspacePath, workspaceIdentity, scope));
     if (!raw) return null;
     const record: unknown = JSON.parse(raw);
     if (!record || typeof record !== "object" || Array.isArray(record)) return null;
@@ -64,9 +142,10 @@ export function captureComposerRecentSubmission(
   submission: { readonly modelSelection: ModelSelection; readonly mode: SubmissionMode },
   workspaceIdentity?: string,
   storage: StorageLike | null = browserStorage(),
+  scope?: ComposerScope,
 ): () => void {
   if (!storage) return () => {};
-  const key = resolveComposerRecentKey(workspacePath, workspaceIdentity);
+  const key = resolveComposerRecentKey(workspacePath, workspaceIdentity, scope);
   const mode = submissionModeSchema.safeParse(submission.mode);
   const modelSelection = normalizeSparseModelSelection(submission.modelSelection);
   if (modelSelection && isHighspeedProviderId(modelSelection.providerId)) {

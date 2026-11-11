@@ -23,6 +23,7 @@ import {
   normalizeDynamicWorkflowMode,
   readZCodeAgentTelemetryEnv,
   sanitizeZCodeRuntimeEnv,
+  type SourceServerArtifactPolicy,
   type ZCodeRuntimeEnv,
 } from "@zcode/shared";
 import { resolvePlatformKeyForPackagedApp } from "../../scripts/target-platform.mjs";
@@ -92,6 +93,8 @@ export const runtimeSessionDataPath =
 // 导致 Electron 已启动但 WebDriver session 一直创建失败。测试态打开该开关后保留 Chromedriver 的目录。
 export const hostModulePath = join(import.meta.dirname, "../host/index.js");
 export const schedulerModulePath = join(import.meta.dirname, "../scheduler/index.js");
+// 全 App 唯一的扩展进程（docs/plugins/extension-host.md §12.1）。
+export const extensionHostModulePath = join(import.meta.dirname, "../extension-host/index.js");
 export function getCredentialsDir() {
   return getAppConfigDir();
 }
@@ -99,7 +102,9 @@ export function getCredentialsDir() {
 export type RemoteAssetDirs = Pick<
   ConnectOptions,
   "mockCdnDir" | "remoteCdnBaseUrl" | "remoteCdnBaseUrls" | "remoteCacheDir"
->;
+> & {
+  sourceServerArtifactPolicy?: SourceServerArtifactPolicy;
+};
 type LocalRuntimeEnv = Record<string, string | undefined>;
 
 export async function isDockerDaemonAvailable(): Promise<boolean> {
@@ -354,6 +359,9 @@ export function resolveRemoteAssetDirs(
   const developmentMockCdnDir = resolveAvailableDevelopmentMockCdnDir();
   return {
     ...(developmentMockCdnDir ? { mockCdnDir: developmentMockCdnDir } : {}),
+    // Bug 原因：ZCODE_ENV 表示测试/生产产品环境，dev:desktop 也可能取 production；
+    // 同版本开发制品刷新必须由未打包 Electron 这一运行形态显式授权。
+    sourceServerArtifactPolicy: "development-content-addressed",
     remoteCdnBaseUrl,
     remoteCdnBaseUrls,
     remoteCacheDir: resolveRemoteAssetCacheDir(localEnv),

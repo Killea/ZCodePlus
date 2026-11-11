@@ -287,6 +287,46 @@ describe("订阅与帧调度", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it("raw cache slims request history without changing live events or sequence continuity", async () => {
+    const gateway = makeGateway(makeHost());
+    const log = new EventLog();
+    gateway.ingest("session-1", sessionCreated(log));
+    const request = log.push(SessionEventType.ModelRequest, {
+      messages: [{ role: "user", content: "history" }],
+      providerId: "fixture",
+      modelId: "model",
+    });
+    gateway.ingest("session-1", request);
+    gateway.ingest(
+      "session-1",
+      log.push(
+        SessionEventType.TurnStarted,
+        { turnNumber: 1, input: "next", inputId: "input" },
+        { turnId: "turn-1" },
+      ),
+    );
+    const states = (
+      gateway as unknown as {
+        rawSequenceStates: Map<
+          string,
+          {
+            recentRawEventsById: Map<string, SessionEvent>;
+            sourceEventSeq: number;
+          }
+        >;
+      }
+    ).rawSequenceStates;
+    const state = states.get("session-1")!;
+    expect(state.recentRawEventsById.get(String(request.id))).toEqual({
+      ...request,
+      payload: { providerId: "fixture", modelId: "model", messageCount: 1 },
+    });
+    expect(request.payload).toHaveProperty("messages");
+    expect(state.sourceEventSeq).toBe(3);
+    expect((await gateway.subscribe(subscribeParams())).ack.mode).toBe("snapshot");
+    gateway.dispose();
+  });
+
   it("subscribe 内部 dispatch result 携带待入 outbox 的 snapshot 初始帧", async () => {
     const host = makeHost();
     const gateway = makeGateway(host);
@@ -625,7 +665,78 @@ describe("订阅与帧调度", () => {
     expect(JSON.stringify(host.telemetryFacts)).not.toContain("不能透传");
   });
 
-  it("Skill tool result 只透传受限 metadata，其他工具不继承", () => {
+  it.each([{ skill: "requested-skill" }, { name: "legacy-skill" }])(
+    "Skill 调度不提取任何请求名称: %#",
+    (input) => {
+      const host = makeHost();
+      const gateway = makeGateway(host);
+      const log = new EventLog();
+      gateway.ingest("session-1", sessionCreated(log));
+      gateway.ingest(
+        "session-1",
+        log.push(
+          SessionEventType.ToolCallScheduled,
+          {
+            toolCallId: "tool-skill-request",
+            toolName: "Skill",
+            input: { ...input, args: "private-arguments" },
+            schedule: { parallelGroups: [], executionOrder: [] },
+          },
+          { turnId: "turn-skill" },
+        ),
+      );
+      const fact = host.telemetryFacts.find((fact) => fact.kind === "tool.lifecycle");
+      expect(fact).toMatchObject({ toolName: "Skill", phase: "scheduled" });
+      expect(fact).not.toHaveProperty("skillName");
+      expect(JSON.stringify(host.telemetryFacts)).not.toContain("private-arguments");
+      const name = "skill" in input ? input.skill : input.name;
+      if (typeof name === "string") expect(JSON.stringify(host.telemetryFacts)).not.toContain(name);
+    },
+  );
+
+  it.each(["/Users/FAKE_USER/private", "demo\nsecret", "sk-" + "a".repeat(49), "a".repeat(5000)])(
+    "Skill 已解析 metadata 仍需名称校验: %#",
+    (name) => {
+      const host = makeHost();
+      const gateway = makeGateway(host);
+      const log = new EventLog();
+      gateway.ingest("session-1", sessionCreated(log));
+      gateway.ingest(
+        "session-1",
+        log.push(
+          SessionEventType.ToolCallScheduled,
+          {
+            toolCallId: "skill-private",
+            toolName: "Skill",
+            input: { skill: "demo" },
+            schedule: { parallelGroups: [], executionOrder: [] },
+          },
+          { turnId: "turn-skill" },
+        ),
+      );
+      gateway.ingest(
+        "session-1",
+        log.push(
+          SessionEventType.ToolCallResult,
+          {
+            toolCallId: "skill-private",
+            duration: 10,
+            skillMetadata: { name, source: "zcode" },
+            result: { success: true, content: "not-for-telemetry" },
+          },
+          { turnId: "turn-skill" },
+        ),
+      );
+      expect(
+        host.telemetryFacts.find(
+          (fact) => fact.kind === "tool.lifecycle" && fact.phase === "completed",
+        ),
+      ).toMatchObject({ skillName: "unknown", skillSource: "zcode" });
+      expect(JSON.stringify(host.telemetryFacts)).not.toContain(name);
+    },
+  );
+
+  it("Skill tool result 只透传受限 metadata", () => {
     const host = makeHost();
     const gateway = makeGateway(host);
     const log = new EventLog();
@@ -651,6 +762,7 @@ describe("订阅与帧调度", () => {
           toolCallId: "tool-skill",
           duration: 10,
           skillMetadata: {
+            name: "pptx",
             qualifiedName: "document-skills:pptx",
             pluginId: "document-skills@zcode-plugins-official",
             source: "plugin",
@@ -666,6 +778,7 @@ describe("订阅与帧调度", () => {
     );
     expect(skillFact).toMatchObject({
       toolName: "Skill",
+      skillName: "pptx",
       skillQualifiedName: "document-skills:pptx",
       skillPluginId: "document-skills@zcode-plugins-official",
       skillSource: "plugin",
@@ -698,6 +811,7 @@ describe("订阅与帧调度", () => {
         {
           toolCallId: "tool-skill-error",
           skillMetadata: {
+            name: "pptx",
             qualifiedName: "document-skills:pptx",
             pluginId: "document-skills@zcode-plugins-official",
             source: "plugin",
@@ -714,6 +828,7 @@ describe("订阅与帧调度", () => {
           kind: "tool.lifecycle",
           phase: "failed",
           toolName: "Skill",
+          skillName: "pptx",
           skillQualifiedName: "document-skills:pptx",
           skillPluginId: "document-skills@zcode-plugins-official",
           skillSource: "plugin",
@@ -1264,7 +1379,6 @@ describe("订阅与帧调度", () => {
     const toolFacts = host.telemetryFacts.filter(
       (fact) => fact.kind === "tool.lifecycle" && fact.toolName === "WebFetch",
     );
-    expect(toolFacts).toHaveLength(2);
     expect(toolFacts).toEqual([
       expect.objectContaining({
         phase: "scheduled",
@@ -3520,6 +3634,125 @@ describe("projection event commit waiter", () => {
 });
 
 describe("v4/command 收口", () => {
+  it("durable create 首发在启动前可观察 pending，启动与快速完成后不残留", async () => {
+    const host = makeHost();
+    const gateway = makeGateway(host);
+    const log = new EventLog();
+    gateway.ingest("session-1", sessionCreated(log));
+    const command = commandParams({
+      commandId: "app-control-create",
+      type: "createSession",
+      sessionId: null,
+      payload: { workspaceId: "/work", firstInput: { text: "first" } },
+    });
+    gateway.admitPendingInput("session-1", command as CommandEnvelope, 100);
+    const before = await gateway.subscribe(subscribeParams());
+    expect(before.initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: {
+        pendingCommands: [{ commandId: command.commandId, state: "accepted" }],
+        rows: { window: [] },
+      },
+    });
+    gateway.ingest(
+      "session-1",
+      log.push(
+        SessionEventType.TurnStarted,
+        { input: "first", inputId: command.commandId, turnNumber: 1 },
+        { turnId: "turn-1" },
+      ),
+    );
+    gateway.ingest(
+      "session-1",
+      log.push(SessionEventType.TurnComplete, { inputId: command.commandId }, { turnId: "turn-1" }),
+    );
+    const after = await gateway.subscribe(subscribeParams());
+    expect(after.initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: { pendingCommands: [] },
+    });
+    gateway.dispose();
+  });
+
+  it("仅持久提升不清 pending，启动前失败按精确 inputId 移除", async () => {
+    const host = makeHost();
+    const gateway = makeGateway(host);
+    const log = new EventLog();
+    gateway.ingest("session-1", sessionCreated(log));
+    const command = commandParams({ commandId: "app-control-pre-start" }) as CommandEnvelope;
+    gateway.admitPendingInput("session-1", command, 100);
+    gateway.ingest(
+      "session-1",
+      log.push(SessionEventType.SessionInputPromoted, {
+        sourceCommandId: command.commandId,
+        pendingInputId: `queue_${command.commandId}`,
+        messageId: "message-1",
+      }),
+    );
+    expect((await gateway.subscribe(subscribeParams())).initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: { pendingCommands: [{ commandId: command.commandId }] },
+    });
+    gateway.ingest(
+      "session-1",
+      log.push(
+        SessionEventType.TurnError,
+        {
+          inputId: command.commandId,
+          error: { message: "pre-start rejected" },
+        },
+        { turnId: "turn-failed" },
+      ),
+    );
+    expect((await gateway.subscribe(subscribeParams())).initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: { pendingCommands: [] },
+    });
+    gateway.dispose();
+  });
+
+  it("取消只移除匹配 pending；队列事实替代 pending，冷启动不恢复 pending", async () => {
+    const host = makeHost();
+    const gateway = makeGateway(host);
+    const log = new EventLog();
+    gateway.ingest("session-1", sessionCreated(log));
+    const first = commandParams({ commandId: "app-control-first" }) as CommandEnvelope;
+    const second = commandParams({ commandId: "app-control-second" }) as CommandEnvelope;
+    gateway.admitPendingInput("session-1", first, 100);
+    gateway.admitPendingInput("session-1", second, 101);
+    gateway.cancelPendingInput("session-1", first.commandId);
+    expect((await gateway.subscribe(subscribeParams())).initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: { pendingCommands: [{ commandId: second.commandId }] },
+    });
+    gateway.ingest(
+      "session-1",
+      log.push(SessionEventType.TurnSteerQueued, {
+        pendingInputId: "queue_app-control-second",
+        inputId: second.commandId,
+        input: "queued",
+        delivery: "queue",
+        queueLength: 1,
+        intent: { sourceCommandId: second.commandId, clientId: "client-1", kind: "sendText" },
+      }),
+    );
+    expect((await gateway.subscribe(subscribeParams())).initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: {
+        pendingCommands: [],
+        queue: { items: [expect.objectContaining({ sourceCommandId: second.commandId })] },
+      },
+    });
+    gateway.admitPendingInput("session-1", first, 102);
+    gateway.dispose();
+    const restarted = makeGateway(host);
+    expect((await restarted.subscribe(subscribeParams())).initialFrame?.payload).toMatchObject({
+      kind: "snapshot",
+      snapshot: { pendingCommands: [] },
+    });
+    restarted.dispose();
+  });
+
   it.each(["createSession", "createSelectionSideSession"] as const)(
     "%s ACK 采用结果会话 Memory 而非父会话",
     async (type) => {
@@ -3594,7 +3827,7 @@ describe("v4/command 收口", () => {
   });
 
   it("stable fork commit 后 registration 异常仍固化 accepted child 并可跨重启重放", async () => {
-    const store = createSqliteSessionStore({ dbPath: ":memory:" });
+    const store = await createSqliteSessionStore({ dbPath: ":memory:" });
     const parentSessionId = createSessionId("post-commit-parent");
     const childSessionId = createSessionId("post-commit-child");
     const childMessageId = createMessageId("post-commit-message");
@@ -4098,26 +4331,29 @@ describe("v4/command 收口", () => {
     });
     host.executeImpl = (envelope, admission) => executor.execute(envelope, admission);
 
-    let sendSettled = false;
-    const sending = gateway
-      .handleCommand(
-        commandParams({
-          commandId: "cmd-new",
-          baseRevision: snapshot!.revision,
-          payload: {
-            text: "你好",
-            modelSelection: { providerId: "glm", modelId: "glm-4-air" },
-            mode: "build",
-          },
-        }),
-      )
-      .then((ack) => {
-        sendSettled = true;
-        return ack;
-      });
+    const sending = gateway.handleCommand(
+      commandParams({
+        commandId: "cmd-new",
+        baseRevision: snapshot!.revision,
+        payload: {
+          text: "你好",
+          modelSelection: { providerId: "glm", modelId: "glm-4-air" },
+          mode: "build",
+        },
+      }),
+    );
     await vi.waitFor(() => expect(sendInput).toHaveBeenCalledTimes(1));
     await expect(sending).resolves.toMatchObject({ status: "accepted" });
-    expect(sendSettled).toBe(true);
+
+    // ACK 只确认输入已准入；投影 revision 必须由实际事件推进，不能由 ACK 自行制造。
+    gateway.ingest(
+      "session-1",
+      log.push(
+        SessionEventType.TurnStarted,
+        { turnNumber: 2, input: "你好", messageId: "msg-user-new" },
+        { turnId: "turn-new" },
+      ),
+    );
 
     const staleRetry = gateway.handleCommand(
       commandParams({
@@ -4308,7 +4544,6 @@ describe("v4/command 收口", () => {
         new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
       ]);
 
-      expect(pair).not.toBe("timeout");
       expect(pair).toEqual([
         expect.objectContaining({
           commandId: "cmd-measure-fault",
@@ -4645,6 +4880,72 @@ describe("v4/command 收口", () => {
       commands: [{ sessionId: "session-1", commandId: "command-promoting" }],
     });
     expect(afterPromotion.results[0]?.result).toBe("unknown");
+  });
+});
+
+// 会话工具设计 0.7：长回合的 turnHeader 滚出快照尾窗后，Host 的 wait 依赖 owner 在
+// commands/query 中给出的回合状态；global bucket 不带该字段。
+describe("commands/query 回合状态（header 在尾窗之外）", () => {
+  function turnComplete(log: EventLog, turnId: string): SessionEvent {
+    return log.push(
+      SessionEventType.TurnComplete,
+      { duration: 1, response: "done", resultType: "success", tokenCount: 1, toolCallCount: 0 },
+      { turnId },
+    );
+  }
+
+  it("按 sourceCommandId 返回全量投影中的回合状态", async () => {
+    const host = makeHost();
+    const gateway = makeGateway(host);
+    const log = new EventLog();
+    gateway.ingest("session-1", sessionCreated(log));
+    gateway.ingest(
+      "session-1",
+      log.push(
+        SessionEventType.TurnStarted,
+        { turnNumber: 1, input: "long", inputId: "command-long" },
+        { turnId: "turn-long" },
+      ),
+    );
+    gateway.ingest("session-1", turnComplete(log, "turn-long"));
+    for (let index = 0; index < PROTOCOL_V4_LIMITS.snapshotTailWindowRows; index += 1) {
+      const turnId = `turn-after-${index}`;
+      gateway.ingest(
+        "session-1",
+        log.push(
+          SessionEventType.TurnStarted,
+          { turnNumber: index + 2, input: "next", inputId: `command-after-${index}` },
+          { turnId },
+        ),
+      );
+      gateway.ingest("session-1", turnComplete(log, turnId));
+    }
+
+    const subscribed = await gateway.subscribe(subscribeParams());
+    const wire =
+      subscribed.initialFrame?.payload.kind === "snapshot"
+        ? subscribed.initialFrame.payload.snapshot
+        : undefined;
+    expect(wire?.rows.window.length).toBe(PROTOCOL_V4_LIMITS.snapshotTailWindowRows);
+    expect(
+      wire?.rows.window.some(
+        (row) => row.kind === "turnHeader" && row.sourceCommandId === "command-long",
+      ),
+    ).toBe(false);
+
+    const query = await gateway.queryCommands({
+      commands: [
+        { sessionId: "session-1", commandId: "command-long" },
+        { sessionId: null, commandId: "command-long" },
+        { sessionId: "session-1", commandId: "command-missing" },
+      ],
+    });
+    expect(query.results[0]?.turn).toEqual({
+      turnId: expect.any(String),
+      state: "completedSuccess",
+    });
+    expect(query.results[1]?.turn).toBeUndefined();
+    expect(query.results[2]?.turn).toBeUndefined();
   });
 });
 

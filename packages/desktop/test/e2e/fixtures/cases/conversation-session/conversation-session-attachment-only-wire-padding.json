@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-attachment-only-wire-padding",
-  "spec": "./test/e2e/conversation-session/conversation-session-attachment-only-wire-padding.test.ts",
+  "spec": "./test/e2e/conversation-session/attachments/conversation-session-attachment-only-wire-padding.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-attachment-only-wire-padding.json"
@@ -14,7 +14,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "fast-text",
-      "syntheticReason": "文本附件内容定位唯一主请求，network capture 结构化断言 user content parts 含精确 wire 空格。"
+      "syntheticReason": "matcher 以文本附件内容定位唯一主请求；spec 再对 network capture 结构化断言 user content parts 含精确 (no content)。"
     }
   ]
 }

@@ -1,58 +1,38 @@
 # Pre-push Hook
 
-仓库现在通过 Husky 接管 Git 的 `pre-push`。
-
-- 安装依赖后会执行根脚本 `pnpm prepare`，自动完成 Husky 安装。
-- `pre-push` 会执行 `pnpm run verify:pre-push`。
-- 根 `pnpm test` 现在只跑单测，不再误把桌面端 `packages/desktop/test/e2e` 当成 Vitest 用例。
-- Bugfix：单测脚本里的 E2E exclude glob 必须加引号；否则 shell 会先把 `packages/desktop/test/e2e/**/*.test.ts` 展开成真实文件列表，导致 Vitest 把多余文件当成 filters，同时又被 exclude 排除，最终报 `No test files found` 并阻止 push。
-- `verify:pre-push` 会先执行 `pnpm lint`，再执行当前分支影响的单测入口；任一步失败都会直接阻止 push。
-
-这样可以在代码推到远端前，先用更快的静态检查拦住明显问题，再把单测问题拦在本地，同时保留 `pnpm test:e2e` 作为桌面端 E2E 的独立入口。
-
-## 开发环境与版本管理工具
-
-pre-push 直接使用当前 `PATH` 中的 pnpm / Node，不强制依赖 mise。此前 hook 外层的
-`mise exec` 虽能选择指定版本，却使已用 nvm 等方式准备好环境的开发者也必须安装 mise，
-否则检查尚未开始就会失败。
+Husky 的 `.husky/pre-push` 使用当前 PATH 中的 Node / pnpm，执行 `pnpm verify:pre-push`。
+不强制依赖 mise，也不自动安装工具、stash 工作区或跳过失败检查。
 
 ```text
-开发者准备 Node / pnpm（mise、nvm 或其他方式）
-    → Git hook 保留 push ref 信息并清理 Git local env
-    → pnpm run verify:pre-push
-    → lint / 架构检查 / 受影响单测
+Git push ref 输入 → 清理 Git local env → 工作区与目标检查
+                                      → 远程目标清单一致性 → lint → 过时文档措辞 → schema → 架构工具测试 → 变更架构检查 → 受影响工程测试
 ```
 
-- 仓库负责声明工具版本和执行检查；个人环境负责让合适的 Node / pnpm 可被 Git 找到。
-- mise 仍是可选的开发入口；`mise.toml`、`mise-run.mjs` 和现有子进程 PATH 保护保持不变。
-- GUI Git 客户端若找不到 Node / pnpm，可在个人 `~/.config/husky/init.sh` 中初始化自己的
-  版本管理环境，参见 [Husky 官方说明](https://typicode.github.io/husky/how-to.html#node-version-managers-and-guis)。
-- 缺少命令或检查失败仍然阻止 push；hook 不自动安装工具，不静默跳过检查。
-- 本次只解除 hook 对 mise 的依赖，不新增版本检查，也不修改现有开发、CLI/SEA 或 CI 的版本要求。
+- 已暂存、未暂存或未跟踪修改均阻止 push；忽略 Git 已忽略的文件。
+- hook 每个非删除目标先解析为 commit，再与当前 HEAD 比较；附注标签可以指向 HEAD；删除 ref 可通过目标检查，多 ref 逐项校验。
+- hook 继续通过 ZCODE_PRE_PUSH_STDIN 传递 ref 和 SHA，架构检查与工程测试使用真实推送基线。
+- 架构基线优先级：显式参数或环境变量、CI 变量、push remote SHA、upstream merge-base、
+  默认分支 merge-base、HEAD。首次推送优先 origin/staging。具体实现见 scripts/architecture/git-base.mjs。
+- 无效的显式架构基线仍失败。工程测试保留 remote SHA / 首推 staging merge-base / 手动 upstream 的基线语义；无效基线不能静默跳过。
+- Git local env 必须先清理，避免工程测试的临时 Git 仓库误操作当前仓库。
+- 过时文档措辞检查（`pnpm docs:stale-phrases:check`，`scripts/check-stale-doc-phrases.mjs`）：规则改了以后，旧说法常留在复述这条规则的其他文档里。脚本登记已作废的说法，扫描 `docs/` 与 `apps/zcode-cli/docs/` 的 Markdown，出现即失败并指向现行规则；`docs/plans/`、`docs/v4-refactor/` 是历史记录，不检查。改规则时把旧说法加进登记表。
+- 远程目标清单一致性检查（`pnpm check:e2e-remote-targets`）直接比较内部队列声明与公开 JSON，不依赖 affected 的 import 图。只有私有 harness 目录不存在时跳过；有队列时清单缺失、损坏或漂移均阻止 push，且检查不改写文件。
+- 任何检查失败均阻止 push；工作区检查也可独立执行 node scripts/check-push-worktree.mjs。
 
-## Affected Unit Tests
+## 测试边界
 
-pre-push 的单测入口是 `pnpm run test:unit:affected`，默认验证本次 push 新增的变更，而不是固定比较 `origin/main`。base 选择顺序：
+App 单测已按 [测试规格](unit-test-quality.md) 退役；不再提供根 test、test:unit、
+test:unit:affected、test:coverage 或 lint-staged 测试入口。
 
-- 显式设置 `ZCODE_PRE_PUSH_BASE` / `ZCODE_AFFECTED_TEST_BASE` 时，使用该 base 与 `HEAD` 的 merge-base，便于手动做 MR 范围自检。
-- Git `pre-push` hook 传入 stdin 时，优先使用其中的 `remote_sha..local_sha`。这对应当前远端跟踪分支到本次推送目标的增量，适合日常 push。
-- 没有 hook stdin 时，使用当前分支的 `@{upstream}..HEAD`，适合手动执行 `pnpm run test:unit:affected`。
-- 新分支或没有 upstream 时，才退回到 `origin/HEAD`、`origin/main`、`origin/master`、`main`、`master` 这类默认分支，并使用 merge-base 计算范围。
+- 工程 Vitest：pnpm test:engineering <文件>，精确清单见 scripts/engineering-test-files.json。
+- 工程增量：pnpm test:engineering:affected --base <任务起点>；--dry-run 可预览官方依赖图选中清单。
+  pre-push 使用 --scope push；仅选择 engineering 项目，CLI/CUA 仍走独立入口。
+  全量选择按既有规则报告跳过，不把跳过当通过；显式全量使用 pnpm test:engineering。
+- 工程执行工具回归：pnpm test:engineering-tools。
+- 架构及推送工具：pnpm test:architecture；schema：pnpm db:schema:check。
+- Node 工程测试：按受影响文件执行 node --test。
+- CUA：pnpm --filter @zcode/zcode-cua test；Agent CLI 按 apps/zcode-cli/AGENTS.md 执行。
+- 桌面与浏览器验收保留既有入口及生命周期，不由工程检查代替。
 
-具体执行分两层：
-
-- `scripts/run-affected-unit-tests.mjs` 负责计算 base、识别全量 fallback 场景、跳过无关变更。
-- `lint-staged.config.mjs` 负责按 `lint-staged --diff "<base>..<head>"` 传入的分支变更文件分组，并按 Vitest 官方推荐调用 `vitest related --run`。
-- `lint-staged` 面向 pre-commit 设计，任务结束后会自动 `git add` 匹配文件。pre-push 主路径会给它设置临时 `GIT_INDEX_FILE`，避免验证过程改动真实 index。
-- `lint-staged` 任务通过 `scripts/run-lint-staged-vitest.mjs` 启动 Vitest，并在启动前清理 Git local env。原因是临时 `GIT_INDEX_FILE` 或 Git hook 环境变量会污染单测中创建的临时 Git 仓库。
-
-选择规则：
-
-- 只改文档、非 JS/TS 资源或桌面端 E2E 文件时，不跑 Vitest 单测。
-- 改动普通 JS/TS/JSON 源文件时，通过 `lint-staged` 将文件列表传给 `vitest related --run`，查找并执行受影响的测试文件。这里的 changed files 不是“只跑改过的测试文件”，而是作为输入交给 Vitest 的静态 import 关系分析；因此改了一个源文件时，会跑引用它的未修改测试文件。
-- 直接改动 `packages/*/test/**/*.test.ts` 时，通过 `lint-staged` 分组后直接执行这些测试文件。
-- 每次分组回调中，变更测试文件合并为一个 `vitest run` 命令，关联源码合并为一个 `vitest related --run` 命令。不再按单个测试文件或每 8 个源码拆批，避免反复启动 Vitest、重复执行跨批次关联到的测试。此调整撤销 `96fa6b1783`、`9f4a831d8d` 的拆批策略，不减少测试选择范围；文件列表仍通过 manifest 传递，保留 Windows 特殊文件名保护。
-- 改动测试运行环境、依赖或 TypeScript/Vitest 配置时，退回全量 `pnpm run test:unit`。这些文件包括 `package.json`、`pnpm-lock.yaml`、`vitest.config.*`、`vitest.setup.*`、`tsconfig*.json`、`.husky/pre-push`、`lint-staged.config.mjs` 和 affected-test 脚本自身。
-- 删除 JS/TS/JSON 代码文件时，退回全量 `pnpm run test:unit`。原因是被删除文件无法再作为 `vitest related` 的输入，但依赖它的测试仍需要暴露导入断裂或行为缺失。
-
-该入口只覆盖根 Vitest 单测范围，即 `packages/*/test/**/*.test.ts`，不替代 `apps/zcode-cli` 自身的 Turbo/Vitest 测试，也不替代桌面端 E2E。
+工程 Vitest 使用独立进程串行执行真实 IO 测试，避免并发 Git、构建和原生模块互相干扰。
+未执行、零收集、平台跳过或环境失败均不代表测试通过。日常只运行受影响工程测试，不默认全量。

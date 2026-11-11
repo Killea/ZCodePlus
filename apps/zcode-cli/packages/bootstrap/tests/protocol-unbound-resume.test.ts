@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createSqliteSessionStore } from "@zcode/adapters/storage";
 import { createLegacySelectionStoreFixture } from "./helpers/legacy-selection-store.js";
 import { ProviderRegistry } from "@zcode/provider";
@@ -29,14 +29,137 @@ import {
 const identity = { providerId: "provider-a", modelId: "model-a" };
 const complete = { ...identity, options: { reasoningLevel: "high" } };
 
+describe("真实 Protocol/App/SQLite 的未绑定创建", () => {
+  it("V4 未绑定与显式选择的创建均不构造 legacy 快照", async () => {
+    const store = await createSqliteSessionStore({ dbPath: ":memory:" });
+    const apps: Awaited<ReturnType<typeof createRegistryBackedTestApp>>[] = [];
+    // 未绑定创建必须明确使用空候选；公共测试 helper 会额外 seed 默认模型。
+    let registry = new ProviderRegistry([]);
+    const server = new ZCodeProtocolAgentServer({
+      cwd: process.cwd(),
+      sessionStore: store,
+      createZCodeApp: async (options) => {
+        const app = await createRegistryBackedTestApp({
+          ...options,
+          env: {},
+          skipUserConfig: true,
+          providerRegistry: registry,
+          configuredDefaultModelSelection: undefined,
+        });
+        apps.push(app);
+        return app;
+      },
+    });
+    server.setNotificationSink((message) => {
+      if (
+        "id" in message &&
+        message.method === zcodeProtocolMethods.sessionRequestRuntimePreferences
+      ) {
+        void server.handleMessage({
+          id: message.id,
+          result: { nativeSearchEnhancementsEnabled: false, memoryEnabled: false },
+        });
+      }
+    });
+    try {
+      const created = await server.handleMessage({
+        id: "create",
+        method: V4_METHODS.command,
+        params: {
+          clientId: "unbound-create",
+          commandId: "create",
+          issuedAt: 1,
+          sessionId: null,
+          type: "createSession",
+          payload: { workspaceId: process.cwd() },
+        },
+      });
+      expect(created).toMatchObject({
+        result: {
+          status: "accepted",
+          result: { type: "createSession", sessionId: expect.any(String) },
+        },
+      });
+      expect(apps[0]?.runtime.getSessionModelSelection()).toBeUndefined();
+      registry = createTestProviderRegistry([identity]);
+      const selected = await server.handleMessage({
+        id: "select",
+        method: V4_METHODS.command,
+        params: {
+          clientId: "unbound-create",
+          commandId: "select",
+          issuedAt: 2,
+          sessionId: null,
+          type: "createSession",
+          payload: { workspaceId: process.cwd(), config: { modelSelection: complete } },
+        },
+      });
+      expect(selected).toMatchObject({ result: { status: "accepted" } });
+      expect(apps[1]?.runtime.getSessionModelSelection()).toEqual(complete);
+      registry = new ProviderRegistry([]);
+      const importedId = createSessionId("unbound-import-create");
+      const imported = await server.handleMessage({
+        id: "import",
+        method: zcodeProtocolMethods.sessionCreate,
+        params: {
+          sessionId: importedId,
+          workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
+          importedHistory: {
+            source: "claudeCode",
+            title: "Unbound imported history",
+            messages: [
+              { role: "user", content: "old question" },
+              { role: "assistant", content: "old answer" },
+            ],
+          },
+        },
+      });
+      expect(imported, JSON.stringify(imported)).toHaveProperty("result");
+      const messages = await store.messages({ sessionID: importedId });
+      expect(
+        messages.map((message) => message.parts.find((part) => part.type === "text")?.text),
+      ).toEqual(["old question", "old answer"]);
+      expect(messages[0]?.info).not.toHaveProperty("modelSelection");
+      expect(messages[1]?.info).not.toHaveProperty("modelId");
+      expect(messages[1]?.info).not.toHaveProperty("providerId");
+      expect(apps[2]?.runtime.getSessionModelSelection()).toBeUndefined();
+    } finally {
+      for (const app of apps) await app.close();
+      store.close();
+    }
+  });
+});
+
 describe.each(["desktop-continuous", "web-remote-replayable"] as const)(
   "真实 Protocol/App/SQLite 的未绑定冷恢复 %s",
   (clientMode) => {
-    it("V4 未绑定与显式选择的创建均不构造 legacy 快照", async () => {
-      const store = createSqliteSessionStore({ dbPath: ":memory:" });
+    it("冷恢复时 Provider 缺席，恢复后 Bot 首条输入沿用持久选择", async () => {
+      const fixture = await createLegacySelectionStoreFixture();
+      const { store } = fixture;
+      const sessionID = createSessionId("bot-cold-model-recovery");
+      await store.createSession({
+        id: sessionID,
+        projectID: createProjectId("bot-cold-model-recovery"),
+        directory: process.cwd(),
+        slug: "bot-cold-model-recovery",
+        title: "Bot cold model recovery",
+        version: "test",
+      });
+      await store.saveSessionEntry({
+        id: `${sessionID}:runtime-model-selection`,
+        sessionID,
+        type: SESSION_ENTRY_MODEL_SELECTION,
+        touchSession: false,
+        time: { created: 2, updated: 2 },
+        data: complete,
+      });
+      const registry = new ProviderRegistry([]);
+      const generateText = vi.fn(async () => ({
+        text: "E2E_BOT_COLD_MODEL_RECOVERED",
+        finishReason: "stop" as const,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      }));
       const apps: Awaited<ReturnType<typeof createRegistryBackedTestApp>>[] = [];
-      // 未绑定创建必须明确使用空候选；公共测试 helper 会额外 seed 默认模型。
-      let registry = new ProviderRegistry([]);
       const server = new ZCodeProtocolAgentServer({
         cwd: process.cwd(),
         sessionStore: store,
@@ -46,7 +169,8 @@ describe.each(["desktop-continuous", "web-remote-replayable"] as const)(
             env: {},
             skipUserConfig: true,
             providerRegistry: registry,
-            configuredDefaultModelSelection: undefined,
+            modelExecutor: { generateText },
+            runtimeConfig: { ...options.runtimeConfig, titleGeneration: { enabled: false } },
           });
           apps.push(app);
           return app;
@@ -56,81 +180,77 @@ describe.each(["desktop-continuous", "web-remote-replayable"] as const)(
         if (
           "id" in message &&
           message.method === zcodeProtocolMethods.sessionRequestRuntimePreferences
-        ) {
+        )
           void server.handleMessage({
             id: message.id,
             result: { nativeSearchEnhancementsEnabled: false, memoryEnabled: false },
           });
-        }
       });
       try {
-        const created = await server.handleMessage({
-          id: "create",
-          method: V4_METHODS.command,
-          params: {
-            clientId: "unbound-create",
-            commandId: "create",
-            issuedAt: 1,
-            sessionId: null,
-            type: "createSession",
-            payload: { workspaceId: process.cwd() },
-          },
+        const subscribed = await server.handleMessage({
+          id: "bot-cold-subscribe",
+          method: V4_METHODS.conversationSubscribe,
+          params: { topic: conversationTopic(sessionID), connectionId: "bot-cold", clientMode },
         });
-        expect(created).toMatchObject({
-          result: {
-            status: "accepted",
-            result: { type: "createSession", sessionId: expect.any(String) },
-          },
-        });
+        expect(subscribed, JSON.stringify(subscribed)).toHaveProperty("result");
         expect(apps[0]?.runtime.getSessionModelSelection()).toBeUndefined();
-        registry = createTestProviderRegistry([identity]);
-        const selected = await server.handleMessage({
-          id: "select",
+        const unavailable = await server.handleMessage({
+          id: "bot-provider-unavailable",
           method: V4_METHODS.command,
           params: {
-            clientId: "unbound-create",
-            commandId: "select",
+            clientId: "bot:feishu:cold-recovery",
+            commandId: "bot-provider-unavailable",
             issuedAt: 2,
-            sessionId: null,
-            type: "createSession",
-            payload: { workspaceId: process.cwd(), config: { modelSelection: complete } },
+            sessionId: sessionID,
+            type: "sendText",
+            payload: { text: "E2E_BOT_UNAVAILABLE_MODEL", requestedDelivery: "queue" },
           },
         });
-        expect(selected).toMatchObject({ result: { status: "accepted" } });
-        expect(apps[1]?.runtime.getSessionModelSelection()).toEqual(complete);
-        registry = new ProviderRegistry([]);
-        const importedId = createSessionId(`unbound-import-${clientMode}`);
-        const imported = await server.handleMessage({
-          id: "import",
-          method: zcodeProtocolMethods.sessionCreate,
+        expect(unavailable, JSON.stringify(unavailable)).toMatchObject({
+          result: { status: "failed", reasonCode: "modelUnavailable" },
+        });
+        expect(generateText).not.toHaveBeenCalled();
+        expect(await store.messages({ sessionID })).toHaveLength(0);
+        registry.replace(createTestProviderRegistry([identity]).listProviders(), "provider-ready");
+        const response = await server.handleMessage({
+          id: "bot-cold-input",
+          method: V4_METHODS.command,
           params: {
-            sessionId: importedId,
-            workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
-            importedHistory: {
-              source: "claudeCode",
-              title: "Unbound imported history",
-              messages: [
-                { role: "user", content: "old question" },
-                { role: "assistant", content: "old answer" },
-              ],
-            },
+            clientId: "bot:feishu:cold-recovery",
+            commandId: "bot-cold-input",
+            issuedAt: 3,
+            sessionId: sessionID,
+            type: "sendText",
+            payload: { text: "E2E_BOT_COLD_MODEL_INPUT", requestedDelivery: "queue" },
           },
         });
-        expect(imported, JSON.stringify(imported)).toHaveProperty("result");
-        const messages = await store.messages({ sessionID: importedId });
-        expect(messages).toHaveLength(2);
+        expect(response, JSON.stringify(response)).toMatchObject({
+          result: { status: "accepted" },
+        });
+        await vi.waitFor(
+          async () => {
+            const messages = await store.messages({ sessionID });
+            expect(
+              messages
+                .flatMap((message) => message.parts)
+                .filter((part) => part.type === "text")
+                .map((part) => part.text),
+            ).toContain("E2E_BOT_COLD_MODEL_RECOVERED");
+          },
+          { timeout: 10_000 },
+        );
+        expect(generateText).toHaveBeenCalledOnce();
+        expect(apps[0]?.runtime.getSessionModelSelection()).toEqual(complete);
         expect(
-          messages.map((message) => message.parts.find((part) => part.type === "text")?.text),
-        ).toEqual(["old question", "old answer"]);
-        expect(messages[0]?.info).not.toHaveProperty("modelSelection");
-        expect(messages[1]?.info).not.toHaveProperty("modelId");
-        expect(messages[1]?.info).not.toHaveProperty("providerId");
-        expect(apps[2]?.runtime.getSessionModelSelection()).toBeUndefined();
+          (await store.sessionEntries({ sessionID, type: SESSION_ENTRY_MODEL_SELECTION })).at(-1)
+            ?.data,
+        ).toEqual(complete);
       } finally {
         for (const app of apps) await app.close();
-        store.close();
+        await fixture.dispose();
       }
-    });
+    }, 20_000);
+
     it.each([
       { stored: identity, provider: identity.providerId, model: identity.modelId },
       {
@@ -181,7 +301,10 @@ describe.each(["desktop-continuous", "web-remote-replayable"] as const)(
         text: "Existing history",
       });
       if ("providerId" in stored && stored.providerId?.startsWith("builtin:")) {
-        fixture.seedLegacy(sessionID, { providerId: stored.providerId, modelId: stored.modelId });
+        await fixture.seedLegacy(sessionID, {
+          providerId: stored.providerId,
+          modelId: stored.modelId,
+        });
         store = fixture.store;
       } else
         await store.saveSessionEntry({

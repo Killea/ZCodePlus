@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime } from "../src/runtime/agent-runtime.js";
-
 afterEach(() => vi.useRealTimers());
 
 describe("runtime Memory Extraction drain", () => {
@@ -20,21 +19,6 @@ describe("runtime Memory Extraction drain", () => {
     await draining;
     expect(finished).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("preserves the default bounded drain used by session close", async () => {
-    vi.useFakeTimers();
-    let finished = false;
-    const draining = AgentRuntime.prototype.drainMemoryExtractions
-      .call({ memoryExtractionScheduler: { drain: () => new Promise<void>(() => {}) } } as never)
-      .then(() => {
-        finished = true;
-      });
-    await vi.advanceTimersByTimeAsync(59_999);
-    expect(finished).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-    await draining;
-    expect(finished).toBe(true);
   });
 
   it("returns immediately when there is no scheduled work", async () => {

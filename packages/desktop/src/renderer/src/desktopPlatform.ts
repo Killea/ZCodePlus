@@ -1,18 +1,40 @@
 import { recordArmsCustomEventForE2E } from "@zcode/ui";
-import { DesktopCommandIds, buildLocalMediaPreviewUrl, type IPlatformService } from "@zcode/shared";
+import {
+  DesktopCommandIds,
+  buildLocalMediaPreviewUrl,
+  resolveLocaleFromLanguageTag,
+  unwrapRemoteWorkspaceBindResult,
+  type IPlatformService,
+} from "@zcode/shared";
 
 import { desktopBrowserPlatformBridge } from "./desktopBrowserPlatformBridge.js";
+import { registerAppControlNavigationHandler } from "#src/app-control-navigation/renderer.js";
 import { createDesktopPluginSandboxPlatform } from "./plugin-sandbox/desktopPluginSandboxPlatform.js";
 
 export function createDesktopPlatform(options: {
   isLocalDevelopmentRuntime: boolean;
 }): IPlatformService {
   return {
+    onAppControlNavigation: (handler) =>
+      registerAppControlNavigationHandler(
+        {
+          subscribe: (listener) => window.zcode.onAppControlNavigationMessage(listener),
+          register: (generation) =>
+            window.zcode.sendAppControlNavigation({ type: "register", generation }),
+          unregister: (generation) =>
+            window.zcode.sendAppControlNavigation({ type: "unregister", generation }),
+          reply: (message) => window.zcode.sendAppControlNavigation({ type: "result", ...message }),
+        },
+        handler,
+        crypto.randomUUID(),
+      ),
     canSelectFilePath: true,
+    canOpenLocalFiles: true,
     pluginSandbox: createDesktopPluginSandboxPlatform(),
     createLocalMediaPreviewUrl: buildLocalMediaPreviewUrl,
     isLocalDevelopmentRuntime: options.isLocalDevelopmentRuntime,
     selectDirectory: () => window.zcode.selectDirectory(),
+    selectDirectories: () => window.zcode.selectDirectories(),
     selectFile: () => window.zcode.selectFile(),
     selectFiles: () => window.zcode.selectFiles?.() ?? Promise.resolve([]),
     createTempTextAttachment: (payload) => window.zcode.createTempTextAttachment(payload),
@@ -20,19 +42,28 @@ export function createDesktopPlatform(options: {
       window.zcode.materializeWorkflowArtifactFile(payload),
     onRemoteConnectionLog: (handler) => window.zcode.onRemoteConnectionLog(handler),
     onRemoteSessionClosed: (handler) => window.zcode.onRemoteSessionClosed(handler),
-    onBotRemoteWorkspaceReconnected: (handler) =>
-      window.zcode.onBotRemoteWorkspaceReconnected(handler),
+    // Source 自动重连会替换 logical session；统一由 preload bridge 转发换代事件。
+    onRemoteSessionReconnected: (handler) =>
+      window.zcode.onRemoteSessionReconnected?.(handler) ?? (() => {}),
     activateOrSetWorkspace: (path) =>
       window.zcode.activateOrSetWorkspace?.(path) ?? Promise.resolve({ activated: false }),
     connectRemote: (remoteOptions, requestId, context) =>
       window.zcode.connectRemote(remoteOptions, requestId, context),
+    requestSourceSettingsAttachment: (sourceServerId) =>
+      window.zcode.requestSourceSettingsAttachment?.(sourceServerId) ??
+      Promise.reject(new Error("Source settings attachment bridge unavailable")),
     cancelPendingRemoteConnection: (requestId) =>
       window.zcode.cancelPendingRemoteConnection?.(requestId) ?? Promise.resolve(),
-    bindRemoteWorkspaceSessionContext: (context) =>
-      window.zcode.bindRemoteWorkspaceSessionContext?.(context) ?? Promise.resolve(),
+    bindRemoteWorkspaceSessionContext: async (context) => {
+      if (!window.zcode.bindRemoteWorkspaceSessionContext) {
+        throw new Error("Desktop bindRemoteWorkspaceSessionContext bridge unavailable");
+      }
+      // preload 返回结构化结果，在页面一侧还原错误才能保留 code/retryable。
+      return unwrapRemoteWorkspaceBindResult(
+        await window.zcode.bindRemoteWorkspaceSessionContext(context),
+      );
+    },
     startWebRemoteControl: (context) => window.zcode.startWebRemoteControl(context),
-    refreshWebRemoteControlPairing: (context) =>
-      window.zcode.refreshWebRemoteControlPairing(context),
     stopWebRemoteControl: () => window.zcode.stopWebRemoteControl(),
     getWebRemoteControlStatus: () => window.zcode.getWebRemoteControlStatus(),
     onWebRemoteControlStatusChanged: (handler) =>
@@ -80,11 +111,14 @@ export function createDesktopPlatform(options: {
     startCuaHelperPermissionDrag: window.zcode.startCuaHelperPermissionDrag
       ? () => window.zcode.startCuaHelperPermissionDrag?.()
       : undefined,
+    notifyWebRemoteControlAuthStateChanged: (change) =>
+      window.zcode.notifyWebRemoteControlAuthStateChanged(change),
     registerOAuthState: (payload) => window.zcode.registerOAuthState(payload),
     onOAuthCallback: (callback) => window.zcode.onOAuthCallback(callback),
     onPaymentCallback: (callback) => window.zcode.onPaymentCallback(callback),
     onShareImport: (callback) => window.zcode.onShareImport?.(callback) ?? (() => {}),
     notifyRendererReady: () => window.zcode.notifyRendererReady(),
+    syncTelemetryContext: (context) => window.zcode.syncTelemetryContext(context),
     reportTelemetryEvent: (payload) => window.zcode.reportTelemetryEvent(payload),
     reportArmsCustomEvent: (payload) => {
       recordArmsCustomEventForE2E(payload);
@@ -104,12 +138,16 @@ export function createDesktopPlatform(options: {
       ? (sample) => window.zcode.reportRendererHeapSample!(sample)
       : undefined,
     showTaskNotification: (payload) => window.zcode.showTaskNotification(payload),
+    // 扩展的系统通知（§18.1 H8）：只有桌面实现；Web 与手机远控没有这两个方法，Renderer 按 unsupported 处理。
+    showExtensionNotification: (payload) => window.zcode.showExtensionNotification(payload),
+    onExtensionNotificationClick: (handler) => window.zcode.onExtensionNotificationClick(handler),
     syncWindowTabs: (paths) => window.zcode.syncWindowTabs(paths),
     syncWebRemoteControlWorkspaces: (workspaces) =>
       window.zcode.syncWebRemoteControlWorkspaces?.(workspaces),
-    syncWebRemoteControlTasks: (tasks) => window.zcode.syncWebRemoteControlTasks?.(tasks),
     onWebRemoteControlReconnectWorkspace: (handler) =>
       window.zcode.onWebRemoteControlReconnectWorkspace?.(handler) ?? (() => {}),
+    onWebRemoteControlRendererAction: (handler) =>
+      window.zcode.onWebRemoteControlRendererAction?.(handler) ?? (() => {}),
     syncWindowUnreadCount: (count) => window.zcode.syncWindowUnreadCount(count),
     syncActiveTaskSession: (sessionId) => window.zcode.syncActiveTaskSession(sessionId),
     syncAppSettings: (patch) => window.zcode.syncAppSettings?.(patch),
@@ -197,7 +235,10 @@ export function createDesktopPlatform(options: {
       window.zcode.acknowledgePostUpdateReleaseNotes(version),
     skipUpdateVersion: (version) => window.zcode.skipUpdateVersion?.(version) ?? Promise.resolve(),
     quitAndInstallUpdate: () => window.zcode.quitAndInstallUpdate(),
-    getInstalledEditors: () => window.zcode.getInstalledEditors(),
+    getInstalledEditors: (filePath) => window.zcode.getInstalledEditors(filePath),
+    getFileApplications: (target) => window.zcode.getFileApplications(target),
+    openFileWithApplication: (applicationId, target) =>
+      window.zcode.openFileWithApplication(applicationId, target),
     getApplicationIcon: (bundleId) =>
       window.zcode.getApplicationIcon?.(bundleId) ?? Promise.resolve(null),
     openInEditor: (editorId, path, editorOptions) =>
@@ -206,7 +247,7 @@ export function createDesktopPlatform(options: {
     setApplicationLocale: (locale) => window.zcode.setApplicationLocale(locale),
     getSystemLocale: () =>
       window.zcode.getSystemLocale?.() ??
-      Promise.resolve(navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US"),
+      Promise.resolve(resolveLocaleFromLanguageTag(navigator.language)),
     setTitleBarTheme: (theme) => window.zcode.setTitleBarTheme(theme),
     getDeviceId: () =>
       (window as Window & { __ZCODE_DEVICE_ID__?: string }).__ZCODE_DEVICE_ID__ ?? "",

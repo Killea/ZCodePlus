@@ -21,7 +21,6 @@
 | `EnterPlanMode`      | active                       | 空输入进入 plan mode                                            | success                      | 后续动作和下一 case 前重设 `yolo` |
 | `ExitPlanMode`       | active                       | 非 plan mode 下调用，验证快速失败 tool block                    | failed tool result           | 无                                |
 | `AskUserQuestion`    | active                       | 单题双选项，测试自动选择第一项                                  | success                      | session-local                     |
-| `ReadSessionContext` | active                       | 读取不存在 session id                                           | success fallback             | session-local                     |
 | `SendMessage`        | conditional                  | 指向不存在的 `agent_*`，或未注册时快速失败                      | failed tool result           | session-local                     |
 | `Agent`              | conditional/default subagent | 非法 `subagent_type`，避免真的派生子 agent                      | failed tool result           | 无                                |
 | `Skill`              | active                       | 加载不存在 skill，验证快速失败 tool block                       | failed tool result           | 无                                |
@@ -75,17 +74,17 @@ tool calls emitted: T1, T2, ... Tn
   -> ...
   -> commit result(Tn), success or failure
   -> batch terminal
-  -> drain at most one guide
+  -> drain waiting guides (turn-steering.md「Drain 边界」)
   -> next provider request in the same product turn
 ```
 
 | Case ID | Tool shape | Guide timing | 关键断言 | 状态 |
 | --- | --- | --- | --- | --- |
 | GTB-01 | single readonly `Read` success | tool call 前已 admission | `ToolCallResult` 先于 `TurnSteerDrained`，drain 后才发下一 provider request | pending：GS/P06 controlled-stream |
-| GTB-02 | two parallel readonly tool calls | 两个 sibling 执行期间已有 guide | 单个 sibling 完成不 drain；全部 results 提交后最多 drain 一条 | missing |
-| GTB-03 | deterministic failed tool result | tool call 前或执行中已有 guide | failed result 仍是 batch terminal 的组成部分；失败事实先提交，再 drain 一条 | missing |
-| GTB-04 | text-only model step，no tool | guide 已 admission | text-only assistant 先提交；随后最多 drain 一条 guide，以 user role 追加并在同一 active turn 发起下一 provider request | core covered；desktop pending：GS/P06 |
-| GTB-05 | two guides + two tool batches | guides 均在对应 batch terminal 前 admission | 每批最多一条，按 admission FIFO；任何一批都不能清空两条 | missing |
+| GTB-02 | two parallel readonly tool calls | 两个 sibling 执行期间已有 guide | 单个 sibling 完成不 drain；全部 results 提交后按 admission FIFO 一次取出全部已等待的 guide | missing |
+| GTB-03 | deterministic failed tool result | tool call 前或执行中已有 guide | failed result 仍是 batch terminal 的组成部分；失败事实先提交，再 drain 已等待的 guide | missing |
+| GTB-04 | text-only model step，no tool | guide 已 admission | text-only assistant 先提交；随后按 admission FIFO 一次取出全部已等待的 guide，逐条以 user role 追加并在同一 active turn 发起下一 provider request | core covered；desktop pending：GS/P06 |
+| GTB-05 | two guides + two tool batches | 两条 guide 均在第一个 batch terminal 前 admission | 第一个 batch 后按 admission FIFO 一次取出两条，成为相邻 guided row 并共用首条开启的工作段；第二个 batch 没有残留 guide | missing |
 
 剪枝：`Write/Edit/Bash/WebFetch/AskUserQuestion/Agent` 等具体工具继续由本矩阵原有
 compact/fork/goal 叉乘证明 tool block 稳定性；guide 只增加 batch-ordering invariant。interaction

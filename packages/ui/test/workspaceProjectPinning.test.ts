@@ -10,8 +10,6 @@ import {
   applyTaskQueryCacheMutation,
   useTaskQueryCacheStore,
 } from "../src/store/taskQueryCacheStore.js";
-import { buildWorkspaceTaskListDisplayGroups } from "../src/hooks/workspaceTaskListDisplayGroups.js";
-import { buildTaskListResult } from "../src/v4/buildTaskListResultFromSessions.js";
 
 const WS_A = "/ws/project-a";
 
@@ -64,27 +62,6 @@ function cachedResult(queryKey: string) {
 
 beforeEach(() => {
   useTaskQueryCacheStore.getState().clearAll();
-});
-
-it("buildTaskListResult：active 归属含 pinned，timeline 归属排除 pinned", () => {
-  const pinned = makeTask("t-pinned");
-  const regular = makeTask("t-regular");
-  const archived = makeTask("t-archived");
-  const base = {
-    taskIndexItems: [pinned, regular, archived],
-    sessions: [],
-    pinnedIds: new Set(["t-pinned"]),
-    archivedIds: new Set(["t-archived"]),
-    unreadAtByTaskId: new Map(),
-    terminalStatusByTaskId: new Map(),
-    titleOverrideByTaskId: new Map(),
-    cronAutomationIdByTaskId: new Map(),
-    sortBy: "created" as const,
-  };
-  const activeResult = buildTaskListResult({ ...base, kind: "active" });
-  expect(activeResult.items.map((task) => task.taskId).sort()).toEqual(["t-pinned", "t-regular"]);
-  const timelineResult = buildTaskListResult({ ...base, kind: "timeline" });
-  expect(timelineResult.items.map((task) => task.taskId)).toEqual(["t-regular"]);
 });
 
 it("workspace 查询内 pin：行留在项目缓存、落到最前、pinnedTaskKeys 同步", () => {
@@ -184,8 +161,12 @@ it("pin 同时把任务纳入 pinned-kind 查询缓存，两个列表各自归�
     nextState: { pinned: true, archived: false },
   });
 
-  expect(cachedResult(workspaceKey).taskKeys.includes(buildTaskEntityKey(t1))).toBeTruthy("workspace 查询保留该任务（项目内置顶）");
-  expect(cachedResult(pinnedQueryKey).taskKeys.includes(buildTaskEntityKey(t1))).toBeTruthy("pinned-kind 查询（timeline/grouped 视图的全局区）同样收录该任务");
+  expect(cachedResult(workspaceKey).taskKeys.includes(buildTaskEntityKey(t1))).toBeTruthy(
+    "workspace 查询保留该任务（项目内置顶）",
+  );
+  expect(cachedResult(pinnedQueryKey).taskKeys.includes(buildTaskEntityKey(t1))).toBeTruthy(
+    "pinned-kind 查询（timeline/grouped 视图的全局区）同样收录该任务",
+  );
 });
 
 it("removeTask 同步清理 pinnedTaskKeys", () => {
@@ -198,101 +179,4 @@ it("removeTask 同步清理 pinnedTaskKeys", () => {
   const result = cachedResult(queryKey);
   expect(result.taskKeys).toEqual([]);
   expect(result.pinnedTaskKeys).toEqual([]);
-});
-
-it("buildWorkspaceTaskListDisplayGroups：pinnedTaskKeys 映射为 pinnedTaskIds", () => {
-  const tPinned = makeTask("t-pinned");
-  const tRegular = makeTask("t-regular");
-  const pinnedKey = buildTaskEntityKey(tPinned);
-  const regularKey = buildTaskEntityKey(tRegular);
-  const descriptor = workspaceDescriptor(5);
-  const queryKey = buildTaskListCacheKeyFromDescriptor(descriptor);
-  const workspaceKey = buildTaskWorkspaceKey(WS_A);
-
-  const { groups } = buildWorkspaceTaskListDisplayGroups({
-    queryConfigs: [
-      {
-        scope: { workspacePath: WS_A },
-        workspaceKey,
-        visibleLimit: 5,
-        queryKey,
-      },
-    ],
-    resultsByQueryKey: {
-      [queryKey]: {
-        taskKeys: [pinnedKey, regularKey],
-        pinnedTaskKeys: [pinnedKey],
-        total: 2,
-        hasMore: false,
-        fetchedAt: 1000,
-        invalidationVersion: 0,
-        stale: false,
-        partial: false,
-        loadingShardKeys: [],
-        failedShardKeys: [],
-        descriptor,
-      },
-    },
-    taskMetaByEntityKey: {
-      [pinnedKey]: tPinned,
-      [regularKey]: tRegular,
-    },
-    taskUnreadOverlayByEntityKey: {},
-    optimisticTaskOverlayByWorkspaceKey: new Map(),
-    previousGroupsByWorkspaceKey: new Map(),
-    sortBy: "created",
-  });
-
-  expect(groups.length).toBe(1);
-  const group = groups[0];
-  expect(group).toBeTruthy();
-  expect(group.pinnedTaskIds).toEqual(["t-pinned"]);
-  expect(group.items.map((task) => task.taskId)).toEqual(["t-pinned", "t-regular"]);
-});
-
-it("buildWorkspaceTaskListDisplayGroups：previousGroup 复用需 pinnedTaskIds 等价", () => {
-  const tPinned = makeTask("t-pinned");
-  const pinnedKey = buildTaskEntityKey(tPinned);
-  const descriptor = workspaceDescriptor(5);
-  const queryKey = buildTaskListCacheKeyFromDescriptor(descriptor);
-  const workspaceKey = buildTaskWorkspaceKey(WS_A);
-  const baseParams = {
-    queryConfigs: [
-      {
-        scope: { workspacePath: WS_A },
-        workspaceKey,
-        visibleLimit: 5,
-        queryKey,
-      },
-    ],
-    taskMetaByEntityKey: { [pinnedKey]: tPinned },
-    taskUnreadOverlayByEntityKey: {},
-    optimisticTaskOverlayByWorkspaceKey: new Map(),
-    sortBy: "created" as const,
-  };
-  const cachedResultValue = {
-    taskKeys: [pinnedKey],
-    pinnedTaskKeys: [pinnedKey],
-    total: 1,
-    hasMore: false,
-    fetchedAt: 1000,
-    invalidationVersion: 0,
-    stale: false,
-    partial: false,
-    loadingShardKeys: [] as string[],
-    failedShardKeys: [] as string[],
-    descriptor,
-  };
-  const first = buildWorkspaceTaskListDisplayGroups({
-    ...baseParams,
-    resultsByQueryKey: { [queryKey]: cachedResultValue },
-    previousGroupsByWorkspaceKey: new Map(),
-  });
-  // 相同数据第二轮：previousGroup 引用应被复用（等价短路）。
-  const second = buildWorkspaceTaskListDisplayGroups({
-    ...baseParams,
-    resultsByQueryKey: { [queryKey]: { ...cachedResultValue } },
-    previousGroupsByWorkspaceKey: first.cache,
-  });
-  expect(second.groups[0]).toBe(first.groups[0]);
 });

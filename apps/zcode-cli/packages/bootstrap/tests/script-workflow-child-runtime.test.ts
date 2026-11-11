@@ -1,3 +1,4 @@
+import * as executionAdapters from "@zcode/adapters/exec";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +16,7 @@ import {
   CREATE_WORKFLOW_TOOL_NAME,
   ESCALATE_TOOL_NAME,
   EVAL_WORKFLOW_SNIPPET_TOOL_NAME,
-  LIST_WORKFLOW_RUNS_TOOL_NAME,
+  LIST_SAVED_WORKFLOWS_TOOL_NAME,
   type Model,
   type ModelResult,
   type ModelSelection,
@@ -66,7 +67,7 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
   beforeEach(async () => {
     tempRoot = await mkdtemp(join(tmpdir(), "zcode-actor-transcript-"));
     parentStore = createInMemorySessionEventStore();
-    sessionStore = createSqliteSessionStore({ dbPath: ":memory:" });
+    sessionStore = await createSqliteSessionStore({ dbPath: ":memory:" });
     forwarded = [];
     parentRuntime = createTestAgentRuntime(
       parentSessionId,
@@ -132,7 +133,7 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
     } as unknown as ScriptWorkflowAgentRuntimeDeps;
   }
 
-  function makeActorRuntime(): AgentRuntime {
+  async function makeActorRuntime(): Promise<AgentRuntime> {
     return createScriptWorkflowAgentRuntime({
       childSessionId: actorSessionId,
       deps: makeDeps(),
@@ -142,7 +143,15 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
   }
 
   it("actor runtime 与父 runtime 共享 event store", async () => {
-    const actorRuntime = makeActorRuntime();
+    const execution = vi.spyOn(executionAdapters, "createNodeExecutionAdapter");
+    const actorRuntime = await makeActorRuntime();
+    expect(execution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bashOutputTempDir: tmpdir(),
+        outputRootDir: join(tempRoot, "cli", "exec"),
+      }),
+    );
+    execution.mockRestore();
     expect(actorRuntime.getSessionEventStore()).toBe(parentStore);
 
     await actorRuntime.ensureSessionPersistedForExternalActivity("workflow actor a#1@1");
@@ -157,7 +166,7 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
   });
 
   it("转发流从 sequenceNumber 1（SessionTitleUpdated）起，保留 actor 的 sessionId", async () => {
-    const actorRuntime = makeActorRuntime();
+    const actorRuntime = await makeActorRuntime();
 
     await actorRuntime.ensureSessionPersistedForExternalActivity("workflow actor a#1@1");
     await actorRuntime.executeTurn("go");
@@ -174,7 +183,7 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
   });
 
   it("恰好一次：每条 actor 事件在共享 store 里只有一份，父会话不被污染", async () => {
-    const actorRuntime = makeActorRuntime();
+    const actorRuntime = await makeActorRuntime();
 
     await actorRuntime.ensureSessionPersistedForExternalActivity("workflow actor a#1@1");
     await actorRuntime.executeTurn("go");
@@ -186,7 +195,6 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
     expect([...idCounts.values()].filter((count) => count !== 1)).toEqual([]);
 
     // 转发是「只通知不 append」：转发条数与落库条数一致，没有第二次写入。
-    expect(forwarded).toHaveLength(stored.length);
     expect(forwarded.map((event) => event.id)).toEqual(stored.map((event) => event.id));
     // 父会话自己一条事件都没有：actor 正文不许落到父 timeline 上。
     expect(await parentStore.getEvents(parentSessionId)).toEqual([]);
@@ -321,8 +329,10 @@ describe("script workflow child runtime — actor transcript 直播通道", () =
       // 探针刻意用两个**只读**工具：CreateWorkflow / AmendWorkflow / SaveWorkflow /
       // ResumeWorkflowRun / ResolveWorkflowQuestion 在 workflow_child 里另有一道结构性禁令
       // （tool-allowlist.ts 的 WORKFLOW_CHILD_DISALLOWED_TOOLS），三种取值下恒为 false，
-      // 拿它们当探针只会写出一条永远为真的假断言。
-      expect(registry.has(LIST_WORKFLOW_RUNS_TOOL_NAME)).toBe(available);
+      // 拿它们当探针只会写出一条永远为真的假断言。ListWorkflowRuns / GetWorkflowRun 同理
+      // （2026-10-21 起子 runtime 不持有 run 端口而不注册，见 RUN_INTROSPECTION_TOOLS），所以换成
+      // 不经 run 端口的 ListSavedWorkflows。
+      expect(registry.has(LIST_SAVED_WORKFLOWS_TOOL_NAME)).toBe(available);
       expect(registry.has(EVAL_WORKFLOW_SNIPPET_TOOL_NAME)).toBe(available);
       // 反向断言：门只碰工作流那几件，普通工具面在三种取值下都在。
       expect(registry.has("Read")).toBe(true);
@@ -354,7 +364,7 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
     await rm(tempRoot, { force: true, recursive: true });
   });
 
-  function baseDeps(parentRuntime: AgentRuntime): ScriptWorkflowAgentRuntimeDeps {
+  async function baseDeps(parentRuntime: AgentRuntime): Promise<ScriptWorkflowAgentRuntimeDeps> {
     return {
       agentTelemetry: createModelTelemetry().agentExecution,
       appOptions: { env: {} },
@@ -375,7 +385,7 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
       runtime: parentRuntime,
       runtimeConfig: { workingDirectory: tempRoot },
       sessionId: parentSessionId,
-      sessionStore: createSqliteSessionStore({ dbPath: ":memory:" }),
+      sessionStore: await createSqliteSessionStore({ dbPath: ":memory:" }),
       storageRoot: tempRoot,
       workingDirectory: tempRoot,
     } as unknown as ScriptWorkflowAgentRuntimeDeps;
@@ -428,11 +438,13 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
       {
         eventStore: createInMemorySessionEventStore(),
         fileSystemPort: createNodeFileSystemAdapter(),
-        modelFactory: parentModelFactory as unknown as ScriptWorkflowAgentRuntimeDeps["modelFactory"],
+        modelFactory:
+          parentModelFactory as unknown as ScriptWorkflowAgentRuntimeDeps["modelFactory"],
       },
     );
-    const deps = baseDeps(parentRuntime);
-    deps.modelFactory = parentModelFactory as unknown as ScriptWorkflowAgentRuntimeDeps["modelFactory"];
+    const deps = await baseDeps(parentRuntime);
+    deps.modelFactory =
+      parentModelFactory as unknown as ScriptWorkflowAgentRuntimeDeps["modelFactory"];
 
     const actorRuntime = createScriptWorkflowAgentRuntime({
       childSessionId: createSessionId("dwf-actor-model-wiring"),
@@ -447,7 +459,6 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
     await actorRuntime.ensureSessionPersistedForExternalActivity("workflow actor a#1@1");
     await actorRuntime.executeTurn("go");
 
-    expect(parentModelFactory).toHaveBeenCalled();
     expect(
       parentModelFactory.mock.calls.some(
         ([target]) =>
@@ -456,7 +467,7 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
     ).toBe(true);
   });
 
-  it("request.opts.model 必须带 provider 段：裸模型名不再借父会话的 provider 补全", () => {
+  it("request.opts.model 必须带 provider 段：裸模型名不再借父会话的 provider 补全", async () => {
     const parentRuntime = createTestAgentRuntime(
       parentSessionId,
       {
@@ -468,7 +479,7 @@ describe("script workflow child runtime — 与父会话共享 model factory", (
         fileSystemPort: createNodeFileSystemAdapter(),
       },
     );
-    const deps = baseDeps(parentRuntime);
+    const deps = await baseDeps(parentRuntime);
     deps.modelFactory = createTestModelFactoryFromAdapter({
       async generateText() {
         throw new Error("not called");
@@ -506,30 +517,26 @@ describe("script workflow child runtime — 对外交互端口由父 runtime 铸
     tempRoot = await mkdtemp(join(tmpdir(), "zcode-actor-routing-"));
     refreshes = [];
     permissionRequests = [];
-    parentRuntime = createTestAgentRuntime(
-      parentSessionId,
-      { workingDirectory: tempRoot },
-      {
-        eventStore: createInMemorySessionEventStore(),
-        fileSystemPort: createNodeFileSystemAdapter(),
-        // 主 runtime 的端口：每次调用报自己的 sessionId；child 拿到的是父 runtime 派生的实例，
-        // 派生层把 sessionId 改写成父会话（core 的 child-client-ports.ts）。
-        providerRuntimeHeadersPort: {
-          shouldRefreshBeforeModelRequest: () => true,
-          async refreshBeforeModelRequest(input) {
-            refreshes.push({ providerId: input.providerId, routedSessionId: input.sessionId });
-            return { headersApplied: true };
-          },
+    parentRuntime = createTestAgentRuntime(parentSessionId, { workingDirectory: tempRoot }, {
+      eventStore: createInMemorySessionEventStore(),
+      fileSystemPort: createNodeFileSystemAdapter(),
+      // 主 runtime 的端口：每次调用报自己的 sessionId；child 拿到的是父 runtime 派生的实例，
+      // 派生层把 sessionId 改写成父会话（core 的 child-client-ports.ts）。
+      providerRuntimeHeadersPort: {
+        shouldRefreshBeforeModelRequest: () => true,
+        async refreshBeforeModelRequest(input) {
+          refreshes.push({ providerId: input.providerId, routedSessionId: input.sessionId });
+          return { headersApplied: true };
         },
-        modelFactory: routingModelFactory,
-        permissionBroker: {
-          async requestPermission(request) {
-            permissionRequests.push({ sessionId: request.sessionId, origin: request.origin });
-            return { decision: "allow" };
-          },
+      },
+      modelFactory: routingModelFactory,
+      permissionBroker: {
+        async requestPermission(request) {
+          permissionRequests.push({ sessionId: request.sessionId, origin: request.origin });
+          return { decision: "allow" };
         },
-      } as never,
-    );
+      },
+    } as never);
   });
 
   afterEach(async () => {
@@ -550,7 +557,7 @@ describe("script workflow child runtime — 对外交互端口由父 runtime 铸
     },
   });
 
-  function makeActorRuntime(): AgentRuntime {
+  async function makeActorRuntime(): Promise<AgentRuntime> {
     const deps = {
       agentTelemetry: createModelTelemetry().agentExecution,
       appOptions: { env: process.env },
@@ -572,7 +579,7 @@ describe("script workflow child runtime — 对外交互端口由父 runtime 铸
       runtime: parentRuntime,
       runtimeConfig: { workingDirectory: tempRoot },
       sessionId: parentSessionId,
-      sessionStore: createSqliteSessionStore({ dbPath: ":memory:" }),
+      sessionStore: await createSqliteSessionStore({ dbPath: ":memory:" }),
       storageRoot: tempRoot,
       workingDirectory: tempRoot,
     } as unknown as ScriptWorkflowAgentRuntimeDeps;
@@ -585,7 +592,7 @@ describe("script workflow child runtime — 对外交互端口由父 runtime 铸
   }
 
   it("actor 的 provider runtime headers 刷新以父会话为路由身份", async () => {
-    const actorRuntime = makeActorRuntime();
+    const actorRuntime = await makeActorRuntime();
     await actorRuntime.executeTurn("go");
 
     expect(refreshes.length).toBeGreaterThan(0);
@@ -631,8 +638,8 @@ describe("script workflow child runtime — 对外交互端口由父 runtime 铸
 /**
  * workflow 子代理跑在发起会话的权限模式上（docs/dynamic-workflow/launch.md「Permissions inside a
  * run」）：该问时经父 runtime 派生的 broker 请求用户，origin 标注这个子代理，并镜像到父会话；
- * guarded 的危险命令是 user-once，拒绝时命令不执行、拒绝结果回到子代理。YOLO 不问普通工具，
- * AskUserQuestion 在任何模式下都问。
+ * guarded 的危险命令是 user-once，拒绝时命令不执行、拒绝结果回到子代理。YOLO 不问普通工具。
+ * 子代理没有 AskUserQuestion：它要人判断时 escalate 给主代理。
  */
 describe("script workflow child runtime — 子代理经父 broker 请求权限与提问", () => {
   const parentSessionId = createSessionId("dwf-parent-guarded");
@@ -704,9 +711,9 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
     },
   });
 
-  function makeActorRuntime(
+  async function makeActorRuntime(
     subagentPermissionMode: WorkflowSubagentPermissionMode | undefined,
-  ): AgentRuntime {
+  ): Promise<AgentRuntime> {
     const deps = {
       agentTelemetry: createModelTelemetry().agentExecution,
       appOptions: { env: process.env, executionPort: { run: execute } },
@@ -728,7 +735,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
       runtime: parentRuntime,
       runtimeConfig: { workingDirectory: tempRoot, mcp: { enabled: false } },
       sessionId: parentSessionId,
-      sessionStore: createSqliteSessionStore({ dbPath: ":memory:" }),
+      sessionStore: await createSqliteSessionStore({ dbPath: ":memory:" }),
       storageRoot: tempRoot,
       workingDirectory: tempRoot,
     } as unknown as ScriptWorkflowAgentRuntimeDeps;
@@ -750,7 +757,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
   }
 
   it("guarded：一次 user-once 请求，父会话路由、子代理 origin；拒绝后不执行且结果回到子代理", async () => {
-    const actorRuntime = makeActorRuntime("guarded");
+    const actorRuntime = await makeActorRuntime("guarded");
     expect(actorRuntime.getMode()).toBe("guarded");
     await actorRuntime.executeTurn("go");
 
@@ -784,7 +791,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
         if (event.sessionId === parentSessionId) parentEvents.push(event);
       },
     });
-    const actorRuntime = makeActorRuntime("guarded");
+    const actorRuntime = await makeActorRuntime("guarded");
     await actorRuntime.executeTurn("go");
 
     const requested = parentEvents.filter(
@@ -855,7 +862,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
         },
       } as never,
     );
-    const actorRuntime = makeActorRuntime("guarded");
+    const actorRuntime = await makeActorRuntime("guarded");
     const controller = new AbortController();
     const turn = actorRuntime.executeTurn("go", undefined, { abortSignal: controller.signal });
     await registered.promise;
@@ -868,7 +875,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
   });
 
   it("YOLO run（键缺席）：子代理不问，命令照常执行", async () => {
-    const actorRuntime = makeActorRuntime(undefined);
+    const actorRuntime = await makeActorRuntime(undefined);
     expect(actorRuntime.getMode()).toBe("yolo");
     await actorRuntime.executeTurn("go");
 
@@ -883,7 +890,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
         if (event.sessionId === parentSessionId) parentEvents.push(event);
       },
     });
-    const actorRuntime = makeActorRuntime("build");
+    const actorRuntime = await makeActorRuntime("build");
     expect(actorRuntime.getMode()).toBe("build");
     await actorRuntime.executeTurn("go");
 
@@ -900,7 +907,7 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
     );
   });
 
-  it("AskUserQuestion：子代理的提问经父会话送达，父流里有带 origin 的 PermissionRequested", async () => {
+  it("AskUserQuestion：子代理的工具面里没有它，调用不会向用户提问，父流里也没有 PermissionRequested", async () => {
     firstToolCall = {
       id: "actor-question",
       name: "AskUserQuestion",
@@ -924,24 +931,17 @@ describe("script workflow child runtime — 子代理经父 broker 请求权限�
         if (event.sessionId === parentSessionId) parentEvents.push(event);
       },
     });
-    // YOLO 也问：AskUserQuestion 在任何模式下都要用户作答。
-    const actorRuntime = makeActorRuntime("yolo");
+    // build 模式下普通工具都会问；即便如此 AskUserQuestion 也到不了用户面前。
+    const actorRuntime = await makeActorRuntime("build");
     await actorRuntime.executeTurn("go");
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0]).toMatchObject({
-      sessionId: parentSessionId,
-      toolName: "AskUserQuestion",
-      origin: { kind: "subagent", childSessionId: actorSessionId },
-    });
-    const requested = parentEvents.filter(
-      (event) => event.type === SessionEventType.PermissionRequested,
-    );
-    expect(requested).toHaveLength(1);
-    expect(requested[0]!.payload).toMatchObject({
-      toolName: "AskUserQuestion",
-      origin: { kind: "subagent", description: "reviewer (agent#1@0)" },
-    });
+    expect(requests).toHaveLength(0);
+    expect(
+      parentEvents.filter((event) => event.type === SessionEventType.PermissionRequested),
+    ).toHaveLength(0);
+    // 工具调用被当作不可用工具回给子代理，turn 照常结束（第二次模型请求带着这条错误结果）。
+    expect(modelRequests).toHaveLength(2);
+    expect(modelRequests[1]).toContain("actor-question");
   });
 });
 
@@ -1018,11 +1018,11 @@ describe("script workflow child runtime — 子代理的 Browser Use", () => {
     } as unknown as ZCodeProtocolAgentServerContext;
   }
 
-  function makeActorRuntime(
+  async function makeActorRuntime(
     browserControlPort: Parameters<
       typeof createScriptWorkflowAgentRuntime
     >[0]["browserControlPort"],
-  ): AgentRuntime {
+  ): Promise<AgentRuntime> {
     const deps = {
       agentTelemetry: createModelTelemetry().agentExecution,
       appOptions: { env: process.env },
@@ -1048,7 +1048,7 @@ describe("script workflow child runtime — 子代理的 Browser Use", () => {
         runtimeFeatures: { browserUse: true },
       },
       sessionId: parentSessionId,
-      sessionStore: createSqliteSessionStore({ dbPath: ":memory:" }),
+      sessionStore: await createSqliteSessionStore({ dbPath: ":memory:" }),
       storageRoot: tempRoot,
       workingDirectory: tempRoot,
     } as unknown as ScriptWorkflowAgentRuntimeDeps;
@@ -1082,7 +1082,7 @@ describe("script workflow child runtime — 子代理的 Browser Use", () => {
     // 生产里有两个实例：app 的 runtime 端口（传给工厂的父端口）与进程级 node_repl broker 用的那个。
     const appPort = createProtocolBrowserControlBroker(context);
     const nodeReplPort = createProtocolBrowserControlBroker(context);
-    const actorRuntime = makeActorRuntime(appPort);
+    const actorRuntime = await makeActorRuntime(appPort);
 
     // actor 的 `mcp__node_repl__js` 最终以 actor 的 session_id 调到进程级实例。
     await expect(
@@ -1118,7 +1118,7 @@ describe("script workflow child runtime — 子代理的 Browser Use", () => {
   it("不传父端口（legacy Workflow child）：actor 没有 Browser 登记，关闭不发任何浏览器请求", async () => {
     const requestClient = vi.fn(async () => ({ ok: true, elapsedMs: 0 }));
     const nodeReplPort = createProtocolBrowserControlBroker(makeProtocolContext(requestClient));
-    const actorRuntime = makeActorRuntime(undefined);
+    const actorRuntime = await makeActorRuntime(undefined);
 
     await expect(nodeReplPort.list({ sessionId: actorSessionId })).rejects.toThrow(
       `Session is not active: ${actorSessionId}`,
@@ -1137,7 +1137,7 @@ describe("script workflow child runtime — 子代理的 Browser Use", () => {
         closed.push(input.sessionId);
       }),
     };
-    const actorRuntime = makeActorRuntime(port);
+    const actorRuntime = await makeActorRuntime(port);
     await actorRuntime.closeBrowserSession();
     expect(closed).toEqual([actorSessionId]);
   });

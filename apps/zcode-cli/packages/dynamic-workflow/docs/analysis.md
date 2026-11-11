@@ -166,6 +166,12 @@ fan-out. It means the site runs once per element. An actor site with `within` is
 family, one fresh actor per element; an actor created outside the fan-out but asked inside
 it stays a single lane and is the serialization bottleneck the picture should show.
 `within` is a may-fact: a helper called both inside and outside a fan-out still carries it.
+It is read off the temporal walk: each time the walk reaches a site's call it notes the
+innermost promoted candidate among the regions it stands in, and the site takes the first
+such fan-out in source order. A helper's call site inlines only the callbacks that call
+passed (see "Inlining"), so a step inside a callback belongs to the fan-out that passed
+the callback, never to another fan-out that calls the same helper. A site the walk never
+reaches, dead code, has no `within`.
 
 ## Diagnostics
 
@@ -185,6 +191,7 @@ recovered later.
 | artifact codes | Artifact ids are literals, tags name a declared preset, an id belongs to one family. | see `docs/dynamic-workflow/authoring.md`, "Compile-time rules" |
 | 9012 | A `hole<T>()` names its type argument explicitly; its name is a non-empty literal of at most 128 characters, unique among the script's holes and phase markers, nested fills included; the call is awaited; it stands outside every array-method fan-out callback (a `for...of` body is sequential and allowed); and its body, when present, is an inline function literal that references no binding declared after the hole. | The type is the contract a fill is checked against, and an inferred `unknown` is no contract. The name is the hole's phase name and the identity every surface shows, so it must be one hole's alone; two markers with one name are one phase on purpose, two holes with one name would be two gaps merged by accident. An unawaited hole would let the script run past a gap that has no value yet. A hole in a concurrent fan-out would have to be filled while its elements run. The body must be a literal because lowering extracts and evaluates its text at the site, and a function value has no text. A body is a closure the compiler does not check for use before declaration, so a reference to a later `const` would throw at run time. |
 | 9010 | A persona's `model` is typed `ModelRef`, a string literal, or a union of string literals; `model()` takes a non-empty string literal. | The set of models a script can use must be closed before it runs, so the launch can resolve every name and the window can show it. The rule reads the **type** of the `model` property at each `agent()` site, so constants and ternaries between literals pass and a widened `string` does not. |
+| 9013 | A persona's `budget.webSearch` is typed as a numeric literal or a union of numeric literals, each an integer from 0 to 1024. | The number of searches a subagent may make per ask is in the script the user confirms. The rule reads the **type** at each `agent()` site, the same way 9010 does, so constants and ternaries between literals pass and a widened `number` does not. |
 
 Facade siting (9001) is the only analyzability rule. Everything else the analysis cannot
 follow widens edge sets; it never bounces the script back to the model.
@@ -196,6 +203,9 @@ and 9006 are courtesy checks; the engine's runtime check in `createActor` is the
 only thing that keeps the set of names closed. Its companion 9011 (a name the catalog cannot
 resolve) is not an analyzer code; the launch tools raise it, because only the host knows its
 models.
+9013 is the authority for the budget's range in the same sense: the engine keeps a
+`budget.webSearch` only when it is an integer from 0 to 1024 and drops anything else, which only
+a cast can produce, so that subagent gets the default budget.
 The run service's recompile at submit does not repeat them.
 
 ## The interpreter
@@ -332,6 +342,15 @@ A call to a script function applies that function's summary: a mapping from para
 captured-variable taint to the return taint and the facade sinks reached inside. Recursion
 and mutual recursion are a fixpoint over summaries. There is no inlining depth limit.
 
+Inside a body a parameter's taint is a symbolic **placeholder**. A call substitutes its
+actuals for the callee's own placeholders only; a placeholder of an enclosing function passes
+through unchanged. At emission a placeholder resolves to the union of the actuals recorded
+for that parameter across every call, recursively through the placeholders those actuals
+carry, collapsed to occurrences. That is reachability over the placeholder graph, so emission
+resolves each strongly connected component once and every sink is a lookup. Walking the
+paths instead is factorial: a callback helper shared by many callers puts every caller's
+placeholder into every caller's actuals.
+
 Invocation forms that reshape the argument list are handled before positional binding:
 `.call` drops the receiver, `.apply` smears the array inexactly across every parameter, a
 `...spread` ends positional certainty and folds into an inexact tail, `arguments` is a
@@ -379,6 +398,21 @@ Every application of a script function is recorded in the **call oracle**
 (`TaintState.applications`): per call, `new`, or tagged-template node, the functions applied
 there and whether as callee or as argument. The temporal walk inlines exactly those bodies
 at exactly those sites.
+
+The fixpoint evaluates a helper's body once per pass with each parameter holding every
+function any caller ever passed, so the record at a call **through a parameter** (`fn()`
+inside `async function limited(slots, fn)`) names every caller's callback. The oracle
+therefore also records **provenance**. When the callee, or a function-valued argument, is
+syntactically a parameter of an enclosing script function — an identifier whose declaration
+is that parameter, with no default initializer and never assigned in the body — the record
+says "parameter `k` of `F`" beside the merged list, together with the functions the
+merged list owes to that parameter. And at every callee application the oracle records
+what each argument **binds** to the parameter it fills: the functions the argument's value
+holds, and, when the argument is itself syntactically a parameter of its enclosing
+function, "parameter `j` of `G`". The walk resolves these against the call it is inlining
+(see "Inlining"). Any other flow — `const h = fn; h()`, a callback stored in an object or an
+array, a destructured parameter, a parameter with a default or a reassignment — keeps the
+merged record: sound, and as slow as before.
 
 ### Relays
 
@@ -506,7 +540,9 @@ compact "who talks to whom" digest.
 
 Every event carries its region chain. An `issue` and a `jump` also carry the phase current
 where they happened. A `settle` carries `joins`, the strand regions the barrier waited
-for, absent when it waited for none. Its `steps` may be empty: a barrier that joins a
+for, absent when it waited for none, and `maybeJoins`, the subset it lifted on a may-claim
+(the promise reached the await through a container or a helper), absent when every join
+is certain. Its `steps` may be empty: a barrier that joins a
 strand whose summary is already settled settles nothing new, and the join alone is a
 control-flow fact worth an event. `maybe` is written `false` on such a join-only settle.
 
@@ -545,16 +581,27 @@ non-structural regions, which is all the causality projection needs. `parallel` 
 
 Function bodies run only when called, so the walk never descends into a function on its
 own. It inlines the body at each call site, reading the call oracle for which bodies a call
-runs. A callback's multiplicity, certainty, and deferral come from the registry: an `each`
+runs. Each inlined body is an **activation** that carries what the call site bound to each
+parameter, resolved against the enclosing activations when a binding is itself "parameter
+`j` of `G`". A record "parameter `k` of `F`" at a call inside the body resolves to the
+innermost activation of `F`: its binding for `k` replaces the functions the merged record
+owes to that parameter, so `fn()` inside a shared helper inlines only the callback this
+call passed. An unresolvable record — no activation of `F` on the stack, as in the sweep, or
+a parameter the call left unfilled — falls back to the merged list. A callback's
+multiplicity, certainty, and deferral come from the registry: an `each`
 callback opens a `fanout` region; a `once` callback opens a `call` region, wrapped in a
 skippable `choice` unless the library provably enters it; a deferred callback is a strand
 whose **prologue** is an ordinary barrier over its receiver, run inside the strand's own
 frame. A callee applied at more than one target opens an exhaustive `choice` with one
 skippable arm per target. `new C(args)` and tagged templates inline the same way.
 
-Recursion is precomputed as self-reachability over the oracle. A recursive function's body
-gets a `loop` region with the `recursive` flag; re-entry is cut and recorded as a `recur`
-jump. That is what gives recursion the same self-arrow as any other sequential repetition.
+Re-entering a function is recursion only when an activation of it **with the same
+bindings** is already open: a helper applied again inside its own callback with a different
+callback is two activations, not a loop. Recursion is precomputed as self-reachability over
+activations — the same resolution the walk performs, run over each body's call sites without
+emitting events, memoized per activation. A recursive activation's body gets a `loop` region
+with the `recursive` flag; re-entry is cut and recorded as a `recur` jump. That is what gives
+recursion the same self-arrow as any other sequential repetition.
 
 A helper called twice contributes two issue events for one step id. There is one step per
 site, never one per call path (see "Alternatives not taken").
@@ -900,7 +947,10 @@ A **strand** region overrides the rule for its own kind, `call` or `fanout` alik
 matters is that the body runs concurrently with its spawner, not how it was written. It
 flows its body from the incoming sources retyped `fork`, then **parks** its exits under
 its own region id and hands the incoming sources straight through: the spawner carries on
-with exactly what it arrived with. The parked exits are the body's exits
+with exactly what it arrived with. Beside the exits it parks two facts the joining barrier
+reads: the sources it was spawned from, and whether control could pass through its body
+without meeting a node (an incoming source that came out the other end, or a `return` that
+met nothing on its way). The parked exits are the body's exits
 and the callback's `return`s, all typed `join`. Two things never park. Sources that passed
 through the body without meeting a node are dropped, as they are for a loop. So is any exit
 still standing on one of the strand's own incoming sources: that is the spawner's control,
@@ -911,9 +961,23 @@ node-free strand's `return` out of the graph, and with it the entry placeholder 
 own is invisible and parks nothing; a strand whose exits all fell away but which created
 nodes still parks, with no exits, so that a later marker can read it as running.
 
-A `settle` leaf is transparent to the main line and is where the strands it awaits rejoin
-it: it returns its incoming sources plus the parked exits of every strand the event's
-`joins` names. A join-only settle, the one that names no step, is exactly as load-bearing
+A `settle` leaf is where the strands it awaits rejoin the main line, and where the main
+line gives up the control it carried for them. It returns the parked exits of every strand
+the event's `joins` names, plus its incoming sources **minus the sources that stood at the
+spawn** of each strand it joins for certain. Those sources were the spawner's control at
+the moment it forked; the barrier is where that control waits for the strand, so what
+follows the barrier follows the strand's exits, not the fork point. Two kinds of join leave
+the spawn sources standing: a may-join (the event's `maybeJoins`: the promise reached the
+await through a container or a helper, so the barrier may not have waited for this strand
+at all), and a strand control could pass through without meeting a node (on that path
+there is nothing to wait for). Sources the main line gained after the spawn are never
+touched: a step issued between the fork and the barrier precedes what follows, beside the
+strand's exits. A body still learning its entries stands on a placeholder for its incoming
+sources; a barrier inside it consumes the placeholder exactly when it consumes every source
+the placeholder stands for. Without this rule every helper call left its fork point standing on the
+main line for good, so `n` sequential `await helper()` calls drew an edge from the entry
+and from every earlier call into every later one, `n(n+1)/2` edges in all, and a picture in
+which the third call could run before the first. A join-only settle, the one that names no step, is exactly as load-bearing
 here as any other. Strands still parked when the root's sequence ends join the `sink`:
 nothing awaited them, and all that is known is that the script did not outlive them.
 Strands parked inside a detached body are discarded along with its pending jumps, because
@@ -952,7 +1016,9 @@ edges — edges inside a strongly connected component are never dropped
 node fact on each phase, never through the reduction (same file, "Alongside").
 
 Known approximations: a loop head's condition is walked once, before the body, so a step
-in a `while` condition sits outside the loop; `may-throw` edges come only from issues inside
+in a `while` condition sits outside the loop; an optional call `await f?.()` inlines the
+helper unconditionally, so the path that skips it is not in the trace and has no edge (the
+old transparent `settle` drew one by accident); `may-throw` edges come only from issues inside
 a try body, not from steps in a catch or outside a try; and a step in a catch block still
 reads `always` in the causality graph, because the transparency rule looks through `catch`
 without consulting its `entered` flag.
@@ -1088,6 +1154,12 @@ fixed and the script moves into `tests/graphs/` with a reviewed golden.
   back-edges into the start of the chart.
 
 ## Open questions
+
+- A callback that reaches a call other than as a bare parameter identifier (`const h = fn;
+  h()`, `{ fn }.fn()`, `fns[i]()`) is still resolved from the merged record, so every caller's
+  callback inlines there. The taint placeholders could carry provenance through such flows,
+  but a value merged from a parameter and a literal cannot be split exactly without tagging
+  each function in the domain with where it came from.
 
 - The certainty of a phase edge is `maybe` whenever any contributing edge is; "any
   `always` witness makes it `always`" is semantically closer on a quotient. Nothing renders

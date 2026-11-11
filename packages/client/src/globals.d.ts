@@ -8,13 +8,13 @@ import type {
   PrepareCuaHelperPermissionDragResult,
   AppSettings,
   BrowserViewOperationPayload,
-  BrowserGuestAttachResult,
   BrowserViewScreenshotSurfacePreparePayload,
   BrowserViewScreenshotSurfaceReadyPayload,
   BrowserViewScreenshotSurfaceReleasePayload,
   BrowserViewViewportChangedPayload,
   BrowserViewCloseTabNotification,
   BrowserViewCloseTabRequest,
+  BrowserViewPromoteDraftTabsRequest,
   BrowserViewResidencyReportPayload,
   BrowserViewResidencyTransitionPayload,
   BrowserViewRestoredTabShell,
@@ -35,15 +35,16 @@ import type {
   WebRemoteControlContext,
   WebRemoteControlReconnectWorkspaceRequest,
   WebRemoteControlReconnectWorkspaceResult,
+  WebRemoteControlRendererActionRequest,
+  WebRemoteControlRendererActionResult,
   WebRemoteControlStartOperationResult,
   WebRemoteControlStatus,
-  WebRemoteControlTaskTarget,
   WebRemoteControlWorkspaceTarget,
   OAuthStateRegistration,
+  WebRemoteControlAuthStateChange,
   PostUpdateReleaseNotesPayload,
   RemoteConnectionRuntimeLog,
   RemoteSessionClosedEvent,
-  BotRemoteWorkspaceReconnectedEvent,
   RemoteTarget,
   SSHConfigAliasOption,
   RendererTelemetryEventPayload,
@@ -70,6 +71,7 @@ declare global {
     /** 插件 UI 沙箱 preload 命名空间；旧 preload 下为 undefined。 */
     zcodePluginSandbox?: {
       supportsRetainedMove?: boolean;
+      setExecutionActive?(sandboxId: string, initId: number, active: boolean): Promise<void>;
       copyImage?(
         input: import("@zcode/shared/mcp-apps").PluginSandboxCaptureRequest,
       ): Promise<void>;
@@ -87,20 +89,21 @@ declare global {
           connectTrigger?: import("@zcode/shared").RemoteWorkspaceConnectTrigger;
         },
       ): Promise<{ success: boolean; error?: string; sessionId?: string }>;
+      requestSourceSettingsAttachment?(sourceServerId: string): Promise<{ attachmentId: string }>;
       /** 取消当前窗口尚未建立完成的远程连接 */
       cancelPendingRemoteConnection?(requestId?: string): Promise<void>;
-      /** 绑定远程 logical session 的 canonical workspace context */
+      /**
+       * 绑定远程 logical session 的 canonical workspace context。
+       * 失败时不 reject，而是返回 `{ success: false, reasonCode }`：preload 抛出的 Error 跨
+       * contextBridge 会丢失 code/retryable。调用方必须用 `unwrapRemoteWorkspaceBindResult` 还原。
+       */
       bindRemoteWorkspaceSessionContext?(context: {
         remoteSessionId: string;
         workspacePath: string;
         workspaceIdentity?: string;
-      }): Promise<BrowserGuestAttachResult>;
+      }): Promise<import("@zcode/shared").BindRemoteWorkspaceSessionContextIpcResult>;
       /** 为当前 workspace 开启 Web 远程控制 */
       startWebRemoteControl(
-        context: WebRemoteControlContext,
-      ): Promise<WebRemoteControlStartOperationResult>;
-      /** 清除旧配对材料并重新生成 Web 远程控制二维码 */
-      refreshWebRemoteControlPairing(
         context: WebRemoteControlContext,
       ): Promise<WebRemoteControlStartOperationResult>;
       /** 关闭当前窗口的 Web 远程控制 */
@@ -125,6 +128,8 @@ declare global {
       log(level: "info" | "warn" | "error", args: unknown[]): void;
       /** 打开系统目录选择框，返回选中路径或 null */
       selectDirectory(): Promise<string | null>;
+      /** 打开系统多目录选择框；取消时返回空数组 */
+      selectDirectories(): Promise<string[]>;
       /** 打开系统文件选择框，返回选中文件路径或 null */
       selectFile(): Promise<string | null>;
       /** 打开系统多文件选择框，返回选中文件路径；取消时返回空数组 */
@@ -135,6 +140,10 @@ declare global {
       ): Promise<import("@zcode/shared").SaveFileResult>;
       /** 将当前页面的 print 媒体版面导出为 PDF（Chromium 打印引擎，矢量文本） */
       printPageToPdf?(): Promise<import("@zcode/shared").PrintPageToPdfResult>;
+      /** 在 main 截取内置浏览器 guest 当前视口为 PNG（renderer 侧 <webview>.capturePage 会崩溃） */
+      captureBrowserGuestPage?(
+        payload: import("@zcode/shared").CaptureBrowserGuestPageRequest,
+      ): Promise<import("@zcode/shared").CaptureBrowserGuestPageResult>;
       /** 从系统拖拽/文件输入得到的 Web File 解析真实本地路径 */
       getPathForFile?(file: File): string | null;
       /** dwf 产物「作为文件打开」：把某一版的字节落成本机副本，返回其路径 */
@@ -145,10 +154,6 @@ declare global {
       onRemoteConnectionLog(handler: (entry: RemoteConnectionRuntimeLog) => void): () => void;
       /** 订阅远程 workspace session 关闭事件，返回 disposer */
       onRemoteSessionClosed(handler: (event: RemoteSessionClosedEvent) => void): () => void;
-      /** 订阅 Bot 触发的远程 workspace 重连成功事件，返回 disposer */
-      onBotRemoteWorkspaceReconnected(
-        handler: (event: BotRemoteWorkspaceReconnectedEvent) => void,
-      ): () => void;
       /** 检查目录是否已在其他窗口打开 */
       activateOrSetWorkspace?(path: string): Promise<{ activated: boolean }>;
       /** 同步当前窗口所有 tab 的 workspace 路径到 main 进程 */
@@ -156,12 +161,17 @@ declare global {
       /** 同步当前窗口里 Web 远程控制允许切换的 workspace */
       syncWebRemoteControlWorkspaces?(workspaces: WebRemoteControlWorkspaceTarget[]): void;
       /** 同步当前窗口里 Web 远程控制可展示的 task 快照 */
-      syncWebRemoteControlTasks?(tasks: WebRemoteControlTaskTarget[]): void;
       /** 注册手机端 Web 远控请求重连 workspace 的回调 */
       onWebRemoteControlReconnectWorkspace?(
         handler: (
           request: WebRemoteControlReconnectWorkspaceRequest,
         ) => Promise<WebRemoteControlReconnectWorkspaceResult>,
+      ): () => void;
+      /** 注册手机远控动作（置顶/归档/新建本地项目）的回调 */
+      onWebRemoteControlRendererAction?(
+        handler: (
+          request: WebRemoteControlRendererActionRequest,
+        ) => Promise<WebRemoteControlRendererActionResult>,
       ): () => void;
       /** 同步当前窗口的未读 task 数到 main 进程 */
       syncWindowUnreadCount(count: number): void;
@@ -277,6 +287,7 @@ declare global {
       startCuaHelperPermissionDrag?(): void;
       /** 上报 OAuth state 用于 deep link 路由 */
       registerOAuthState(payload: OAuthStateRegistration): void;
+      notifyWebRemoteControlAuthStateChanged(change: WebRemoteControlAuthStateChange): void;
       /** 注册 OAuth deep link 回调，返回 disposer */
       onOAuthCallback(cb: (url: string) => void): () => void;
       /** 注册支付 deep link 回调，返回 disposer */
@@ -320,6 +331,7 @@ declare global {
       browserViewDetachGuest?(payload: { key: string; webContentsId: number }): Promise<boolean>;
       browserViewCloseTab?(payload: BrowserViewCloseTabRequest): Promise<void>;
       browserViewReportResidency?(payload: BrowserViewResidencyReportPayload): Promise<void>;
+      browserViewPromoteDraftTabs?(payload: BrowserViewPromoteDraftTabsRequest): Promise<string[]>;
       browserViewSuspendReady?(payload: { tabId: string; generation: number }): Promise<void>;
       browserViewEnsureResident?(payload: BrowserViewCloseTabRequest): Promise<void>;
       browserViewRestoreTabs?(
@@ -375,7 +387,7 @@ declare global {
       /** 用户确认重启安装更新 */
       quitAndInstallUpdate(): Promise<void>;
       /** 获取已安装的编辑器/终端列表（含图标） */
-      getInstalledEditors(): Promise<EditorInfo[]>;
+      getInstalledEditors(filePath?: string): Promise<EditorInfo[]>;
       /** 按兼容 bundle id 或结构化 locator 获取系统应用图标 */
       getApplicationIcon?(
         request: string | ApplicationIconRequest,

@@ -301,16 +301,55 @@ title sidecar, or a memory agent all pass the gate without knowing it exists. Th
 answers "who is calling", which the runtime knows when it builds the handle; the call site
 answers only "why".
 
+When one runtime's handle is wrapped by another runtime's layer, the **outer** layer wins,
+that is the runtime that actually makes the call: a subagent that inherits its parent's model
+reuses the parent's handle (`createInheritedSubagentModelFactory`), and the parent's layer,
+being nearer the adapter, used to override the subagent's, so the subagent's requests carried
+the parent's port, retry budget and session type (`main`, which also reached the provider as
+the session-type header). An inner runtime layer now passes through when an outer one has
+already applied; a runtime layer still overrides the call site. The "already applied" marker
+travels inside the invocation context itself, because an inner layer can be reached late: the
+off-peak wrapper's `streamText` is an async generator that calls the handle inside it only on
+the first `next()`, after it has waited for a ticket, and only the invocation context is carried
+across that boundary (`runWithModelInvocationContext` re-enters it for every `next()`).
+
 | Runtime | Port | Effect |
 |---|---|---|
 | a workflow subagent (`taskType` `workflow_child` or `nested_workflow_child`) | the driver's per-subagent wrapper over the run's seat gate and the governor | takes a seat when the run's own bound was lowered under it ("Retuning a live run"), then queues at the governor's gate; feeds signals |
 | the main agent, and its tools and sidecars | the governor's **observer** | never queues, never waits for cooldown; counts in flight and feeds signals |
+| a subagent of the main agent (`taskType` `subagent_child`, the `Agent` tool), and its tools and sidecars | the governor's **session subagent pool**, one per parent session | queues at the governor's gate and waits for cooldown like a workflow run; feeds signals |
 | a subagent of the legacy `Workflow` tool | none | ungoverned: no gate, no signals |
 | a snippet evaluation (`EvalWorkflowSnippet`) | none | its driver has no ask path |
 
 The main agent is an observer because its turn must never block behind workflow traffic,
 and it still feeds the controller because the provider sees its requests too: a 429 on the
 user's own conversation lowers the workflow cap.
+
+A subagent of the main agent is **not** an observer. It used to inherit the observer from its
+parent, and a turn that fans out ten `Agent` calls then sent ten request streams that neither
+queued nor honoured a Retry-After, each retrying on its own backoff: in production the
+subagents were the largest source of rate-limit refusals (2026-10-20: 46% of the sampled
+1302s, against 21% for main-agent turns), and they kept refusing the workflow runs and the
+user's own turn too. The main-agent rule protects the user's turn, which a subagent is not:
+it is delegated work, the same kind of work a workflow subagent does, so it takes the same
+gate. The governor exposes one admission per parent session, `sessionSubagents(parentSessionId)`:
+
+- Its run identity is `\0subagents:<parentSessionId>`, so all the subagents of a session share
+  **one** queue and take one turn in the round robin (below) next to each workflow run. A turn
+  that fans out ten subagents gets one share of a saturated bucket, not ten.
+- It neither registers a bound nor subscribes; it does not join a bucket's `runs`, so it never
+  lifts the growth limit and leaves nothing behind when the session goes away.
+- `tryAcquire` is the fast path, so a queued subagent request publishes `model_request_queued`
+  and `model_request_admitted` like a workflow subagent's, and a tool deadline pauses for the wait.
+  The `Agent` tool itself has no deadline, so a long cooldown cannot time a subagent out.
+- A user cancel aborts the request signal, which takes the waiter out of the queue.
+- The parent's foreground `Agent` call holds no ticket while it waits for its subagents (tool
+  execution holds no ticket), so the parent waiting on a queued subagent cannot deadlock.
+
+The runtime binds it at spawn time: `AgentRuntimeDeps.subagentModelRequestAdmission` is a
+factory the core calls with its current session id when it builds a subagent runtime; an
+assembly without it leaves the subagent on the parent's port, as before. Subagents cannot
+spawn subagents, so the pool has no nesting.
 
 ### One attempt, start to end
 
@@ -564,9 +603,22 @@ The ticket maps the attempt's status events onto controller signals, and settles
 | `model_retry_scheduled`, reason `reasoning_signature_repair` or `auth_refresh` | `ended` (not a provider failure; the streak survives) |
 | `model_retry_scheduled`, any other reason | `failedTransient` |
 | `model_request_failed`, `retryable: true` | nothing; the retry-scheduled event that follows is the signal |
+| `model_request_failed`, `retryable: false`, and the model-error policy (below) says `stop` | `ended`: neither the cap nor the cooldown moves |
 | `model_request_failed`, `retryable: false`, reason `rate_limited` | `throttled(epoch, "rate_limited", retryAfterMs)`: a 429 the classifier calls terminal is still a concurrency signal |
 | `model_request_failed`, `retryable: false`, other | `ended` |
 | `release()` before any of the above | `ended` |
+
+The rows are read in order, so the policy check comes before the `rate_limited` row. A
+`stop`-class failure — a quota code such as `1308`, an auth failure — says the account
+cannot be served at all, not that the provider wants fewer requests at once. The run it
+belongs to stops (`ProviderStop`), and the user decides when to try again: after a top-up or
+a quota reset, a resume must reach the provider at once. A quota 429 usually carries a
+Retry-After pointing at the end of the quota window; read as a throttle, it would freeze the
+shared bucket until then, past the stop and past any reset the user bought, and every later
+run on that model would wait at the gate without sending a request. The main agent's quota
+429s go through the same rule. The ticket asks the very function the runner and the driver
+use (`resolveWorkflowModelFailurePolicy`), so the three layers cannot disagree about which
+failures are `stop`.
 
 The off-peak queue (`offpeak_queued`) is a 429 with a Retry-After from a provider's idle
 plan; it counts as a throttle and, in the runner, does not consume a retry attempt.
@@ -597,9 +649,12 @@ and the "may we try again after this failure" gate, and nothing else:
 
 The backoff curve is the runner's: 2 s doubling to a 60 s ceiling, multiplied by a jitter in
 [0.5, 1]. A Retry-After header replaces the computed delay when it is at most five minutes,
-or shorter than the exponential delay would have been. After the ceiling the runner probes
+or shorter than the exponential delay would have been; the runner then adds a small jitter on
+top, never below the header (see `docs/bigmodel-business-error-retry.md` "Retry-After
+Header"). After the ceiling the runner probes
 forever; the only exits are success, user cancel, which interrupts the sleep and the gate
-wait alike, and the policy table below.
+wait alike, and the policy table below (which includes a cap on consecutive unknown provider
+codes).
 
 Status events carry `maxAttempts: 0` to mean unbounded, since `Infinity` does not
 serialize; consumers that render "attempt n of N" special-case zero.
@@ -624,10 +679,27 @@ failure the runner declines is one the driver will stop on.
 | error code `model_not_found` | `stop`, kind `model_unavailable` |
 | reason `context_exceeded` | `context_exceeded` |
 | reason `invalid_request`, unless the code is `invalid_model_response` | `stop`, kind `invalid_request` |
-| anything else: rate limits, overload, 5xx, timeouts, network and TLS errors, unknown provider codes, a response the adapter could not parse | `retry` |
+| reason `unknown` with a provider code (a code the classifier does not know, such as `1113`), the 10th time in a row within one request | `stop`, kind `other` |
+| anything else: rate limits, overload, 5xx, timeouts, network and TLS errors, an unknown provider code fewer than 10 times in a row, a response the adapter could not parse | `retry` |
 
 Under `unbounded`, `retry` means retry; `stop` and `context_exceeded` mean the attempt loop
-ends and the turn rejects. Under `default` the classifier's flag is consulted exactly as
+ends and the turn rejects.
+
+The cap on unknown provider codes (`WORKFLOW_UNRECOGNIZED_CODE_MAX_CONSECUTIVE`, 10)
+exists because such a code can be deterministic. On 2026-10-16 the server returned `1113`
+to a set of accounts on every request; the classifier did not know the code, so workflow
+runs retried it forever and only the stall notice said anything. An unknown code may also be
+transient, so the first one does not stop the run. The count is consecutive, not the
+attempt number: the runner keeps a streak per request (`nextUnrecognizedCodeStreak`), adds
+one for each failure that is an unknown provider code, and resets it to zero on any other
+failure. Nine network errors followed by one unknown code is a streak of one and retries;
+unknown codes alternating with network errors never stop the run; ten unknown codes in a row
+stop it, after about six minutes of backoff when nothing else interrupts them. Both paths
+that see a failure count it, the catch around the request and the in-stream error chunk.
+The runner passes the streak to the table, and the adapter error carries it as
+`unrecognizedCodeStreak`, so the driver reads the same input and reaches the same stop.
+The run stops as `stopped(provider)` with kind `other` and can be
+resumed once the cause is fixed. Under `default` the classifier's flag is consulted exactly as
 before, so main-conversation behaviour is untouched. The quota check comes before the
 reason check on purpose: code `1005` classifies as `invalid_request`, and a stopped run
 that reads "quota" is the one the user can act on.
@@ -821,7 +893,7 @@ carries it.
 |---|---|
 | `dynamic-workflow/tests/engine/concurrency.test.ts` | the constants; current-epoch throttle cuts by 0.75 to the floor and turns the epoch; a cut clears `lastGood` and records `lastBad`; old-epoch throttles move nothing, emit nothing, still reset the streak; thirteen epoch-0 refusals cut once; Retry-After cooldown, including from old epochs; K current-epoch successes prove `lastGood` with or without waiters; a raise needs waiters and headroom; old-epoch successes do not count; `failedTransient` and `ended`; idle reset after five minutes with nothing in flight, back to `initial`; growth stops at `growthLimit`, a raised limit is climbed step by step, a lowered one pulls the cap down (`limit_lowered`) and turns the epoch; `seed` jumps to the target within the growth limit, clears `lastGood` so the next refusal cuts by the factor, and is refused for a target at or below the cap or within five minutes of any refusal; the 16→12→13 and 13→9→6→4→5→6→5 sequences |
 | `dynamic-workflow/tests/engine/engine-concurrency-observations.test.ts` | the three sink methods each record one event and are ignored after settlement |
-| `bootstrap/tests/workflow-concurrency-governor.test.ts` | buckets per key; first run starts at D; auto-growth stops at 2D; a registered bound above 2D lifts the growth limit only for keys that run used and seeds the cap to it at once, a refusal in the last five minutes suppresses the seed, a default run never seeds, and clearing it pulls a higher cap down with `limit_lowered` fanned out to the runs still engaged; the observer never lifts it; a new run inherits a cap the observer's 429s lowered; idle reset; `tryAdmit` misses while anyone waits; round-robin across runs; the ticket's event mapping and double-count guard; `release()` as `ended`; abort dequeues; fan-out only to engaged runs; cooldown wake |
+| `bootstrap/tests/workflow-concurrency-governor.test.ts` | buckets per key; first run starts at D; auto-growth stops at 2D; a registered bound above 2D lifts the growth limit only for keys that run used and seeds the cap to it at once, a refusal in the last five minutes suppresses the seed, a default run never seeds, and clearing it pulls a higher cap down with `limit_lowered` fanned out to the runs still engaged; the observer never lifts it; a new run inherits a cap the observer's 429s lowered; idle reset; `tryAdmit` misses while anyone waits; round-robin across runs; the ticket's event mapping and double-count guard; a `stop`-class failure (quota code with a Retry-After) moves neither the cap nor the cooldown, from a run's ticket or the observer's, while a terminal 429 outside the stop set still throttles; `release()` as `ended`; abort dequeues; fan-out only to engaged runs; cooldown wake |
 | `bootstrap/tests/workflow-driver-concurrency.test.ts` | slot and backoff waits, executing on the first and post-wait `started`, per-ask reset; chain aggregation with parallel tool requests; wait deduplication; the driver-side policy split (stop / `ContextLimit` / redrive); the stall clock's 19-minute silence, 20-minute fire, and re-arm |
 | `dynamic-workflow/tests/engine/engine-retune-concurrency.test.ts`, `dynamic-workflow-runtime/tests/control.test.ts` | the setter: a raise pumps and dispatches within the same slice, a cut leaves live asks alone and stops the next dispatch, an unchanged value and a settled run both answer false and write neither row nor event; one `run-caps-changed` carrying `caps` and `previous`, one `updateRunCaps`; the scheduler reads `host.caps` on every pump, so a bound changed between two pumps is the one the second pump enforces; the harness binds the control to the engine it just built, and a binding never bound answers false |
 | `bootstrap/tests/workflow-seat-gate.test.ts` | the gate alone: park on a turn step over the limit (`tryAcquire` misses → `model_request_queued` → `waiting(slot)`), seat before governor, FIFO unpark on an ask settling and on a raise, one at a time; `activeAsks = working + parked`; limit 1 keeps one subagent working and deadlocks nothing; a tool-side request never parks and a subagent with no live ask never parks; abort dequeues, rejects with the signal's reason and returns the subagent to `working`, its later settlement frees no phantom seat, an already-aborted signal never enters the FIFO, and a settle that beats the abort refuses the waiter without freeing a seat; a settle for an instance never seen started is a strict no-op; a cut inside the `ensureSession` window still parks the late subagent and counts nobody twice; two asks in a row on one subagent join idempotently; a run never lowered is a pure pass-through and the governor sees every call |
@@ -839,7 +911,7 @@ carries it.
 | `core/tests/create-workflow-tool.test.ts`, `create-workflow-permission.test.ts`, `amend-workflow-permission.test.ts`, `get-workflow-run-tool.test.ts` | `resolveInput` floors before the window, leaves a whole-number inline call byte-identical at any size, and carries the value through a saved source; the amend tri-state (a number floored, `null` removing the key, an omitted field inheriting the snapshot's value as is, nothing inherited from a predecessor at D); `GetWorkflowRun` carries `maxConcurrency` and its `<max_concurrency>` tag only when the run has one |
 | `core/tests/amend-workflow-permission.test.ts`, `core/tests/dynamic-workflow-run-settings.test.ts` | the routing, from both callers: only `max_concurrency` on a live run goes in place, with the same run id, no supersede and no window; a script, a `path`, a `subagent_model` or a name beside it, a settled run, a pending run with no engine yet and a host whose port has no `retuneConcurrency` all fall through to the amend they take today; the same value is refused `workflow_retune_unchanged` and the refusal names the bound in force; `not_live` amends a run the owner predicate accepts and refuses the rest (`workflow_run_settled`, `workflow_run_not_retunable`), so nothing a retune failed to apply starts a run nobody approved; `null` reaches the port and comes back as the applied bound; the response text verbatim for both endings, and `retuned` carrying the applied bound, the previous one and `defaultConcurrency` with no `status`, `backgroundTaskId` or display |
 | `packages/ui/test/createWorkflowToolCallBlock.test.ts`, `workflowTurnDigests.test.ts`, `workflowRunSidePane.test.ts`, `packages/shared/test/zcodeProtocol.test.ts` | the retune row: drawn for a successful `AmendWorkflow` whose input is `run_id` + `max_concurrency` alone with no display and no run joined by tool call id, in the settings row's own words, clickable to that run's pane; a request equal to D, and `null`, read as "limit back to the default", a request above D reads as its number, and an unknown D shows the number as typed; the in-flight label stays 「正在调整工作流」; no turn-end digest card for it, and an in-place settings turn is a row without one; the optional `predecessorRunId` and the `run-caps-changed` payload across the protocol schemas |
-| `packages/desktop/test/e2e/automations-workflows-hub.test.ts`, the concurrency chip case | the real app: a running saved workflow at the default has no chip; Configure, one step down and Apply retune it in place and the chip reads 「最大并发数 N」 with the lowered bound; once the run completes the chip and Configure leave together. |
+| `packages/desktop/test/e2e/automations/workflows/automations-workflows-hub.test.ts`, the concurrency chip case | the real app: a running saved workflow at the default has no chip; Configure, one step down and Apply retune it in place and the chip reads 「最大并发数 N」 with the lowered bound; once the run completes the chip and Configure leave together. |
 
 ## Alternatives not taken
 

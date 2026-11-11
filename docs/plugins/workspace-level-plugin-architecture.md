@@ -88,7 +88,9 @@ Workspace 配置只覆盖自己声明的字段，其余字段继续继承 User �
 
 - `plugins.enabledPlugins`：项目启用/禁用哪些 Plugin；
 - `plugins.options`：项目共享的普通 option、credential、secret；
-- `plugins.dirs`：项目内 Plugin root 或项目相对 Plugin 路径，受路径和 manifest schema 校验。
+- `plugins.dirs`：仅 User 配置支持。项目配置中的该字段在读取时忽略，包括自动发现和显式指定的项目配置；相对路径与绝对路径均不进入插件发现。
+
+项目目录不构成用户安装授权。关闭 Workspace `plugins.dirs`，避免仓库声明的目录插件绕过用户安装直接注册 Hook、MCP 等能力。已有项目文件不改写；需要目录插件时由用户显式登记到 User 配置。Workspace 的 `enabledPlugins` 与 `options` 覆盖规则保持不变。
 
 Workspace 配置不保存 package bytes、安装完成态、Marketplace cache、Plugin data 或 Host 用户级安装记录。
 敏感 option 的空输入表示保留当前值；用户显式清除时只删除当前 scope 的指定 option key，
@@ -133,7 +135,7 @@ Plugin package、安装、更新、卸载、缓存和 data 仍是目标 Agent Ho
 按 Plugin ID/key 合并 effective enabled/options
           |
           v
-发现目标 Host 上的 installed/builtin/Workspace Plugin package
+发现目标 Host 上的 installed/builtin/User 目录 Plugin package
           |
           +-------------------+
           |                   |
@@ -191,24 +193,22 @@ Workspace: [local workspace / remote workspace]
 
 选择 Workspace 后，所有读取和写回都绑定被选择的 Workspace target。
 
-Plugin Marketplace 是独立主视图，不提供 scope selector：
+Plugin Marketplace 是独立主视图，浏览页不提供 scope selector；页内“插件管理”保留 User / Workspace 配置范围。
 
 ```text
-Settings / Plugins / Workspace A
-        | open marketplace; remember returnScopeKey=A
+Settings / Sidebar
+        | open marketplace
         v
 Plugin Marketplace
   | install/update/uninstall package in Host User inventory
   | new install defaults User enabled=true
-        | back
+  | manage -> [User | Workspace] -> browse all
+        | primary navigation back
         v
-Settings / Plugins / Workspace A
-  | row is visible as effective enabled, source=User
+Chat
 ```
 
-从非 Settings 入口打开 Marketplace 时，返回目标固定为 User 已安装列表。Marketplace 的
-source 只来自 User/Host 配置；Workspace 不支持 Marketplace 声明、添加或刷新，当前 Workspace
-只作为窗口/Agent 的执行上下文，不会改变市场的安装或配置 scope。
+主导航返回聊天；市场内管理与详情返回市场浏览。Marketplace 的 source 只来自 User/Host 配置；Workspace 不支持 Marketplace 声明、添加或刷新。包安装写 Host User，项目启停与配置仍由管理页显式选择的范围决定。完整交互见 [市场范围](plugin-market-interactions-scope.md)。
 
 插件详情区分三类状态：
 
@@ -383,18 +383,18 @@ Workspace-level E2E feature 分组如下：
 | User/Workspace scope UI         | `WPL-001` | 两级配置视图共享 Host 候选；User 不受项目覆盖污染；Workspace inheritance/override 与 A/B 隔离                           |
 | enabled 状态优先级              | `WPL-002` | Workspace 显式 true/false 覆盖 User，缺 key 继承                                                                        |
 | options 深合并                  | `WPL-003` | 按 Plugin/key 合并，未覆盖 User option 保留                                                                             |
-| sensitive/secret                | `WPL-004` | Workspace 可保存并运行；UI/log/provider/mobile artifact 不泄露原值                                                   |
+| sensitive/secret                | `WPL-004` | Workspace 可保存并运行；UI/log/provider/mobile artifact 不泄露原值                                                      |
 | Plugin 全组件直达 runtime       | `WPL-005` | Hook/Skill/Command/Agent/MCP 无 trust/approval 即进入新 Session                                                         |
 | 缺包行为                        | `WPL-006` | 只显示 missing，不自动安装；显式安装后才可运行                                                                          |
 | 配置与包生命周期分离            | `WPL-007` | enable/disable、install/uninstall 互不错误回滚                                                                          |
 | resident/cold resume            | `WPL-008` | resident App 冻结，新 Session/cold resume 读取新配置                                                                    |
 | Global Marketplace install      | `WPL-009` | 只有 User Marketplace 可添加/刷新；声明本身不触发下载；市场安装写 User inventory/config，不写 Workspace enabled/options |
 | Remote target isolation         | `WPL-010` | 相同 path、不同 identity 不串配置和 runtime                                                                             |
-| Remote missing/explicit install | `WPL-011` | 连接不复制本机 package；显式 Sync/Install 只物化 remote Host                                                            |
+| Remote missing/explicit install | `WPL-011` | 连接不复制本机 package；显式 Sync（Header「同步插件」打开数据同步弹窗）只物化 remote Host                               |
 | Mobile shared-host              | `WPL-012` | `/remote` 使用现有 Host，不复制 Plugin runtime/store                                                                    |
 | builtin Workspace disable       | `WPL-013` | 只改 enabledPlugins，不删除 builtin asset/user data                                                                     |
-| project Plugin root/MCP         | `WPL-014` | 合法项目 Plugin root 直接激活；非法 manifest/path fail closed                                                           |
-| Marketplace/installed roundtrip | `WPL-015` | 从 User 已安装进入全局市场；市场无 scope/config；安装写 User；返回 User，再切 Workspace 做配置                          |
+| project Plugin root/MCP         | `WPL-014` | 项目 `plugins.dirs` 不激活目录插件；不向模型注册其 MCP 工具                                                             |
+| Marketplace/installed roundtrip | `WPL-015` | 从 User 已安装进入全局市场；浏览页无 scope/config；安装写 User；主导航返回聊天，再进入管理切 Workspace 做配置           |
 
 E2E 证据分层：
 
@@ -467,7 +467,7 @@ promotion、Docker admission 和三平台 CI。`WPL-005` 当前只用 Skill+MCP 
 11. 当前 targeted pass 的 WPL case 具备独立 E2E setup/action/assertion/evidence；pending、review、fixture、Docker 和多平台门禁仍是后续晋级条件。
 12. 只有 `WPL-001` 至 `WPL-015` 全部完成对应实现、独立 E2E、人工审核和平台门禁，才能宣称完整 feature complete；本 V1 commit 不做该声明。
 13. 当前提交本身必须通过 `pnpm typecheck`、`pnpm lint`、E2E typecheck 和已实现 WPL 的 targeted E2E。
-14. Marketplace 不显示 scope、enable 或 options 控件；安装固定写 Host User inventory/User enablement，返回动作恢复来源配置视图。
+14. Marketplace 浏览页不显示 scope 或 options 控件；安装固定写 Host User inventory/User enablement；管理页保留项目范围，主导航返回聊天。
 
 ## 11. Out of scope
 
@@ -521,4 +521,3 @@ Workspace Plugin config loads without Workspace trust
   attachment 不复制 Plugin state，尚未完成真实手机 `/remote` E2E。
 
 实现时不能只修改 Settings UI；必须同时修改 config loader、Plugin discovery、Session startup、protocol/service contract 和 E2E fixture/coverage。
-

@@ -34,7 +34,24 @@ export type {
   PersistedWorkspaceSessionEntry,
 } from "./protocol.js";
 export type { WorkspacePurpose } from "./workspacePurpose.js";
-export { DEFAULT_LOCALE } from "./protocol.js";
+export { DEFAULT_LOCALE, SUPPORTED_LOCALES } from "./protocol.js";
+export {
+  hasLegacyIncompatiblePersistedLocale,
+  isLocale,
+  isLocalePreference,
+  LOCALE_NATIVE_NAMES,
+  resolveLocaleFromLanguageTag,
+  resolvePersistedUiLocale,
+  resolvePersistedUiLocalePreference,
+  toLegacyPersistedLocalePreference,
+  toPersistedSettingsLocaleFields,
+  toZhOrEnLocale,
+} from "./locale.js";
+export type {
+  LegacyPersistedLocale,
+  LegacyPersistedLocalePreference,
+  PersistedSettingsLocaleFields,
+} from "./locale.js";
 export { ZCODE_VERSION, ZCODE_COMMIT, ZCODE_BUILD_TIME } from "./version.js";
 export type { HelloMessage, HelloAckMessage } from "./handshake.js";
 export type { ArmsRumEnv, ZCodeEnv, ZCodeProductFlavor } from "./env.js";
@@ -72,6 +89,7 @@ export {
   ZCODE_PRODUCT_FLAVOR,
   ZCODE_APP_VERSION_ENV,
   ZCODE_BUILD_COMMIT_ID_ENV,
+  ZCODE_CLIENT_LANGUAGE_ENV,
   RUNTIME_ZCODE_DEBUG,
   ZCODE_ARMS_RUM_ENDPOINT,
   ZCODE_TELEMETRY_REPORT_ENDPOINT,
@@ -81,6 +99,10 @@ export {
   normalizeZCodeProductFlavor,
 } from "./env.js";
 export * from "./errors.js";
+export {
+  USER_INSTRUCTIONS_MAX_BYTES,
+  USER_INSTRUCTIONS_TOO_LARGE_ERROR_CODE,
+} from "./userInstructions.js";
 export * from "./rendererActionTrace.js";
 export * from "./validation.js";
 export * from "./api.js";
@@ -99,6 +121,7 @@ export * from "./official-mcp-tool-error.js";
 export * from "./conversation-message-projection-policy.js";
 export * from "./conversation-share.js";
 export * from "./session-sharing.js";
+export * from "./conversation-share-content.js";
 export * from "./conversation-preview-artifacts.js";
 export * from "./zcode-session-task-status.js";
 export * from "./zcode-session-content-profile.js";
@@ -116,6 +139,7 @@ export * from "./dynamic-workflow-feature.js";
 export * from "./markdown-artifact-images.js";
 export * from "./serviceAuthority.js";
 export * from "./server-remote.js";
+export * from "./source-server/index.js";
 
 export interface ICredentialStore {
   get(key: string): Promise<string | null>;
@@ -123,7 +147,6 @@ export interface ICredentialStore {
   delete(key: string): Promise<void>;
 }
 
-export * from "./test-ids.js";
 export * from "./test-ids-workflow.js";
 export * from "./channels.js";
 export * from "./storage.js";
@@ -141,23 +164,35 @@ export {
   BROWSER_SCREENSHOT_SURFACE_PREPARE_TIMEOUT_MS,
   BROWSER_VIEW_RESTORE_BOOTSTRAP_URL,
   LOCAL_MEDIA_PREVIEW_SCHEME,
+  BROWSER_VIEW_DRAFT_SESSION_ID,
+  BROWSER_LOCAL_PREVIEW_SCHEME,
+  browserPreviewSourceUrl,
   DesktopCommandIds,
   buildLocalMediaPreviewUrl,
   createOpenInEditorRemoteTarget,
+  unwrapRemoteWorkspaceBindResult,
 } from "./platform.js";
 export type {
   ArmsCustomEventPayload,
   ConfigureFinalArmsCustomEventE2ERequest,
   FinalArmsCustomEventE2EEntry,
   FinalArmsCustomEventPayload,
+  MobilePluginDiscoveryTelemetry,
   RendererTelemetryEventPayload,
   TelemetryEventPayload,
   TelemetryRendererContext,
+  TelemetryUiMode,
 } from "./telemetry.js";
 export {
+  PLUGIN_TELEMETRY_EVENTS,
+  mobilePluginDiscoveryTelemetrySchema,
+  sanitizePluginTelemetryDetail,
   collectTelemetryRendererContext,
+  normalizeTelemetryUiMode,
+  telemetryUiModeSchema,
   resolveSafeTelemetryHostname,
   sanitizeTelemetryErrorMessage,
+  sanitizeTelemetrySkillName,
   sanitizeTelemetryEventDetail,
 } from "./telemetry.js";
 export type {
@@ -179,12 +214,15 @@ export * from "./sessionCreateTelemetry.js";
 export type { LaunchMarks } from "./launchMarks.js";
 export { LAUNCH_MARKS_QUERY_KEY, parseLaunchMarks, serializeLaunchMarks } from "./launchMarks.js";
 export type {
+  BrowserViewSurfaceScaleMode,
   CancelPendingRemoteConnectionRequest,
   BindRemoteWorkspaceSessionContextRequest,
-  BotRemoteWorkspaceReconnectedEvent,
+  BindRemoteWorkspaceSessionContextIpcResult,
+  BindRemoteWorkspaceSessionContextResult,
   BrowserTabResidencyState,
   BrowserViewCloseTabNotification,
   BrowserViewCloseTabRequest,
+  BrowserViewPromoteDraftTabsRequest,
   BrowserViewOperationPayload,
   BrowserViewResidencyReportPayload,
   BrowserViewResidencyTransitionPayload,
@@ -198,6 +236,8 @@ export type {
   ChromeBrowserDataImportOptions,
   ChromeBrowserDataImportResult,
   ConnectRemoteRequest,
+  FileApplicationInfo,
+  FileApplicationTarget,
   CreateTempTextAttachmentRequest,
   CreateTempTextAttachmentResult,
   MaterializeWorkflowArtifactFileRequest,
@@ -205,6 +245,11 @@ export type {
   SaveFileRequest,
   SaveFileResult,
   PrintPageToPdfResult,
+  MicrophoneAccessResult,
+  MicrophoneSettingsTarget,
+  CaptureBrowserGuestPageClip,
+  CaptureBrowserGuestPageRequest,
+  CaptureBrowserGuestPageResult,
   DesktopCloseToTrayCapability,
   DesktopCommandId,
   CuaOsSupport,
@@ -228,17 +273,24 @@ export type {
   EmbeddedBrowserSitePermissionUpdateRequest,
   EmbeddedBrowserSitePermissionsSnapshot,
   IPlatformService,
+  AppNavigationTarget,
+  AppNavigationResult,
+  AppNavigationHandler,
+  DesktopZoomState,
+  WindowControlsOverlayMetrics,
   OpenInEditorRemoteTarget,
   OpenInEditorOptions,
   PostUpdateReleaseNotesPayload,
   RemoteConnectionRuntimeLog,
   RemoteSessionClosedEvent,
+  RemoteSessionReconnectedEvent,
   RemoteServiceSession,
   SSHConfigAliasOption,
   TaskNotificationPayload,
   UpdateCheckResultPayload,
   UpdateStatePayload,
   WSLDistro,
+  WindowControlsOverlayReadyPayload,
   ZCodeStdioTapDevState,
 } from "./platform.js";
 export type {
@@ -295,7 +347,8 @@ export * from "./streaming-tool-input-preview.js";
 export * from "./tool-plan-adapter.js";
 export * from "./permission-request-preview.js";
 export * from "./web-remote-control.js";
-export * from "./web-remote-control-heartbeat.js";
+export * from "#src/web-remote-relay/index.js";
+
 export * from "./web-remote-control-rpc-transport.js";
 export * from "./settings-sync.js";
 export * from "./uuid.js";
@@ -330,7 +383,7 @@ export * from "./subagent-runtime-config.js";
 export * from "./subagent-profile.js";
 export { parseAgentProfileFromMarkdown } from "./subagent-profile-parser.js";
 
-export * from "./localTtft.js";
+export * from "./local-ttft/contract.js";
 export * from "./pluginStoreOrder.js";
 export * from "./clientConfig.js";
 export * from "./pluginStoreOrdering.js";
@@ -342,7 +395,11 @@ export { redactFeedbackText } from "./feedbackPrivacy.js";
 export { API_KEY_USAGE_SCENE, type ApiKeyCreationUsageScene } from "./api-key-usage-scene.js";
 export {
   projectAccessTokenFingerprint,
+  projectAccessTokenRetryAfterMs,
+  ProjectAccessTokenError,
+  ProjectAccessTokenHttpStatusError,
   ProjectAccessTokenTransientError,
+  type ProjectAccessTokenRequestFailure,
 } from "./project-access-token.js";
 export {
   ProjectAccessTokenClient,
@@ -354,9 +411,12 @@ export * from "./conversationSelection.js";
 export * from "./attachment-source.js";
 
 export * from "./channel-mention.js";
+export * from "./plugin-store-visibility.js";
 
 export {
   requestSecuritySensitiveHeaders,
   isRequestSecurityFailure,
 } from "./request-security-edition/policy.js";
 export * from "./request-security-edition/verification-policy.js";
+
+export * from "./conversation-share-tool-presentation.js";

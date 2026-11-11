@@ -81,11 +81,17 @@ describe("new-turn task notification context usage", () => {
         { role: "assistant", content: "background launched" },
         { role: "user", content: notification.content },
       ].reduce((sum, message) => sum + JSON.stringify(message).length, 0);
+      // 指令按请求里 context_prefix 公告的真实文本计（context-composition.md §3.1），不再按 section 估算。
+      const instructionMessage = projection.messages[0]!;
+      const expectedInstructionChars = JSON.stringify({
+        role: instructionMessage.role,
+        content: instructionMessage.content,
+      }).length;
       expect(runtime.buildContextUsageBreakdownFromSnapshot(snapshot)).toEqual([
-        { source: "meta_user_context", chars: contextBody.length },
+        { source: "meta_user_context", chars: expectedInstructionChars },
         { source: "messages", chars: expectedMessagesChars },
       ]);
-      expect(snapshot.totalChars).toBe(contextBody.length + expectedMessagesChars);
+      expect(snapshot.totalChars).toBe(expectedInstructionChars + expectedMessagesChars);
       expect(runtime.buildContextUsageSnapshot(options)).toEqual(snapshot);
       expect(entries).toEqual(before);
       expect(projection.diagnostics.latestRealUserMessageIndex).toBe(1);
@@ -130,7 +136,10 @@ describe("new-turn task notification context usage", () => {
       expect(requests).toHaveLength(2);
       const notification = requests[1]!.at(-1)!;
       expect(notification.role).toBe("user");
-      expect(notification.content).toContain(notificationBody);
+      // 每条通知各自包装，正文逐条出现在请求里。
+      for (const part of notificationBody.split("\n\n")) {
+        expect(notification.content).toContain(part);
+      }
       expect(JSON.stringify(requests)).not.toContain("sourceEntries");
       const completions = (await eventStore.getEvents(sessionId)).filter(
         (event) => event.type === SessionEventType.ModelComplete,

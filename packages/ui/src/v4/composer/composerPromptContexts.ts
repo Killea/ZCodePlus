@@ -3,7 +3,6 @@ import {
   parsePromptCodeComments,
   type CodeCommentComposerAttachment,
 } from "@/lib/codeCommentContext.js";
-import { stripGenUiModelContext } from "@zcode/shared/gen-ui";
 import {
   buildPromptWithConversationSelections,
   parsePromptConversationSelections,
@@ -76,7 +75,10 @@ export function serializeComposerPromptContexts(
   const withPptx = buildPromptWithPptxElementReferences(withWebElements, contexts.pptxElements);
   // 与 pluginUiContexts 同款：不带工具推荐块的 contexts（旧调用方/测试夹具）按空处理，
   // 不能透传 undefined 到 buildToolRecommendationsBlock（内部直接读 .length）。
-  const withTools = buildPromptWithToolRecommendations(withPptx, contexts.toolRecommendations ?? []);
+  const withTools = buildPromptWithToolRecommendations(
+    withPptx,
+    contexts.toolRecommendations ?? [],
+  );
   return buildPromptWithPluginUiContexts(withTools, contexts.pluginUiContexts ?? []);
 }
 
@@ -92,7 +94,7 @@ export function parseComposerPromptContexts(
   pluginUiContexts: PluginUiModelContext[];
   toolRecommendations: ComposerToolRecommendation[];
 } {
-  const plugin = parsePromptPluginUiContexts(stripGenUiModelContext(content));
+  const plugin = parsePromptPluginUiContexts(content);
   const tools = parsePromptToolRecommendations(plugin.visibleContent);
   const pptx = parsePromptPptxElementReferences(tools.visibleContent);
   const web = parsePromptWebElementContexts(pptx.visibleContent, workspace);

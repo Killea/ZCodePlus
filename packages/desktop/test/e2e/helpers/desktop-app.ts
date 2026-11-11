@@ -1,8 +1,10 @@
+import { createSystemCredentialCipher } from "@zcode/shared/credential-security";
 /* eslint-disable max-lines -- 测试相关的代码，忽略 */
 import { execFileSync } from "node:child_process";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  isApiKeyAccess,
   type ModelConfig,
   type ProviderConfig,
   type ProviderConfigLayerSnapshot,
@@ -11,14 +13,12 @@ import {
   NodePersonalProviderConfigRepository,
   PERSONAL_PROVIDER_CONFIG_FILE_NAME,
 } from "@zcode/provider-node";
+import { ZAI_PROVIDER_ID } from "@zcode/shared";
 import {
   TID_COMPOSER_WORKSPACE_TRIGGER,
   TID_V4_SESSION_PANE,
-  TID_WORKSPACE_ITEM,
   TID_WORKSPACE_PATH,
-  ZAI_PROVIDER_ID,
-  testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import type { AppSettings } from "@zcode/shared";
 import { collectWindowsE2EProcessTreePids } from "./e2e-process-cleanup.js";
 import {
@@ -27,6 +27,7 @@ import {
 } from "./e2e-window-target.js";
 import { dismissOccupationOnboarding } from "./occupation-onboarding.js";
 import { sel } from "./selectors.js";
+import { projectSectionSelector } from "./project-sidebar.js";
 
 const DEFAULT_E2E_HOME_DIR = resolve(process.cwd(), ".e2e-home");
 const E2E_HOME_DIR =
@@ -280,34 +281,6 @@ export async function clickTestIdByDom(
   }
 }
 
-export async function ensureWorkspaceItemExpanded(
-  workspacePath: string,
-  timeout = 30_000,
-): Promise<void> {
-  const workspaceItemTestId = testId(TID_WORKSPACE_ITEM, workspacePath);
-  await waitForTestIdByDom(workspaceItemTestId, {
-    timeout,
-    timeoutMsg: `侧栏没有显示 workspace: ${workspacePath}`,
-  });
-
-  const isExpanded = async () =>
-    (await browser.execute(readExactTestIdAttribute, workspaceItemTestId, "aria-expanded")) ===
-    "true";
-  if (!(await isExpanded())) {
-    await clickTestIdByDom(workspaceItemTestId, {
-      timeout: 15_000,
-      timeoutMsg: `侧栏 workspace 不可展开: ${workspacePath}`,
-    });
-  }
-
-  // Bug 根因：慢渲染环境下 DOM click 成功只代表事件已经派发，项目树的 React
-  // 展开提交仍可能在后续帧；统一等待 aria 终态，避免各 case 提前查找 task。
-  await browser.waitUntil(isExpanded, {
-    timeout: 15_000,
-    timeoutMsg: `侧栏 workspace 没有完成展开: ${workspacePath}`,
-  });
-}
-
 export async function clickTestIdByWebDriver(
   testId: string,
   { timeout = 10000, timeoutMsg = `页面没有可点击的 test id: ${testId}` }: DomTestIdOptions = {},
@@ -363,6 +336,11 @@ export async function setInputValueByTestIdDom(
           !(element instanceof HTMLTextAreaElement) &&
           (element.isContentEditable || element.hasAttribute("data-e2e-lexical-bridge"))
         ) {
+          // 原因：冷恢复时 bridge 已挂载但编辑器仍禁用，越权 setText 会与草稿恢复竞争。
+          // 只在真实 DOM 开放输入后写入，不能靠延时或再次写入补偿被覆盖的文字。
+          if (!element.isContentEditable) {
+            return { ok: false, reason: "not-editable", tagName: element.tagName };
+          }
           const bridge = (
             element as HTMLElement & {
               __zcodeLexicalInputE2E?: {
@@ -442,7 +420,8 @@ export async function setInputValueByTestIdDom(
         // missing 不是“选择器指向非输入框”的终态，必须和 bridge 初始化一起重试。
         return (
           current.ok ||
-          (current.reason !== "lexical-bridge-not-ready" &&
+          (current.reason !== "not-editable" &&
+            current.reason !== "lexical-bridge-not-ready" &&
             current.reason !== "lexical-pending" &&
             !(current.reason === "not-input" && current.tagName === null))
         );
@@ -559,6 +538,14 @@ export function getE2EAppDataPaths() {
     storageRoot: E2E_STORAGE_ROOT,
     workspace: DEFAULT_WORKSPACE,
   };
+}
+
+/** 行为断言读取解密值；磁盘格式与损坏值断言继续直接读取原始文件。 */
+export async function readE2ECredentialValue(key: string): Promise<string | undefined> {
+  const record = JSON.parse(await readFile(CREDENTIALS_FILE, "utf8")) as Record<string, string>;
+  const value = record[key];
+  if (value === undefined) return undefined;
+  return createSystemCredentialCipher({ filePath: CREDENTIALS_FILE }).decrypt(value);
 }
 
 export async function clearAppData() {
@@ -775,7 +762,8 @@ function convertPersonalProviderConfig(
       },
       apiFormat: provider.api?.type ?? "openai-chat-completions",
       apiKeyRequired: true,
-      apiKey: provider.access?.type === "api-key" ? provider.access.apiKey?.trim() || "" : "",
+      // 套餐手动 Key 同样是 API Key；仅识别普通类型会把已保存凭据误报为空。
+      apiKey: isApiKeyAccess(provider.access) ? provider.access.apiKey?.trim() || "" : "",
       defaultKind: kind,
       models: (provider.personalModelIds ?? []).map((modelId) =>
         convertPersonalModelConfig(
@@ -859,11 +847,45 @@ export async function readModelProvider(
 }
 
 export async function seedSettings(partial: Partial<AppSettings>): Promise<Partial<AppSettings>> {
-  const current = await readSettings();
+  const current: Record<string, unknown> = await readSettings();
+  // setting.json 的真实界面语言优先存在 uiLocale/uiLocalePreference（旧字段只存中英以兼容降级）。
+  // 用例只种旧字段时要清掉上一个用例残留的新字段，否则 app 会按新字段优先读到旧语言。
+  if ("locale" in partial && !("uiLocale" in partial)) delete current.uiLocale;
+  if ("localePreference" in partial && !("uiLocalePreference" in partial)) {
+    delete current.uiLocalePreference;
+  }
   const next = { ...current, ...partial };
   await ensureAppDataDir();
   await writeFile(SETTINGS_FILE, JSON.stringify(next), "utf-8");
   return next;
+}
+
+type E2ELocale = "zh-CN" | "en-US";
+type LocaleTestActions = { getLocale(): E2ELocale; setLocale(locale: E2ELocale): void };
+
+/**
+ * 运行中把界面语言固定为 locale，并等 renderer 生效。
+ * 首帧跟随宿主系统语言：容器、英文系统下是英文，断言中文文案的 spec 必须自己固定语言。
+ * 走真实的 setLocale（写进设置文件）；clearAppData 会清掉它，之后的 case 要重新调用。
+ */
+export async function pinE2ELocale(locale: E2ELocale): Promise<void> {
+  const readLocale = () =>
+    browser.execute(
+      () =>
+        (window as Window & { __testActions?: LocaleTestActions }).__testActions?.getLocale() ??
+        null,
+    );
+  await browser.waitUntil(async () => (await readLocale()) !== null, {
+    timeout: 30000,
+    timeoutMsg: "renderer 没有注册 __testActions，无法固定界面语言",
+  });
+  await browser.execute((next) => {
+    (window as Window & { __testActions?: LocaleTestActions }).__testActions?.setLocale(next);
+  }, locale);
+  await browser.waitUntil(async () => (await readLocale()) === locale, {
+    timeout: 15000,
+    timeoutMsg: `界面语言没有切到 ${locale}`,
+  });
 }
 
 export async function seedCliConfig(
@@ -897,6 +919,16 @@ export async function restoreCliConfig(snapshot: CliConfigSnapshot): Promise<voi
 
   await mkdir(dirname(CLI_CONFIG_FILE), { recursive: true });
   await writeFile(CLI_CONFIG_FILE, snapshot.content, "utf-8");
+}
+
+/** 仅用于旧 Electron 已退出后的 fixture 注入；删除指定测试凭据，保留登录与其他键。 */
+export async function removeSeededCredentials(keys: string[]): Promise<void> {
+  const credentials = JSON.parse(await readFile(CREDENTIALS_FILE, "utf-8")) as Record<
+    string,
+    string
+  >;
+  for (const key of keys) delete credentials[key];
+  await writeFile(CREDENTIALS_FILE, JSON.stringify(credentials), "utf-8");
 }
 
 export async function seedCredentials(authToken = "mock-token") {
@@ -942,7 +974,7 @@ export function probeWorkspaceAppState(
   const pathBadge = document.querySelector<HTMLElement>(
     `[data-testid="${params.workspacePathTestId}"]`,
   );
-  if (pathBadge?.getAttribute("title") === params.expectedPath) {
+  if (pathBadge?.dataset.workspaceAbsPath === params.expectedPath) {
     return "ready";
   }
 
@@ -951,9 +983,12 @@ export function probeWorkspaceAppState(
   // 同时存在，才代表用户已经进入可操作的目标工作区。
   // 修复原因：Windows workspacePath 会进入 data-testid，反斜杠直接拼到
   // CSS attribute selector 会被当作转义字符，导致 DOM 里有元素也查不到。
-  const workspaceItem = Array.from(document.querySelectorAll<HTMLElement>("[data-testid]")).find(
-    (element) => element.dataset.testid === params.workspaceItemTestId,
-  );
+  const workspaceItem =
+    (
+      window as Window & {
+        __zcodeTabStoreE2E?: { getState(): { activeWorkspacePath?: string | null } };
+      }
+    ).__zcodeTabStoreE2E?.getState().activeWorkspacePath === params.expectedPath;
   const conversationWorkspaceReady =
     params.expectedPath.replace(/\\/g, "/").endsWith("/.zcode/workspace/default") &&
     Boolean(document.querySelector(`[data-testid="${params.composerWorkspaceTriggerTestId}"]`));
@@ -965,14 +1000,14 @@ export function probeWorkspaceAppState(
 }
 
 // Bugfix: WorkspaceHeader 里的 TID_WORKSPACE_TITLE 现在展示的是 activeTaskTitle，
-// 不再稳定代表当前工作区名。e2e 改为读取 TID_WORKSPACE_PATH 的 title 属性，
-// 新建任务草稿下 header 路径胶囊不会渲染，因此同时接受侧边栏 workspace item。
-// 这样才能准确覆盖“默认工作区自动打开 / 多标签切换”这条真实产品链路。
+// 不再稳定代表当前工作区名。路径徽标的上下文改由 tooltip 承载，改读 data-workspace-abs-path。
+// 虚拟项目侧栏不再渲染真实目录节点，新建任务草稿下以 tab store 的导航 owner + 可见
+// session pane 判定，覆盖默认工作区自动打开及多标签切换。
 export async function waitForWorkspaceApp(workspacePath: string, timeout = 10000) {
   const timeoutMsg = `主界面没有切到工作区: ${workspacePath}`;
   const probeParams: WorkspaceAppProbeParams = {
     workspacePathTestId: TID_WORKSPACE_PATH,
-    workspaceItemTestId: testId(TID_WORKSPACE_ITEM, workspacePath),
+    workspaceItemTestId: "virtual-project-row",
     sessionPanePrefix: TID_V4_SESSION_PANE,
     composerWorkspaceTriggerTestId: TID_COMPOSER_WORKSPACE_TRIGGER,
     expectedPath: workspacePath,
@@ -1005,31 +1040,24 @@ export async function waitForWorkspaceApp(workspacePath: string, timeout = 10000
 }
 
 async function isWorkspaceAppVisible(workspacePath: string) {
-  const workspaceItemTestId = testId(TID_WORKSPACE_ITEM, workspacePath);
   try {
     return await browser.execute(
-      (workspacePathTestId, workspaceItemTestId, sessionPanePrefix, expectedPath) => {
+      (workspacePathTestId, sessionPanePrefix, expectedPath) => {
+        if (
+          (
+            window as Window & {
+              __zcodeTabStoreE2E?: { getState(): { activeWorkspacePath: string | null } };
+            }
+          ).__zcodeTabStoreE2E?.getState().activeWorkspacePath === expectedPath &&
+          document.querySelector(`[data-testid^="${sessionPanePrefix}-"]`)
+        )
+          return true;
         const pathBadge = document.querySelector<HTMLElement>(
           `[data-testid="${workspacePathTestId}"]`,
         );
-        if (pathBadge?.getAttribute("title") === expectedPath) {
-          return true;
-        }
-
-        // 修复原因：API Key 登录后进入空任务态时，主区域只展示新任务草稿，
-        // 不一定渲染 WorkspaceHeader 的路径徽标。此时侧栏工作区项和 v4 session pane
-        // 同时存在，才代表用户已经进入可操作的目标工作区。
-        // 修复原因：Windows workspacePath 会进入 data-testid，反斜杠直接拼到
-        // CSS attribute selector 会被当作转义字符，导致 DOM 里有元素也查不到。
-        const workspaceItem = Array.from(
-          document.querySelectorAll<HTMLElement>("[data-testid]"),
-        ).find((element) => element.dataset.testid === workspaceItemTestId);
-        return Boolean(
-          workspaceItem && document.querySelector(`[data-testid^="${sessionPanePrefix}-"]`),
-        );
+        return pathBadge?.dataset.workspaceAbsPath === expectedPath;
       },
       TID_WORKSPACE_PATH,
-      workspaceItemTestId,
       TID_V4_SESSION_PANE,
       workspacePath,
     );
@@ -1043,12 +1071,12 @@ async function isWorkspaceAppVisible(workspacePath: string) {
 export async function getActiveWorkspacePath() {
   return browser.execute((workspacePathTestId) => {
     const pathBadge = document.querySelector<HTMLElement>(`[data-testid="${workspacePathTestId}"]`);
-    return pathBadge?.getAttribute("title") ?? null;
+    return pathBadge?.dataset.workspaceAbsPath ?? null;
   }, TID_WORKSPACE_PATH);
 }
 
 async function collectWorkspaceDiagnostics(expectedPath: string) {
-  const workspaceItemTestId = testId(TID_WORKSPACE_ITEM, expectedPath);
+  const projectSelector = projectSectionSelector(expectedPath);
   const windows = await getAllWindowInfo().catch((error: unknown) => ({
     error: error instanceof Error ? error.message : String(error),
   }));
@@ -1057,13 +1085,11 @@ async function collectWorkspaceDiagnostics(expectedPath: string) {
   }));
   const dom = await browser
     .execute(
-      (workspacePathTestId, workspaceItemId) => {
+      (workspacePathTestId, projectSectionSelectorValue) => {
         const pathBadge = document.querySelector<HTMLElement>(
           `[data-testid="${workspacePathTestId}"]`,
         );
-        const workspaceItem = Array.from(
-          document.querySelectorAll<HTMLElement>("[data-testid]"),
-        ).find((element) => element.dataset.testid === workspaceItemId);
+        const projectSection = document.querySelector(projectSectionSelectorValue);
         let localStorageKeys: string[] | { error: string };
         try {
           localStorageKeys = Object.keys(window.localStorage).sort();
@@ -1080,13 +1106,13 @@ async function collectWorkspaceDiagnostics(expectedPath: string) {
             .map((element) => element.dataset.testid ?? ""),
           title: document.title,
           url: window.location.href,
-          workspaceItemExists: Boolean(workspaceItem),
-          workspacePathTitle: pathBadge?.getAttribute("title") ?? null,
+          projectRowExists: Boolean(projectSection),
+          workspaceAbsPath: pathBadge?.dataset.workspaceAbsPath ?? null,
           localStorageKeys,
         };
       },
       TID_WORKSPACE_PATH,
-      workspaceItemTestId,
+      projectSelector,
     )
     .catch((error: unknown) => ({
       error: error instanceof Error ? error.message : String(error),
@@ -1279,7 +1305,7 @@ export async function restoreElectronRendererContentSize(
   }
 }
 
-async function switchToWorkspaceRendererWindow(workspacePath: string, timeout = 10000) {
+export async function switchToWorkspaceRendererWindow(workspacePath: string, timeout = 10000) {
   let latestResult: WorkspaceRendererSwitchResult = {
     switched: false,
     reason: "not-started",
@@ -1540,15 +1566,13 @@ export async function isPrimaryWindowMinimized(): Promise<boolean> {
 
 export async function getTabLabels(): Promise<string[]> {
   return browser.execute(() => {
-    const workspaceItems = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-testid^='workspace-item-']"),
+    // 虚拟项目侧栏：项目行的 data-project-name 就是旧 workspace 标签名（目录 basename）。
+    const projectSections = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-project-id][data-project-name]"),
     );
-    if (workspaceItems.length > 0) {
-      return workspaceItems
-        .map((node) => {
-          const label = node.querySelector("div > div")?.textContent?.trim();
-          return label ?? "";
-        })
+    if (projectSections.length > 0) {
+      return projectSections
+        .map((node) => node.getAttribute("data-project-name")?.trim() ?? "")
         .filter(Boolean);
     }
 

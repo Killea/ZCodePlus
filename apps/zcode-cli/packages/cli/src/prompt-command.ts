@@ -1,3 +1,5 @@
+import type { ToolSearchMode } from "@zcode/contracts";
+import { createCliProviderRefreshReporter } from "./provider-runtime-env.js";
 import { extname } from "node:path";
 import { formatJson, type PresentationSurface } from "@zcode/core";
 import type { RunContext, GlobalOptions } from "@zcode/shared-types";
@@ -39,6 +41,7 @@ import type {
   ModeCapableApp,
   RunDependencies,
 } from "./cli-types.js";
+import { workspaceTrustCommandArgument } from "./hooks-trust-command.js";
 
 /**
  * Does this run print a JSON summary at the end?
@@ -76,6 +79,7 @@ export const runPrompt = async (
   resumeRequest: CliResumeRequest = { continueSession: false },
   toolDisallowlist?: readonly string[],
   forceMcs = false,
+  toolsearchMode: ToolSearchMode = "off",
   presentationSurface: PresentationSurface = "terminal",
   workflowMode: DynamicWorkflowMode = DEFAULT_CLI_WORKFLOW_MODE,
 ): Promise<number> => {
@@ -238,6 +242,8 @@ export const runPrompt = async (
     });
     browserRuntime = createCliHeadlessBrowserRuntime(options, deps);
     app = await createApp({
+      modelSelectionMode: "cli-default",
+      standaloneSessionControl: true,
       browserControlPort: browserRuntime?.browserControlPort,
       env: appEnv,
       // headless 没有交互审批面，core 因此退到 deny broker，于是 CreateWorkflow 的
@@ -257,6 +263,7 @@ export const runPrompt = async (
       runtimeConfig: {
         ...(mode ? { mode } : {}),
         ...(toolDisallowlist ? { toolDisallowlist } : {}),
+        toolSearch: { mode: toolsearchMode },
         ...(forceMcs ? { midConversationSystem: { mode: "force" as const } } : {}),
         ...resolveWorkflowModeRuntimeConfig(workflowMode),
         memory: { extractionEnabled: options.memoryBench === true },
@@ -289,7 +296,8 @@ export const runPrompt = async (
     // 的三件机制全被跳过——dwf 结算等待、常驻事件订阅的单一写者、`response` 取最后一个
     // 回合。结果是 `zcode -p "/workflow ..."` 在第一个回合后就退出，把在飞的 run 孤儿化
     // 成 Interrupted。能解析成真实自定义命令的必须落到普通 prompt 路径，提交**原文**即可：
-    // facade 的 customCommandPromptResolver 会在服务端展开（$ARGUMENTS、skills: 前言、`!`）。
+    // facade 的 customCommandPromptResolver 会在服务端展开（$ARGUMENTS、skills: 前言、把 `!`
+    // 块改写成交给模型的 Bash 指令）。
     // 解析不出来的名字继续留在 command-center，拿它的 "Unknown command" 文案；保留名
     // （`/compress` 是唯一一个 CLI 解析成 unknown 而 facade 又拒绝展开的）同样留在那边，
     // 判据与 facade 的 gate 共用一个来源，见 isResolvableCustomCommand。
@@ -487,14 +495,12 @@ async function routesToPromptCommandCenter(
 }
 
 async function isResolvableCustomCommand(deps: RunDependencies, name: string): Promise<boolean> {
-  // 保留名先问，再尝试加载——与 facade 那道 gate 的顺序逐字一致
-  // （`bootstrap/src/custom-command-prompt.ts:31`）。判据必须是同一个：facade 对保留名
+  // 保留名先问，再尝试加载——与 facade 那道 gate 的顺序逐字一致（`bootstrap/src/
+  // custom-command-prompt.ts` 的 resolveZCodeCustomCommandPrompt 开头）。判据必须是同一个：facade 对保留名
   // 直接返回 undefined、不做展开，所以这里若把一个保留名判成"可解析"，它就会以字面文本
   // `/compress …` 被当成普通 prompt 提交给模型——静默走错路，没有任何报错。
   //
-  // 探测刻意用「保留名检查 + load」这一对，而不是直接调 resolveZCodeCustomCommandPrompt：
-  // 后者会执行 `!` shell expansion，拿它探测等于把用户的 shell 片段跑两遍。
-  // 这一对是它的无副作用等价物（load 只读文件）。
+  // 探测只用「保留名检查 + load」这一对（load 只读文件），完整展开留给 facade 做一次。
   if (await isReservedSlashCommandName(deps, name)) return false;
   try {
     await loadCustomCommandForPrompt(deps, name);
@@ -666,8 +672,7 @@ function writeHeadlessWorkspaceHookTrustDiagnostic(
       ...status.items
         .filter((item) => item.configuredEnabled && item.trustState !== "trusted_persistent")
         .map((item) => `pending digest: ${item.hookDeclarationDigest}`),
-      `Review with: zcode hooks trust review --workspace ${JSON.stringify(status.workspaceIdentity)}`,
+      `Review with: zcode hooks trust review --workspace ${JSON.stringify(workspaceTrustCommandArgument(status))}`,
     ].join("\n") + "\n",
   );
 }
-import { createCliProviderRefreshReporter } from "./provider-runtime-env.js";

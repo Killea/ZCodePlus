@@ -243,7 +243,6 @@ describe("workflow driver — lenient stringified submit", () => {
     expect(node?.status).toBe("completed");
     // 落库的是解析后的对象，而非原始字符串。
     expect(node?.result).toEqual(artifact);
-    expect(typeof node?.result).toBe("object");
   });
 });
 
@@ -267,24 +266,24 @@ describe("workflow driver — actor tool surface", () => {
     // 先确认 ask 真的跑通了：工具面若把 submit_result 滤掉，run 会失败而不是给出空列表。
     expect(settlement).toEqual({ status: "completed", artifact: { approved: true } });
     const names = modelCalls["actor#1@1"]?.toolNames[0];
-    expect(names).toBeDefined();
     return names ?? [];
   }
 
-  it("keeps the full working set for every actor, minus plan-mode and meta tools", async () => {
+  it("keeps the full working set for every actor, minus question, plan-mode and meta tools", async () => {
     const names = await toolNamesForPersona('agent("worker", "You do work.")');
     // 每个 actor 都照常干活（2026-09-12 起没有工具档位，docs/dynamic-workflow/authoring.md）。
-    // AskUserQuestion 经父会话送达用户（docs/dynamic-workflow/launch.md「Permissions inside a run」）。
-    for (const expected of ["Bash", "Edit", "Write", "AskUserQuestion", SUBMIT_RESULT_TOOL_NAME]) {
+    for (const expected of ["Bash", "Edit", "Write", SUBMIT_RESULT_TOOL_NAME]) {
       expect(names).toContain(expected);
     }
-    // plan 审批不属于子代理，CreateWorkflow 会递归提交工作流，ReadSessionContext 越界读父会话——
-    // 全部减掉。
+    // 子代理不问人：要人判断时用 escalate 交给主代理（docs/dynamic-workflow/launch.md
+    // 「Permissions inside a run」）；plan 审批不属于子代理，CreateWorkflow 会递归提交工作流，
+    // ReadTopicResource 越界读父会话的话题资源——全部减掉。
     for (const forbidden of [
+      "AskUserQuestion",
       "EnterPlanMode",
       "ExitPlanMode",
       "CreateWorkflow",
-      "ReadSessionContext",
+      "ReadTopicResource",
     ]) {
       expect(names).not.toContain(forbidden);
     }
@@ -377,6 +376,7 @@ describe("workflow driver — actor session ids", () => {
         ids.push(sessionId);
         // 最小 stub：driver 只需要一个能 executeTurn 的对象；本用例只看会话 id。
         return {
+          close: async () => {},
           executeTurn: async () => ({ response: "ok", events: [], usage: undefined }),
         } as never;
       },
@@ -397,8 +397,6 @@ describe("workflow driver — actor session ids", () => {
     const [underscore] = await sessionIdsFor("a_b");
     const [hash] = await sessionIdsFor("a#b");
 
-    expect(underscore).toBeDefined();
-    expect(hash).toBeDefined();
     // 朴素白名单方案下这两个会相等；转义先行使它们保持可区分。
     expect(underscore).not.toBe(hash);
     expect(underscore).toContain("a__b");
@@ -453,6 +451,7 @@ describe("workflow driver — resume 会话身份互证", () => {
         onFactory?.();
         // 最小 stub：互证通过后 driver 只需要一个可持有的 runtime 对象。
         return {
+          close: async () => {},
           executeTurn: async () => ({ response: "ok", events: [], usage: undefined }),
         } as never;
       },
@@ -542,7 +541,7 @@ describe("workflow driver — resume 会话身份互证", () => {
 /** 一次性 sqlite session store（真实持久层），用完即删。 */
 async function withSessionStore(run: (store: SessionStorePort) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "zcode-dwf-transcript-"));
-  const store = createSqliteSessionStore({ dbPath: join(root, "session.sqlite") });
+  const store = await createSqliteSessionStore({ dbPath: join(root, "session.sqlite") });
   try {
     await run(store as unknown as SessionStorePort);
   } finally {
@@ -638,7 +637,12 @@ describe("workflow driver — ask 边界记账", () => {
       const aSecond = journal.getNode(runId, "ask#3", 1)?.messageBoundary;
       // b 只问过一次，所以它的边界必须停在自己那一轮上——而不是跟着 a 一起长。
       expect(bOnly).toBe(aFirst);
-      expect(aSecond).toBe((aFirst ?? 0) * 2);
+      // 首个 ask 还会持久化一条 date 公告，各 ask 新增条数不同；边界按各自会话的实际条数核对。
+      const aPersisted = await store.messages({
+        sessionID: mintActorSessionId(runId, { siteId: "actor#1", ordinal: 1 }),
+      });
+      expect(aSecond).toBeGreaterThan(aFirst ?? 0);
+      expect(aSecond).toBe(aPersisted.length);
       const bPersisted = await store.messages({
         sessionID: mintActorSessionId(runId, { siteId: "actor#2", ordinal: 1 }),
       });
@@ -1075,7 +1079,11 @@ describe("workflow driver — quality epilogue on every ask", () => {
         },
       });
       const persisted = await store.messages({ sessionID: mintActorSessionId(runId, ACTOR_ONE) });
-      const users = persisted.filter((message) => message.info.role === "user");
+      // model-only 的上下文公告（如 date）不是 ask 消息，不带 epilogue 标记。
+      const users = persisted.filter(
+        (message) =>
+          message.info.role === "user" && message.info.semantics?.kind !== "system_reminder",
+      );
       expect(users.length).toBe(2);
       const askText = users[0]?.parts.find((part) => part.type === "text");
       expect(askText?.type === "text" ? askText.text : "").toContain(STANDARD);
@@ -1121,7 +1129,14 @@ describe("workflow driver — 结算后释放 actor runtime", () => {
           );
         }),
     );
-    return { closeBrowserSession, executeTurn };
+    return {
+      closeBrowserSession,
+      executeTurn,
+      close: async () => {
+        await Promise.allSettled(executeTurn.mock.results.map((result) => result.value));
+        await closeBrowserSession();
+      },
+    };
   }
 
   function driverWith(
@@ -1153,6 +1168,46 @@ describe("workflow driver — 结算后释放 actor runtime", () => {
   const flushMicrotasks = async () => {
     for (let i = 0; i < 8; i++) await Promise.resolve();
   };
+
+  it("创建 actor 尚未返回时关闭，等待迟到实例释放且不再接收新 actor", async () => {
+    const factory = Promise.withResolvers<ReturnType<typeof stubRuntime>>();
+    const cleanup = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    const runtime = stubRuntime(async () => {
+      released.resolve();
+      await cleanup.promise;
+    });
+    let probe!: { drain(): Promise<void> };
+    const driver = createAgentRuntimeWorkflowDriver({
+      journal: new InMemoryJournalStore(),
+      emit: () => {},
+      escalationRegistry: createWorkflowEscalationRegistry(),
+      fileSystemPort: fakeFileSystemPort({}),
+      cwd: process.cwd(),
+      runId: RUN,
+      runtimeFactory: async () => (await factory.promise) as never,
+      onQuiescenceProbe: (value) => {
+        probe = value;
+      },
+    })(NOOP_SINK);
+    const creating = driver.createActorSession(A1, {});
+    const rejected = expect(creating).rejects.toThrow(/closed/);
+    driver.dispose?.();
+    let drained = false;
+    const draining = probe.drain().then(() => {
+      drained = true;
+    });
+    await flushMicrotasks();
+    expect(drained).toBe(false);
+    factory.resolve(runtime);
+    await released.promise;
+    expect(drained).toBe(false);
+    cleanup.resolve();
+    await rejected;
+    await draining;
+    expect(runtime.closeBrowserSession).toHaveBeenCalledTimes(1);
+    await expect(driver.createActorSession(A2, {})).rejects.toThrow(/closed/);
+  });
 
   it("无在飞 turn 的会话立即关；有在飞 turn 的会话等 turn 落地后才关", async () => {
     const idle = stubRuntime();

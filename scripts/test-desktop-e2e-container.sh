@@ -6,12 +6,11 @@ IMAGE_NAME="${IMAGE_NAME:-zcode-desktop-e2e-demo}"
 DOCKERFILE="${DOCKERFILE:-Dockerfile.desktop-e2e}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 PNPM_VERSION="${PNPM_VERSION:-10.33.2}"
-DEFAULT_E2E_SPEC="./test/e2e/container-boot.test.ts,./test/e2e/smoke.test.ts,./test/e2e/e2ecase-regression.test.ts,./test/e2e/upstream-provider.test.ts,./test/e2e/task-list-archive-confirmation.test.ts"
-# 修复原因：formal/local replay 通过不等于 Docker admission；Assistant Preview Cards 的容器尝试
-# 停在镜像解析阶段，CDD01 则在 WDIO 内失败；两者都没有 replay-isolated 绿色证据。
-CONVERSATION_SESSION_VERIFIED_E2E_SPEC=""
+DEFAULT_E2E_SPEC="./test/e2e/infrastructure/smoke/container-boot.test.ts,./test/e2e/infrastructure/smoke/smoke.test.ts,./test/e2e/infrastructure/smoke/e2ecase-regression.test.ts,./test/e2e/infrastructure/smoke/upstream-provider.test.ts,./test/e2e/ui-shell/navigation/task-list-archive-confirmation.test.ts"
+# 修复原因：formal/local replay 通过不等于 Docker admission；只有取得 replay-isolated 绿色证据的 spec 才写入。
+CONVERSATION_SESSION_VERIFIED_E2E_SPEC="./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-amend.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-artifacts.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-compile.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-confirm.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-cross-session.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-english-dark.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-lookup.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-notify.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-overflow.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-questions.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-restart.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-resume.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run-pane-details.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run-permissions.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-save-from-chat.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-save-window.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-snippet.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-stop.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-transcript.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-user-choice.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-disabled.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-on-demand.test.ts,./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-holes.test.ts"
 # 只有通过人工 review、formal promotion 和单 spec Docker admission 的插件用例才能写入。
-PLUGIN_MANAGEMENT_VERIFIED_E2E_SPEC=""
+PLUGIN_MANAGEMENT_VERIFIED_E2E_SPEC="./test/e2e/plugins/runtime/plugin-ui-session-ready.test.ts"
 E2E_SPEC_PRESET="${E2E_SPEC_PRESET:-}"
 if [ "$#" -gt 1 ]; then
   printf '[desktop-e2e-container] expected at most one preset argument\n' >&2
@@ -143,10 +142,17 @@ if [ "${SKIP_DRIVER_PREFETCH:-0}" != "1" ]; then
     "${IMAGE_NAME}:latest" \
     bash -lc '
       set -euo pipefail
-      version="${CHROMEDRIVER_VERSION:-$(node -e "const { electronToChromium } = require(\"electron-to-chromium\"); const pkg = require(\"./packages/desktop/package.json\"); console.log(electronToChromium(pkg.devDependencies.electron));")}"
-      echo "Chromedriver version: ${version}"
-      timeout "${DRIVER_PREFETCH_TIMEOUT}s" pnpm exec browsers install "chromedriver@${version}" --path "${WDIO_BROWSER_DRIVER_CACHE_DIR}" --format "{{browser}}@{{buildId}} {{path}}"
+      timeout "${DRIVER_PREFETCH_TIMEOUT}s" node packages/desktop/scripts/chromedriver-preflight.mjs prepare "${WDIO_BROWSER_DRIVER_CACHE_DIR}"
     '
+fi
+
+# 预取选择的补丁可能不同于 Chromium 精确补丁；离线运行必须读取实际路径，不能再次联网猜版本。
+CHROMEDRIVER_BINARY="$(docker run --rm --platform "$DOCKER_PLATFORM" \
+  -v "${DRIVER_CACHE_VOLUME}:${DRIVER_CACHE_DIR}" "${IMAGE_NAME}:latest" \
+  node packages/desktop/scripts/chromedriver-preflight.mjs path "$DRIVER_CACHE_DIR")"
+if [ -z "$CHROMEDRIVER_BINARY" ]; then
+  printf '[desktop-e2e-container] Chromedriver cache path is empty; run prefetch again.\n' >&2
+  exit 1
 fi
 
 docker_run_args=(
@@ -154,6 +160,7 @@ docker_run_args=(
   --platform "$DOCKER_PLATFORM"
   --shm-size "$SHM_SIZE"
   -e CI=1
+  -e "CHROMEDRIVER_PATH=${CHROMEDRIVER_BINARY}"
   -e ZCODE_E2E_CONTAINER=1
   -e "ZCODE_E2E_RUN_ID=${E2E_RUN_ID}"
   -e "ZCODE_E2E_ARTIFACT_DIR=${CONTAINER_ARTIFACT_DIR}"

@@ -46,7 +46,7 @@ export async function resolveLatestSession(
   let sessionStore = options.sessionStore;
   if (!sessionStore) {
     const configResult = createConfig({ env: options.env });
-    sessionStore = openStartupSqliteSessionStore({ dbPath: getSessionDbPath(configResult) });
+    sessionStore = await openStartupSqliteSessionStore({ dbPath: getSessionDbPath(configResult) });
   }
 
   try {
@@ -70,7 +70,7 @@ export async function listZCodeSessions(
   let sessionStore = options.sessionStore;
   if (!sessionStore) {
     const configResult = createConfig({ env: options.env });
-    sessionStore = openStartupSqliteSessionStore({ dbPath: getSessionDbPath(configResult) });
+    sessionStore = await openStartupSqliteSessionStore({ dbPath: getSessionDbPath(configResult) });
   }
 
   try {

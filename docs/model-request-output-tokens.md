@@ -87,9 +87,10 @@ preserved assistant 的原始 usage 不再代表当前上下文；运行时和�
 本地增量复用 Compact 的共享估算器：每条消息按 `ceil(provider-visible 字符数 / 3)` 估算，
 assistant 的 tool call 名称和序列化入参也计入字符数。OTB09 以 `inputTokens=1` 和
 255,984 字符 user message 锁定边界；该 provider usage anchor 已覆盖上一轮 assistant，
-因此 suffix 只估算 anchor 后的新用户消息：
-`estimatedCurrentUsage = 1 + 85,328 = 85,329`。因此 128K context 下本轮发送
-`max_tokens = 128,000 - 85,329 - 1,000 = 41,671`。
+因此 suffix 只估算 anchor 后的两条消息：新用户消息 85,328，以及同轮 token 预算提醒
+（独立隐藏 user 行，`<system-reminder>` 包裹后 86 字符）29：
+`estimatedCurrentUsage = 1 + 85,328 + 29 = 85,358`。因此 128K context 下本轮发送
+`max_tokens = 128,000 - 85,358 - 1,000 = 41,642`。
 
 ```ts
 const estimatedAvailable = Math.floor(contextWindow - estimatedCurrentUsage - 1_000);
@@ -165,23 +166,14 @@ Compact 只决定本轮 `maxOutputTokens` value；它与 reasoning level 按相�
 - normalized `finishReason === "length"`；
 - raw reason 为 `max_tokens`、`max_output_tokens` 或 `model_context_window_exceeded`。
 
-成功响应的 `model_context_window_exceeded` 属于上述 Continue 恢复，不能仅凭该结束标记转成
-Reactive Compact；normalized reason 为 `other` 或 `length`、内容和 usage 全空时均遵循此约定。
-连续耗尽 3 次 Continue 后仍按 output-limit 报错，不因该 raw reason 改走 Reactive Compact。
+成功响应的 `model_context_window_exceeded` 有有效 partial 时仍按上述 Continue 恢复。
+新增例外仅为明确超窗且没有正文、有效 reasoning（含 opaque metadata）或完整工具调用：
+Adapter 在成功 finish/completed 前将其转换为已有 `ModelContextExceeded`，由 Core 原有异常
+恢复路径执行 Reactive Compact，再重试当前请求，不追加 Continue。usage 不参与空输出判定。
 
-这是有意设计（非 Bug），经隔离实测确认，并与原始实现提交
-`6e7ef0d6171c54d6cd65c88bd79762ad0a9be54d` 保持一致：成功响应的
-`model_context_window_exceeded` 映射为 `apiError: max_output_tokens`，即使 content 全空也走三次
-Continue。历史讨论中“根据 raw reason 优先 Compact”的初步方案已被这次核验纠正，不是最终约定。
-
-协议层的区别是“生成截断”和“请求失败”：Anthropic 的
-[context window overflow 定义](https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior)
-允许支持该行为的模型接受 input 本身未超窗、但 input + `max_tokens` 超窗的请求，生成填满窗口时
-才返回该 stop reason；input 本身已超窗则返回 `400 invalid_request_error`（prompt is too long）。
-该标记仍表示触及上下文容量，不意味着窗口没有满；它是有效但被截断的响应，不能据名称直接构造
-请求异常。参见 [stop reason 定义](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#model_context_window_exceeded)。
-三次恢复与空内容处理是本项目确认的约定，不是协议保证续写一定成功；每次 Continue
-仍回到既有 outer loop，保留 Micro/Auto Compact，后续若抛出真实超窗异常仍走 Reactive Compact。
+原来空内容也走三次 Continue 是有意设计；此次只修改该空超窗边界。有效 partial 继续保留
+正文/思考并按原规则续写，普通 `length` 和输出 token 上限不改，Core 原有成功超窗兼容分支
+及其解释注释保持不变。Adapter 不判断能否 Continue，也不改变非流式 metadata 透传。
 
 协议 adapter 的标准归一化边界如下；runtime 只消费 normalized/raw 事实，不从 HTTP event 名称重新推断：
 
@@ -201,7 +193,9 @@ network/model-io、Runtime diagnostics 与 `providerMetadata.rawFinishReason` �
 
 真正以 request error 抛出的 context overflow 不属于本节，继续走既有 Reactive Compact。完整 tool
 call 的优先级高于 output-limit；判断使用 adapter 已经完成组装的全部 tool calls，而不是只看本地可执行
-tool calls。只有命中上述 output-limit 判据时，text、reasoning 和 usage 全空的响应才允许恢复；其他空
+tool calls。例外是服务端内置工具轮次（见 `apps/zcode-cli/docs/design/v2/model/anthropic-stream-compat.md`
+「Provider 内置工具多轮回放」）：这些调用在流中已切成带结果的前序轮次单独提交，不属于本 step 的最终调用，
+不参与本判断；最后一轮被截断时照常续写。web_search 等未切轮的 provider 调用仍按完整 tool call 处理。只有命中上述 output-limit 判据时，text、reasoning 和 usage 全空的响应才允许恢复；其他空
 响应继续走 suspicious-empty 错误。
 
 恢复最多追加 3 条 user-role Continue，因此一次恢复链最多产生 4 次正常模型请求。文案必须保持
@@ -292,6 +286,9 @@ hydration 规则。请求级真实 usage 仍由既有 `ModelComplete` 和 usage 
 恢复链不维护额外的 usage snapshot 或绝对 message cursor。带有真实 text、reasoning 或 tool call 的
 partial assistant 会连同归一化后的 `tokens` 一起提交到 canonical 与 query-local history；下一次请求继续
 使用既有的反向扫描，从最近一条有效 assistant usage 开始，只对其后的 Continue 等消息做本地增量估算。
+Anthropic Messages 协议下，只有思考的 partial 在请求投影第一步被删除（见
+[Anthropic Reasoning History Replay](../apps/zcode-cli/docs/design/v2/model/anthropic-reasoning-history-replay.md)），
+反向扫描看不到它的 usage，从更早一条有效 assistant usage 开始估算；思考用完输出上限的处理另行设计。
 空 output-limit 在前三次恢复中间态不生成 assistant entry 或 transcript message；次数耗尽时仅保留上述
 durable error-only assistant。它在 live 和 cold hydration 后都不覆盖上一条有效 usage，也不进入 provider
 history；有真实 partial 时，普通 assistant 保留原始 usage，独立 error carrier 仍为零 usage。

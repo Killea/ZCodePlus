@@ -34,6 +34,12 @@ describe("connectivity probe wire contract", () => {
           },
         },
         {
+          requestSecurityState: {
+            createExecution: () => ({
+              protectTransport: ({ transport }) => transport,
+              take: () => [],
+            }),
+          },
           // 离线拦截所有请求，包含意外的鉴权/控制面请求；绝不回落真实账号网络。
           transport: async (input, init) => {
             const request = new Request(input, init);
@@ -54,7 +60,7 @@ describe("connectivity probe wire contract", () => {
       const modelId = "probe-model-unchanged";
       const resolved = fixture.resolve(
         { providerId, modelId },
-        { maxOutputTokens: 1, reasoningLevel: "disabled" },
+        { maxOutputTokens: 512, reasoningLevel: "disabled" },
       );
       const result = streamText(
         createStreamTextOptions({
@@ -93,7 +99,7 @@ describe("connectivity probe wire contract", () => {
           : kind === "anthropic"
             ? "max_tokens"
             : "max_completion_tokens";
-      expect(body[budgetField]).toBe(1);
+      expect(body[budgetField]).toBe(512);
       if (kind === "anthropic") {
         expect(body.system).toEqual([{ type: "text", text: "You are ZCode connectivity probe." }]);
         expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hi" }] }]);

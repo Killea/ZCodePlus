@@ -1,11 +1,23 @@
-import { subagentProfilesFromSnapshot } from "../subagent-runtime-config.js";
+import { createWorkspaceMcpTrust } from "../workspace-mcp-trust/index.js";
+import { subagentProfilesFromSnapshot } from "../runtime-subagents/index.js";
+import { CliDefaultSelection } from "./cli-default-selection.js";
+import {
+  createCliSessionControlRuntime,
+  type CliSessionControlRuntime,
+} from "../cli-session-control/index.js";
+import type { SessionControlBinding } from "@zcode/core/session-control";
 import { isAbsolute, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import {
   createInMemorySessionEventStore,
   createNodeToolArtifactStore,
 } from "@zcode/adapters/storage";
 import { createNodeLoggerFactory } from "@zcode/adapters/logging";
-import { createConfig, resolvePath } from "@zcode/adapters/config";
+import {
+  createConfigWithPluginMigrations,
+  resolvePath,
+  resolveWorkspaceHookTrustIdentityForWorkspace,
+} from "@zcode/adapters/config";
 import {
   createNodeExecutionAdapter,
   resolveEffectiveBashShellSelection,
@@ -30,10 +42,13 @@ import {
 import { createModelTelemetry } from "@zcode/telemetry";
 import {
   createRootTraceContext,
+  ModelRequestSessionFeature,
   traceContextToLogContext,
   type TraceContext,
+  type SessionId,
   createSessionId,
   createSessionEvent,
+  SessionEventType,
   type ExecutionShellSelection,
   type MessageId,
 } from "@zcode/contracts";
@@ -58,7 +73,12 @@ import {
   resolveEffectiveLocale,
   resolveEffectiveConfigResult,
 } from "./app-config-options.js";
-import { getCliStorageRoot, getModelIoDir, projectIdFromDirectory } from "./paths.js";
+import {
+  getCliStorageRoot,
+  getModelIoDir,
+  getSubagentOutputRootDir,
+  projectIdFromDirectory,
+} from "./paths.js";
 import {
   asInputHistoryStore,
   asLocalSettingStore,
@@ -70,9 +90,11 @@ import { createWorkflowFacade } from "./workflow-facade.js";
 import { createInputFacade } from "./input-facade.js";
 import { createPluginFacadeForApp } from "./plugin-facade.js";
 import { resolvePluginRuntimeFeatures } from "./plugin-runtime-features.js";
+import { OFFICIAL_VISUALIZE_PLUGIN_ID } from "./official-plugin-definitions.js";
 import { createSessionFacade } from "./session-facade.js";
 import { resolveAppRuntimeConfig, runtimeConfigLogContext } from "./runtime-config.js";
 import { resolveBundledSkillRoots } from "./bundled-skills.js";
+import { resolveMcpNodeFallbackProvider } from "./mcp-node-fallback.js";
 import { collectDynamicWorkflowDisabledSkillPaths } from "./dynamic-workflow-gate.js";
 import { createWorkspaceHookRuntimeSecurity } from "./workspace-hook-trust.js";
 import { createScriptWorkflowBridge } from "./script-workflow-methods.js";
@@ -91,6 +113,7 @@ import {
   workflowActorInteractionDescription,
   workflowActorPermissionPolicy,
 } from "./workflow-actor-permission.js";
+import { startWorkflowQuotaAutoResume } from "./dynamic-workflow-quota-resume.js";
 import { workflowActorToolPolicy } from "./workflow-actor-tools.js";
 import {
   createNodeReplBrowserBroker,
@@ -108,6 +131,7 @@ import {
   loadZCodeAgentProfiles,
 } from "../subagents.js";
 import { createRuntimeAiSdkModelExecutionConfig } from "../model-config.js";
+import { withOfficialCommandEnv } from "../official-command-endpoint/index.js";
 import { ApiProviderModelRuntime } from "./provider-registry-model-runtime.js";
 import {
   completeAppStartup,
@@ -167,12 +191,22 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
   const sessionId = options.sessionId ?? createSessionId();
   const traceContext = options.traceContext ?? createRootTraceContext({ sessionId });
   const workingDirectory = resolve(options.runtimeConfig?.workingDirectory ?? process.cwd());
+  // Hook Trust identity（D23）：受管 worktree 归一为源仓库路径，snapshot 与 Trust record 共用该键。
+  // createConfig 是同步函数，resolver 要异步读取 .git 链接，所以在这里先算好再传入。
+  const workspaceHookTrustIdentity = await resolveWorkspaceHookTrustIdentityForWorkspace({
+    workspacePath: workingDirectory,
+    ...(options.runtimeConfig?.memory?.workspaceIdentity?.trim()
+      ? { workspaceIdentity: options.runtimeConfig.memory.workspaceIdentity.trim() }
+      : {}),
+    ...(options.env ? { env: options.env } : {}),
+  });
   const configResult = resolveEffectiveConfigResult(
-    createConfig({
+    await createConfigWithPluginMigrations({
       env: options.env,
       projectConfigPath: options.projectConfigPath,
       workingDirectory,
       workspaceIdentity: options.runtimeConfig?.memory?.workspaceIdentity,
+      workspaceHookTrustIdentity,
       skipUserConfig: options.skipUserConfig,
       userConfigPath: options.userConfigPath,
       cliOverrides: createConfigCliOverrides(options),
@@ -213,6 +247,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
   let nodeReplBrowserBroker: NodeReplBrowserBroker | undefined;
   let ownedNodeReplBrowserBroker: NodeReplBrowserBroker | undefined;
   let providerModelRuntime: ApiProviderModelRuntime | undefined;
+  let standaloneSessionControl: CliSessionControlRuntime | undefined;
   try {
     const storageRoot = resolvePath(configResult.config.storage.dir);
     const cliStorageRoot = getCliStorageRoot(storageRoot);
@@ -227,9 +262,14 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     });
     const zcodeSubagentProfileOutcome = hostSubagentSnapshot
       ? subagentProfilesFromSnapshot(hostSubagentSnapshot)
-      : await loadZCodeAgentProfiles({ logger, storageRoot, workingDirectory });
+      : await loadZCodeAgentProfiles({
+          logger,
+          storageRoot,
+          workingDirectory,
+          additionalDirectories: options.additionalDirectories,
+        });
     const zcodeSubagentProfiles = zcodeSubagentProfileOutcome.profiles;
-    const pluginOutcome = resolveStartupPlugins({
+    const pluginOutcome = await resolveStartupPlugins({
       cliStorageRoot,
       configResult,
       env: options.env,
@@ -264,8 +304,89 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     const ownsSessionStore = options.sessionStore === undefined;
     const sessionStore =
       options.sessionStore ?? (await openStartupSessionStore(configResult, startupTimer));
+    // 独立 CLI/TUI 同样登记持有关系，其他 App 进程不能把未加载误判为全局空闲。
+    if (ownsSessionStore) await sessionStore.registerSessionRuntime?.(sessionId);
+    let sessionControl = options.sessionControl;
+    let standaloneRootProvenance: "new-independent-root" | "unverified-history" =
+      "unverified-history";
+    if (options.standaloneSessionControl) {
+      if (
+        sessionControl ||
+        options.runtimeConfig?.parentSessionId ||
+        options.runtimeConfig?.workspaceIdentity
+      ) {
+        throw new Error("Standalone session control requires an independent local CLI root");
+      }
+      // borrowed 只说明 app.close 的责任；新建根已有唯一启动 owner，应保留 rename/send 能力。
+      // resume 或复用历史 ID 不证明独立来源，不能因当前进程拿到 runtime 就把历史升级为可写目标。
+      if (options.resume !== true && !(await sessionStore.getSession(sessionId))) {
+        standaloneRootProvenance = "new-independent-root";
+      }
+      const workspace = { kind: "cli" as const, workspacePath: workingDirectory };
+      const bindRoot = (rootId: SessionId): SessionControlBinding => ({
+        kind: "cli",
+        control: standaloneSessionControl!.control,
+        context: () => ({
+          callerId: rootId,
+          rootSession: { ...workspace, sessionId: rootId },
+          allowedScopes: [workspace],
+          // 独立 CLI 的读取不要求 owner：list/read 可访问本机 CLI 会话库，写操作仍只看 allowedScopes。
+          readAnyLocalSession: true,
+        }),
+      });
+      standaloneSessionControl = createCliSessionControlRuntime({
+        workspace,
+        sessionStore,
+        createRootApp: async (request) => {
+          // 新根只借用基础设施和独立 CLI 配置，不展开 actor 的 runtimeConfig、yolo 或审批结果。
+          const target = await createZCodeApp({
+            sessionId: request.sessionId,
+            resume: request.resume,
+            traceContext: request.traceContext,
+            sessionStore,
+            sessionControl: bindRoot(request.sessionId),
+            // Bug 根因：后台根原先不传交互端口，Core 退回拒绝 broker，需要审批的工具被直接拒绝、
+            // 用户看不到询问。改为共用启动方的同一个询问通道（TUI 审批队列 / headless 拒绝）；
+            // 只共用通道，不共用批准结果，权限模式仍固定 build。
+            permissionBroker: options.permissionBroker,
+            providerRegistry: options.providerRegistry,
+            configuredDefaultModelSelection: options.configuredDefaultModelSelection,
+            providerEndpointRoutingPort: options.providerEndpointRoutingPort,
+            providerRuntimeHeadersPort: options.providerRuntimeHeadersPort,
+            modelAdapter: options.modelAdapter,
+            env: options.env,
+            skipUserConfig: options.skipUserConfig,
+            userConfigPath: options.userConfigPath,
+            version: options.version,
+            runtimeConfig: {
+              workingDirectory: request.cwd,
+              taskType: request.resume ? "fork" : "interactive",
+              mode: "build",
+            },
+          });
+          if (request.model) {
+            try {
+              await target.setModel(request.model);
+            } catch (error) {
+              await target.close?.();
+              throw error;
+            }
+          }
+          return target;
+        },
+      });
+      sessionControl = bindRoot(sessionId);
+    }
     const localSettingStore = asLocalSettingStore(sessionStore);
-    const projectID = projectIdFromDirectory(workingDirectory);
+    // 受管 worktree 会话的项目身份（权限 project_id、项目记忆）映射回源仓库路径，与 Hook Trust
+    // 继承同一 resolver（docs/git/worktree.md §6.6.3）。远程 workspace 的 Trust identity 是
+    // 不透明身份而不是目录，保持按工作目录派生；映射失败时 resolver 已退回工作目录。
+    const projectDirectory =
+      !options.runtimeConfig?.memory?.workspaceIdentity?.trim() &&
+      workspaceHookTrustIdentity !== workingDirectory
+        ? workspaceHookTrustIdentity
+        : undefined;
+    const projectID = projectIdFromDirectory(projectDirectory ?? workingDirectory);
     const persistedMode = options.runtimeConfig?.mode
       ? undefined
       : readProjectPermissionMode(localSettingStore, projectID);
@@ -281,12 +402,24 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
         pluginRuntimeFeatures,
         builtInSubagentModelSelectionOverrides:
           zcodeSubagentProfileOutcome.builtInModelSelectionOverrides,
-        subagentOutputRootDir: join(cliStorageRoot, "agents"),
+        subagentOutputRootDir: getSubagentOutputRootDir(cliStorageRoot),
         subagentProfiles,
         storageRoot,
         workingDirectory,
         workspaceIdentity: options.runtimeConfig?.memory?.workspaceIdentity,
       });
+    // 过去仅凭宿主目录注入 Gen UI 上下文，插件关闭后仍污染模型请求；复用已解析的插件启用态。
+    if (
+      !pluginOutcome.plugins.some(
+        (plugin) => plugin.id === OFFICIAL_VISUALIZE_PLUGIN_ID && plugin.enabled,
+      )
+    ) {
+      runtimeConfig.genUiOutputRoot = undefined;
+    }
+    if (projectDirectory) runtimeConfig.projectDirectory = projectDirectory;
+    // 协议入口给出会话所属 workspace 的 key（受管 worktree 会话 = 项目）；MCP 工具调用与官方 MCP
+    // 授权头以它为身份，不按工作目录重算（docs/git/worktree.md §9.3）。
+    if (options.workspaceKey) runtimeConfig.workspaceKey = options.workspaceKey;
     const browserControlPort = options.browserControlPort;
     if (
       browserControlPort &&
@@ -322,6 +455,10 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     const pluginReferenceCatalog = buildPluginReferenceCatalog(pluginOutcome.plugins);
     runtimeConfig.pluginReferenceCatalog = pluginReferenceCatalog;
     let runtime: AgentRuntime | undefined;
+    const cliDefaultSelection =
+      options.modelSelectionMode === "cli-default"
+        ? new CliDefaultSelection(runtimeConfig.modelSelection)
+        : undefined;
     const workspaceHookRuntimeSecurity = createWorkspaceHookRuntimeSecurity({
       appVersion,
       logger,
@@ -329,6 +466,12 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       policy: options.workspaceHookPolicy,
       policyProvider: options.workspaceHookPolicyProvider,
       reviewHost: options.workspaceHookReviewHost,
+      ...(options.env ? { env: options.env } : {}),
+      // 对外 workspaceKey：协议入口传入会话所属 workspace 的 key（受管 worktree 会话 = 项目）；
+      // 独立 CLI 缺省同旧规则：远程 identity 优先，否则工作目录。
+      workspaceKey:
+        options.workspaceKey ??
+        (options.runtimeConfig?.memory?.workspaceIdentity?.trim() || workingDirectory),
       workspaceHookTrustEnabled: options.workspaceHookTrustEnabled,
       runtimeRoot: configResult.sources.project.workspaceHookRuntimeRoot ?? {
         // Fallback 只在 config-factory 未导出时生效（理论上不会发生）。
@@ -400,7 +543,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       startupTimer,
       storageRoot,
     });
-    const mcpPort =
+    const rawMcpPort =
       options.mcpPort ??
       (runtimeConfig.mcp?.enabled === false
         ? undefined
@@ -414,10 +557,33 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
               noProxy: configResult.config.network.noProxy,
               caCertFile: configResult.config.network.caCertFile,
             },
+            nodeFallback: resolveMcpNodeFallbackProvider({ cliStorageRoot, logger }),
             workingDirectory,
           })));
+    const mcpPort = rawMcpPort
+      ? createWorkspaceMcpTrust({
+          workingDirectory,
+          workspaceIdentity: options.runtimeConfig?.memory?.workspaceIdentity,
+          userConfigPath: options.userConfigPath,
+          projectConfigPath: options.projectConfigPath,
+          skipUserConfig: options.skipUserConfig,
+          env: options.env,
+          onAdmissionChanged: async (payload) => {
+            if (!runtime) return;
+            await runtime.appendEvent(
+              createSessionEvent(
+                SessionEventType.WorkspaceMcpAdmissionUpdated,
+                sessionId,
+                payload,
+                { traceId: traceContext.traceId },
+              ),
+              traceContext,
+            );
+          },
+        }).guard(rawMcpPort)
+      : undefined;
     const ownsMcpPort = options.mcpPort === undefined && mcpPort !== undefined;
-    const executionPort =
+    const baseExecutionPort =
       options.executionPort ??
       createNodeExecutionAdapter({
         onToolExecResource: options.onToolExecResource,
@@ -427,8 +593,28 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
           caCertFile: configResult.config.network.caCertFile,
         },
         outputRootDir: join(storageRoot, "cli", "exec"),
+        bashOutputTempDir: tmpdir(),
         processEnv: options.env ?? process.env,
       });
+    // 本 app 只服务一个 session：它的子进程统一带上这个 session 的官方命令端点 env。
+    const officialCommandEnv = options.officialCommandEnv;
+    const officialCommandIdentity = options.runtimeConfig?.memory?.workspaceIdentity;
+    const officialCommandWorkspace = {
+      workspacePath: workingDirectory,
+      ...(officialCommandIdentity ? { workspaceIdentity: officialCommandIdentity } : {}),
+    };
+    const executionPort = officialCommandEnv
+      ? withOfficialCommandEnv(
+          baseExecutionPort,
+          () =>
+            officialCommandEnv(sessionId, officialCommandWorkspace, {
+              onSiteDeploymentRequested: () => {
+                runtime?.recordSessionFeature({ feature: ModelRequestSessionFeature.SiteDeploy });
+              },
+            }),
+          logger,
+        )
+      : baseExecutionPort;
     const ownsExecutionPort = options.executionPort === undefined;
     const pdfDocumentPort =
       options.pdfDocumentPort ?? createPopplerPdfDocumentAdapter({ executionPort });
@@ -509,6 +695,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       // 只查模型是否存在会把缺档位/已删除的选择重新绑定进 Runtime，
       // 抵消了未绑定初始化。历史恢复不要求可执行模型，只有完整选择可以绑定。
       getRuntime().setSessionModelSelection(validation?.ok ? selection : undefined);
+      cliDefaultSelection?.set(validation?.ok ? selection : undefined);
       // 恢复结果是保存意图，不是执行绑定。过去在这里置空/删档位，Host 的
       // Selection View 就再也拿不到原意图，账号切换和配置恢复后也无法重新解析。
       return selection;
@@ -533,6 +720,16 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
           traceContext: resumeTraceContext,
         });
         await runtime.activatePausedTargetAfterResume(resumeTraceContext);
+        // SessionResumed 已清理旧投影；即使声明未变也要重新发布当前准入。
+        try {
+          await mcpPort?.refreshWorkspaceTrustAdmission?.(true);
+        } catch (error) {
+          logger.warn("MCP trust admission publication failed after resume", {
+            event: "mcp.trust.admission.failed",
+            sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         resumePrepared = true;
         return { ...result, modelSelection };
       } finally {
@@ -553,7 +750,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     };
 
     const prepareUserExecutionBoundary: PrepareUserExecutionBoundary = async (boundaryOptions) => {
-      // Bash shell 快照属于“首次真实用户执行”边界，而不是 chat
+      // Bash shell 属于“首次真实用户执行”边界，而不是 chat
       // input 独有状态。普通 prompt、expert workflow、script workflow 都可能
       // 作为新 session 的第一个模型/子 agent 入口，必须统一在 resume/context
       // 初始化前落定一次，避免模型看到的 Shell 与 Bash 执行 shell 分叉。
@@ -644,6 +841,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
               submitPort,
               submitProfile,
               escalatePort,
+              webSearchBudgetPort,
               modelRequestAdmission,
             }) =>
               createScriptWorkflowAgentRuntime({
@@ -724,6 +922,8 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
                 // 就是 core 侧的注册门。恒传（端口在 run service 里恒被构造），不做 opt-in——
                 // 最可能撞上未预见之墙的 actor 恰是作者没标记的那一个。
                 workflowEscalatePort: escalatePort,
+                // 每个 ask 的 WebSearch 预算（execution-engine.md「Search budget」）：同为 actor 会话的控制面，恒传。
+                webSearchBudget: webSearchBudgetPort,
                 // 请求级准入端口：driver 在治理器在场时给出，runner 每次尝试先过闸门。
                 ...(modelRequestAdmission === undefined ? {} : { modelRequestAdmission }),
               }),
@@ -829,6 +1029,9 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       agentTelemetry: modelTelemetry.agentExecution,
       // 主代理的模型请求过治理器的 observer：立即放行，但让治理器看见它的 429 / 成功。
       modelRequestAdmission: workflowConcurrencyGovernor.observer(),
+      // 主代理的 subagent 不是 observer：和 workflow run 一样排队、看冷却，同一父会话共用一条队列。
+      subagentModelRequestAdmission: (parentSessionId) =>
+        workflowConcurrencyGovernor.sessionSubagents(parentSessionId),
       eventStore: options.eventStore ?? createInMemorySessionEventStore(),
       sessionStore,
       sessionMailboxPort,
@@ -848,6 +1051,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
         configResult.config.features.skill && configResult.config.skills.enabled
           ? (options.skillPort ??
             createNodeSkillAdapter({
+              additionalDirectories: options.additionalDirectories,
               extraRoots: configResult.config.skills.roots,
               extraResolvedRoots: [...pluginOutcome.skillRoots, ...bundledSkillRoots],
               disabledPaths: [
@@ -862,6 +1066,9 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
           : undefined,
       mcpPort,
       eventSink: options.eventSink,
+      onOffPeakLifecycleEvent: options.onOffPeakLifecycleEvent
+        ? (event) => options.onOffPeakLifecycleEvent!({ ...event, sessionId })
+        : undefined,
       modelFactory,
       modelIoDir,
       providerRuntimeHeadersPort: options.providerRuntimeHeadersPort,
@@ -874,9 +1081,11 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       dynamicWorkflowRunPort,
       dynamicWorkflowSnippetPort,
       modelCatalogPort,
+      sessionControl,
       automationPort: options.automationPort,
       offPeakPort: options.offPeakPort,
       topicResourcePort: options.topicResourcePort,
+      pluginDiscoveryPort: options.pluginDiscoveryPort,
       appVersion,
       traceContext,
     });
@@ -892,6 +1101,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
     });
     scheduleStartupLogRetentionCleanup(loggerFactory, logger);
     const inputFacade = createInputFacade({
+      cliDefaultSelection,
       artifactStore,
       customCommandPromptResolver: async (text, resolverOptions) => {
         const builtin = resolveZCodeBuiltinPromptCommandInvocation(text, {
@@ -910,18 +1120,21 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
               source: "command",
               traceContext: resolverOptions?.traceContext ?? traceContext,
             });
+            // 同一展开点打会话能力标签（docs/design/v2/model/session-features-header.md）；
+            // 灰度关闭时命令不展开、不进入本分支，所以不打。
+            runtime?.recordSessionFeature({
+              feature: ModelRequestSessionFeature.WorkflowCmd,
+              traceContext: resolverOptions?.traceContext ?? traceContext,
+            });
           }
           return builtin.prompt;
         }
         return await resolveZCodeCustomCommandPrompt(text, {
+          additionalDirectories: options.additionalDirectories,
           env: options.env,
-          executionPort,
           logger,
           projectConfigPath: options.projectConfigPath,
-          sessionId,
-          signal: resolverOptions?.abortSignal,
           skipUserConfig: options.skipUserConfig,
-          traceContext: resolverOptions?.traceContext ?? traceContext,
           userConfigPath: options.userConfigPath,
           workingDirectory,
         });
@@ -956,12 +1169,46 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       traceContext,
       workingDirectory,
     });
+    // 额度停止的 run 到点自动续跑（dynamic-workflow-quota-resume.ts）。续跑与 UI 的「恢复」同一条路
+    // （port.resume → 重臂追踪：终态通知、后台任务条目、常驻护栏），外加统一执行边界：冷启动补做时
+    // 会话可能还没从存储恢复。
+    const quotaAutoResume =
+      dynamicWorkflowRunPort === undefined ||
+      dynamicWorkflowJournal === undefined ||
+      typeof dynamicWorkflowRunPort.resume !== "function"
+        ? undefined
+        : startWorkflowQuotaAutoResume({
+            journal: dynamicWorkflowJournal,
+            logger,
+            parentSessionId: sessionId,
+            resume: async (runId) => {
+              await prepareUserExecutionBoundary({ traceContext });
+              const result = await dynamicWorkflowRunPort.resume!(runId);
+              if (result.ok) {
+                await getRuntime().trackResumedDynamicWorkflowRun({
+                  runId: result.runId,
+                  ...(result.toolCallId === undefined ? {} : { toolCallId: result.toolCallId }),
+                  traceContext,
+                });
+              }
+              return result;
+            },
+            subscribeRunSettled: (listener) => dynamicWorkflowRunPort.subscribeRunSettled(listener),
+          });
     const sessionFacade = createSessionFacade({
+      closeScriptWorkflowRuns: () => scriptWorkflowFacade.closeScriptWorkflowRuns(),
+      cliDefaultSelection,
       // App 关闭时停下本会话拥有的 dwf run：
       // 引擎活在本 App 的闭包里，关掉 App 而不停它，journal 行会停在 running 等下一次孤儿收敛。
       ...(dynamicWorkflowRunPort === undefined
         ? {}
-        : { closeDynamicWorkflowRuns: () => dynamicWorkflowRunPort.close() }),
+        : {
+            closeDynamicWorkflowRuns: () => {
+              // 先停自动续跑：关闭中的 service 拒绝 resume，到点的定时器不该再去撞它。
+              quotaAutoResume?.dispose();
+              return dynamicWorkflowRunPort.close();
+            },
+          }),
       configResult,
       configuredMcpServers,
       ...(options.configuredDefaultModelSelection
@@ -1031,7 +1278,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       }
       return { ref, mediaType, ...(artifactUri ? { artifactUri } : {}) };
     };
-    return {
+    const app: ZCodeApp = {
       sessionId,
       traceId: traceContext.traceId,
       runtime,
@@ -1108,6 +1355,8 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       // session 的 coordinator 并重发 admission 状态（详见 types.ts 注释）。
       reloadWorkspaceHookTrust: () =>
         workspaceHookRuntimeSecurity?.reloadTrust() ?? Promise.resolve(),
+      reloadWorkspaceMcpTrust: () =>
+        mcpPort?.refreshWorkspaceTrustAdmission?.() ?? Promise.resolve(),
       setModelIoFullRetentionEnabled: (enabled) =>
         modelAdapter.setModelIoFullRetentionEnabled(enabled),
       readToolResultArtifact: (uri) =>
@@ -1220,12 +1469,25 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       ...sessionFacade,
       close: async () => {
         try {
-          await closeSession?.();
+          // 先关闭 manager 准入并等后台根中断落盘，再让发起会话关闭其拥有的共享存储。
+          try {
+            await standaloneSessionControl?.close();
+          } finally {
+            await closeSession?.();
+          }
         } finally {
           try {
             providerModelRuntime?.dispose();
           } finally {
-            await modelTelemetry.shutdown();
+            try {
+              await modelTelemetry.shutdown();
+            } catch (error) {
+              // 遥测失败不表示 session 仍占用运行资源，也不能覆盖真正的关闭错误。
+              logger.warn("Session telemetry shutdown failed", {
+                event: "session.telemetry_shutdown.failed",
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
           }
         }
       },
@@ -1355,8 +1617,8 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       // 中枢直接启动一个已保存的工作流。能力缺席条件与
       // resumeWorkflowRun 家族一致：dwf 端口整体缺席（stub / 单测宿主）时不注册——GUI 据此拿到
       // 能力不支持错误并原样显示，而不是把「不支持直接启动」误当成一次失败的启动。
-      // 与 /goal 控制轮同构：先走统一用户执行边界（否则首次持久化前 shell selection 为空，
-      // 冷恢复退回 legacy fallback），再由 runtime 解析 + 校验 + 编译 + 落启动轮 + submit。
+      // 与 /goal 控制轮同构：先走统一用户执行边界（读取 shell 设置并完成 resume 准备），
+      // 再由 runtime 解析 + 校验 + 编译 + 落启动轮 + submit。
       ...(dynamicWorkflowRunPort === undefined
         ? {}
         : {
@@ -1395,7 +1657,10 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       resume: resumeFromStore,
       ...inputFacade,
     };
+    standaloneSessionControl?.attachRoot(app, standaloneRootProvenance);
+    return app;
   } catch (error) {
+    await standaloneSessionControl?.close();
     providerModelRuntime?.dispose();
     void modelTelemetry.shutdown().catch(() => undefined);
     void ownedNodeReplBrowserBroker?.close();

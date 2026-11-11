@@ -7,8 +7,9 @@ session 初始化/父 turn 的同一 RPC → definitions → listing / Agent / S
 配置读取失败 snapshot 标记内置回退；RPC 断连/取消仍结束父轮，保留输入且无 provider 请求。
 后台更新期间使用旧完整 snapshot；running child 不刷新，terminal resume 使用父轮定义并保留
 身份历史。Host 诊断按文件更新记录，CLI 不重复解析。工具 schema/执行/历史与缓存标记不变。
-删除专用广播，不扩展插件热更新、独立 CLI/远程来源或 continuous/replayable 语义。
-详见 `docs/subagent-runtime-refresh.md`。
+删除专用广播，不扩展插件热更新、独立 CLI 来源或 continuous/replayable 语义。
+远程 workspace 由远端 Host 走同一链路（2026-10-18）；是否接入读取由持有 CLI stdio 的 Host
+决定，不按 workspace 身份排除。详见 `docs/subagent-runtime-refresh.md`。
 
 SHR09/SHR10 仅补测：真实 Settings 单字段保存 → 下一父轮 spawn/terminal resume → provider
 及既有模型变更持久化；running SendMessage 只投递，不刷新 child。时序控制留在测试端，
@@ -78,13 +79,18 @@ desktop continuous 与 web remote replayable 的交付边界不变。
 
 ## 工具历史声明顺序
 
-同一 assistant 的工具声明顺序可以不同于提前执行时的首次落盘顺序。现有 ToolPart
-写入携带 runtime 生成的可选 `declarationIndex`。回退和断流恢复继续新建 part，沿用
-同一 callID 和声明序号；模型 history hydration 在同一 assistant 内按 callID 选最后
-新建的 part，再在序号完整时恢复 calls/results 声明顺序。缺少序号时保留所选记录原序。
-原始 parts、UI 和文件读取状态恢复不做调用合并或声明排序。
-模型流回调、工具调度及落盘时机保持不变。
-详细契约见 [工具历史顺序修复方案](./tool-history-order-repair-proposal.md)。
+同一 assistant 的工具声明顺序可以不同于提前执行时的首次落盘顺序。ToolPart 每次写入都携带调用
+对象的 `blockIndex`（一次响应内的块到达序号，与 text / reasoning part 共用）；`declarationIndex`
+不再写入，只在旧数据里读取。回退和断流恢复继续新建 part，沿用同一 callID 和序号；模型 history
+hydration 在同一 assistant 内按 callID 选最后新建的 part，再按 `blockIndex`（旧数据按
+`declarationIndex`）恢复 calls/results 声明顺序。缺少序号时保留所选记录原序。session-store 读取时
+只对有序 assistant 消息按 `blockIndex` 重排 reasoning / text / tool part，其他 part 位置不变，旧消息
+保持物理顺序；UI 不做调用合并。浏览器轮尾截图 tool part 不进入模型历史。文件读取状态恢复按 live
+的写入顺序：快照 metadata
+另带执行器在工具记录快照时取的可选 `snapshotIndex`，同一 assistant 内按它重放快照，模型 history
+不使用它。模型流回调和落盘时机保持不变；live 调度、执行和提交结果按 `blockIndex` 排序，和冷恢复同序。
+详细契约见 [工具历史顺序修复方案](./tool-history-order-repair-proposal.md) 与
+[Assistant 内容块顺序](../../../../apps/zcode-cli/docs/design/v2/model/assistant-block-order.md)。
 
 ```text
 声明 Bash(0) -> Read(1) -> 原有落盘 Read(1), Bash(0)
@@ -116,32 +122,33 @@ continuous/replayable 交付链路。跨平台路径与 PDF 外部命令仍由�
 
 ## 话题历史附件按需读取（本地／stdio／WebSocket 接入验证中）
 
-复用 `ReadSessionContext` 的 `topic` 策略，通过可选附件选择器传入已归档的
-`messageId` 与资源序号。模型输入不包含 botId、chatId、workspace、授权版本或下载地址。
+2026-11-03 起，话题资源由 `ReadTopicResource` 读取。`ReadSessionContext` 已删除，见
+`docs/architecture/zcode-app-control-design.md` 0.8。模型传入已归档的 `messageId` 与资源序号。
+模型输入不包含 botId、chatId、workspace、授权版本或下载地址。
 当前 session 必须与工具上下文一致；输入来源和授权版本从当前任务的可信入站记录解析。
 
-工具选择器为 `attachment: { inputId?, messageId, index? }`；文本历史索引携带 inputId 时，只能解析该任务已接收的对应快照。旧调用省略时沿用最新可信输入。模型填写的 inputId 只做选择，不提供授权。
+工具输入为 `{ inputId?, messageId, index? }`，`index` 缺省为 0；文本历史索引携带 inputId 时，只能解析该任务已接收的对应快照。省略 inputId 时沿用最新可信输入。模型填写的 inputId 只做选择，不提供授权。
 
-附件选择器仅允许用于 `strategy=topic`。
-真实模型验证发现当前任务 ID 不在模型上下文内；话题策略省略 sessionId 或传 `current` 时，
-由工具上下文解析当前任务。其他策略仍要求明确 sessionId，不允许跨话题读取。
+工具没有 sessionId 参数。真实模型验证发现当前任务 ID 不在模型上下文内，所以工具由工具上下文
+解析当前任务，不允许跨话题读取。运行时注入了 `topicResourcePort`（App 托管的会话）才注册该工具，
+并延迟曝光；非机器人会话调用时没有已接纳的话题授权，工具报错。
 可信来源优先读取 `conversationInputIntent`，兼容旧 `inputIntent`；canonical 字段存在但无效时
 不能借旧字段恢复权限。只有正常用户输入可提供来源；缺少入队授权版本时明确拒绝附件读取。
 Host 返回寄存引用及名称／MIME／字节数，Agent 校验实际字节数后写 session binary artifact。
 
 ```text
-ReadSessionContext(topic, attachment reference)
+ReadTopicResource({ inputId?, messageId, index? })
   -> current session + trusted admitted input source
   -> dependency-injected TopicResourcePort
   -> strict Agent/Host reverse request
   -> Host readTopicResource (archive + group/topic/version checks)
   -> existing chunked attachment upload into requesting CLI
   -> CLI session artifact -> binary artifact with target-local path
-  -> bounded tool result (name/type/size/reference/path)
+  -> bounded tool result (status/path/fileName/mime/bytes/messageId/index)
 ```
 
 App/Agent 方法及双向参数使用 `packages/shared/src/zcode-protocol/index.ts` 的运行时
-schema；旧 Host/standalone CLI 能力缺失须明确失败，不回退到任意 URL 下载。Host 连接边界
+schema；旧 Host 能力缺失须明确失败，独立 CLI 不注册该工具，不回退到任意 URL 下载。Host 连接边界
 注入 workspaceIdentity 与 remoteSessionId，不接受模型覆盖；远程 runtime 的请求必须经现有
 连接回到拥有机器人凭据的 Host，不能另建运行时或在远端读取本地凭据。
 
@@ -152,7 +159,8 @@ wireClient 参数，丢失 remoteSessionId。每次读取开始时从同一个 C
 附件 bytes 复用现有分块上传和校验，不放进单个反向响应。Agent 从自己 session 的 artifact
 读取完整资源，复用 binary artifact 写入及 session 生命周期清理，文件后缀必须安全规范化。
 取消传播到下载/传输/落盘；失败不提供半成品路径。下载不能批准权限、改变策略或创建输入队列。
-只读工具权限仍检查当前 task/source 边界，trace、结果预算、事件和 V4 投影沿用工具执行链。
+该工具会写托管文件，不声明只读；`sideEffectScope` 为 `session`，权限名为 `session.topic_resource.read`，
+无需审批。工具权限仍检查当前 task/source 边界，trace、结果预算、事件和 V4 投影沿用工具执行链。
 
 测试依次覆盖工具 schema、可信来源解析、Host 反向请求、远端路由、分块失败与取消、runtime
 artifact 落地、真实模型按文件内部值回答及原话题投递。Host 下载单测或原生 API 下载成功不代表
@@ -185,9 +193,28 @@ CronDelete(id)
 
 删除不存在的 ID、已删除的 ID 或不属于当前 workspace 的 ID，不能返回成功。调用方需要得到明确的未找到结果，避免模型在 CronList 后反复重试同一个删除请求。
 
+## CronPauseSelf 暂停语义
+
+CronPauseSelf 只在 automation 执行轮可见，用于在 prompt 的停止条件满足时暂停本轮所属任务。
+
+```text
+Host admission automationId（仅接受调度派发显式注入；inputId/runId 只是追踪字段）
+  -> core RegularTurnLoopState.automationId
+  -> executor ToolExecutionContext.automationId
+  -> CronPauseSelf({})（无 id 输入，缺少 automationId 时拒绝）
+  -> CLI AutomationPort.pause({ id })
+  -> automation/pause protocol
+  -> Service.pause(id, current workspace)
+  -> Repo.pause：只把 active + enabled 的行改为 paused
+  -> { paused: true | false }
+  -> Tool result
+```
+
+普通用户轮、只有兜底信号的轮和 remote workspace 都不暴露该工具。已暂停、已完成、已失败、已删除或不属于当前 workspace 的任务返回 `paused: false`，不改变状态。scheduler 的 `markDispatched` 回写在同一条 UPDATE 内保留 paused，避免暂停后被派发回写复活。完整状态与时序见 `docs/automation-edit-status.md`。
+
 ## 远程 workspace 的 Cron 工具策略
 
-SSH、WSL、Docker 和 Server workspace 使用 `remote:*` workspace identity。此类 session 在创建或恢复时将 CronCreate、CronList、CronUpdate、CronDelete 加入 session 级 denylist，避免远程 Agent 暴露无法由远程调度边界可靠承载的定时任务能力。本地 workspace 不继承该限制。
+SSH、WSL、Docker 和 Server workspace 使用 `remote:*` workspace identity。此类 session 在创建或恢复时将 CronCreate、CronList、CronUpdate、CronDelete、CronPauseSelf 加入 session 级 denylist，避免远程 Agent 暴露无法由远程调度边界可靠承载的定时任务能力。本地 workspace 不继承该限制。
 
 ## Todo103：Off-Peak 工具与标准执行边界
 
@@ -226,8 +253,16 @@ Host 闲时派发 -> prompt-turn.ts / server-operations.ts turn denylist（+Send
 `isOffPeakCreateRestrictedTurn` 的 denylist 兜底只认 OffPeakCreate 哨兵。工具 schema、权限、超时不变；
 automation 轮与普通轮不受影响。测试：`core/tests/off-peak-tool.test.ts`、
 `bootstrap/tests/offpeak-prompt-turn-disallowlist.test.ts`、`bootstrap/tests/v4-native-commands.test.ts`。
+
 #### 2026-09-08 原生验证发现的入口校验问题
 
-话题原文回查与历史附件选择均以 `conversationInputIntent` 为权威来源。仅当该字段不存在时兼容 `inputIntent`；权威字段存在但无有效话题记录时，不得从同条消息的旧字段恢复记录。相同消息上两个字段冲突时只采纳权威记录，正文与 synthetic 背景仍不能注入来源身份。
+2026-11-03：话题原文回查随 ReadSessionContext 删除。`ReadTopicResource` 没有 sessionId 参数，下文的 `sessionId: current` 选择器已不存在。
+
+历史附件选择以 `conversationInputIntent` 为权威来源。仅当该字段不存在时兼容 `inputIntent`；权威字段存在但无有效话题记录时，不得从同条消息的旧字段恢复记录。相同消息上两个字段冲突时只采纳权威记录，正文与 synthetic 背景仍不能注入来源身份。
 
 真实模型显式传入 `sessionId: current` 时，工具 executor 的 JSON Schema 校验将正则字符串与字面量的联合转换为 `oneOf`，而最小校验器未应用正则，因此两个分支同时匹配，错误拒绝调用。当前话题选择器应使用单个字符串模式表达 `current | sess_*`，在 executor 入参校验与 handler 运行时解析两层验证；非话题策略仍要求明确任务 ID。不能仅直接调用 handler 的单测宣称真实工具入口可用。
+
+
+## Agent 官方插件发现与确认安装
+
+`SearchPlugins` / `SuggestPluginInstall` 经 contracts -> Core handler -> 注入的 PluginDiscoveryPort -> Bootstrap 官方目录/安装适配器；V4 pluginInstall 专用交互由 CLI 发出，桌面/手机通过 resolveInteraction 回应。UI 仅提交选择，安装继续复用 storage lock、内置恢复和 User/Workspace 启用原语。工具内部显式确认合同绕过重复通用弹窗，但 project deny/ask 和 plan 限制保留；yolo 也必须点击卡片，绝不套用 AskUserQuestion 自动结束。能力刷新仅注入 PluginActivationPort，未接入返回 refreshRequired。两个工具均为 deferred（`shouldDefer`），经 ToolSearch 按需加载；Session-specific guidance 暂不注入插件推荐提示。详见 docs/plugins/agent-plugin-discovery.md。

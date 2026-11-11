@@ -124,6 +124,7 @@ guest 页面发起请求
 - **页面能力**：展示该站点在 main 持久层已记录的各权限状态，逐项可设为 询问/允许/阻止（询问即删除记录回到每次询问）；支持整站重置（main 侧 `resetSite(origin)`，清除该 origin 全部持久决定）；「仅本次」临时态不展示（与设置页区块口径一致）。
 - **数据源唯一**：读写全部经 main 站点权限 store（`getEmbeddedBrowserSitePermissions` / `setEmbeddedBrowserSitePermission` / `resetEmbeddedBrowserSitePermission`），页面持有独立的读取失败/写入失败状态与显式重试，不推测修改后的授权，不加授权缓存、自动重试或操作队列。
 - 地址栏 URL 非编辑态居中，聚焦编辑时左对齐并隐藏左侧图标。
+- 窄面板（地址栏宽度不足 9rem，如 Windows 1280 屏 150% 缩放）：地址栏用小内边距、隐藏左侧滑杆入口，同一入口改在浏览器工具栏「更多」菜单里以「站点权限」出现，点它直接进入同一个设置标签页；宽面板地址栏里有入口，菜单里不重复。仅 http / https 页面有此项。
 
 ## 整合决策记录（2026-10-09）
 
@@ -160,8 +161,21 @@ info 级（低频、生产保留）；弹窗类路径日志量与权限请求数
 
 ## 测试要求
 
+- 权限 E2E 必须先发起页面请求而不等待它完成，再点击产品确认条，最后读取页面结果。
+  `executeJavaScript` 会等待返回的 Promise；发起 `getUserMedia` 时使用 `void`，避免测试自身等待用户决策而无法点击。
+  顺序：发起请求 -> 确认条可见 -> 点击允许/拒绝 -> 断言结果与二次请求行为。
+
 - 单测：决策表全枚举（白名单/记录命中/无记录无弹窗能力时拒绝/未知权限 fail-closed）、check 与 request 一致性、持久层读写与原子写、sessionAllow 生命周期、inflight 去重、20s 超时拒绝、select-* 与 displayMedia 的拒绝回调。
 - e2e（desktop e2e）：确认气泡出现 → 三种按钮 + ✕ 各自的页面侧结果与二次请求行为；重启后持久记忆生效；设置页改状态后生效；源选择器选源后 `getDisplayMedia` 成功、取消失败；`requestDevice` 弹设备选择器，负向断言"未选择设备时不再静默授权第一个设备"。
+
+### 权限查询与请求的 origin 一致性
+
+修复测试自身等待权限 Promise 的死锁后，`browser-permission-prompt.test.ts` 仍在持久允许后的
+`permissions.query('camera')` 断言失败。运行时记录显示 `getUserMedia` 已返回 `ok`，查询仍为
+`denied`：授权写入标准 origin，而 Electron check 回调传入带尾部 `/` 的 origin，原样查询未命中。
+证据见本地 `packages/desktop/.e2e-artifacts/desktop-e2e-accountless-diagnosis-20261014b/`。
+request 与 check 都使用 URL.origin 归一化后查询同一份记录；持久允许和本次允许均遵循此约束。
+单测覆盖裸 origin、尾部斜杠、页面路径，以及协议、站点、权限隔离；E2E 保留授权后 `granted` 断言。
 
 ## 实施顺序（四步提交，每步独立可验证）
 

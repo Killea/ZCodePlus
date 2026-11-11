@@ -61,7 +61,10 @@ describe("persistent custom-agent memory", () => {
 
     expect(prompt).toContain("## MEMORY.md\n\n- memory 1");
     expect(prompt).toContain("- memory 200\n\n> WARNING: MEMORY.md is 201 lines (limit: 200).");
-    expect(prompt).not.toContain("- memory 201");
+    expect(prompt.split("\n\n> WARNING:")[0]).not.toContain("- memory 201");
+    expect(prompt).toContain(
+      'Only part of it was loaded: 1 of 201 lines were cut off, starting at line 201 ("- memory 201").',
+    );
   });
 
   it("limits a single long MEMORY.md value and formats integer KB like the baseline", () => {
@@ -82,36 +85,37 @@ describe("persistent custom-agent memory", () => {
       memory: "project",
       tools: ["Grep"],
     });
-    const config = projectPersistentAgentMemoryTools({
-      memory: { enabled: true, storageRoot: "/storage", use: true },
-      subagents: { profiles: [profile] },
-    });
-    const projected = config.subagents?.profiles?.[0];
+    const definitions = { activeAgents: [profile] };
+    const memory = { enabled: true, storageRoot: "/storage", use: true };
+    const projected = projectPersistentAgentMemoryTools(definitions, memory).activeAgents[0];
 
     expect(projected?.tools).toEqual(["Grep", "Write", "Edit"]);
-    expect(projected?.tools).not.toContain("Read");
     expect(formatAgentProfilesForPrompt([projected!])).toContain(
       "- reviewer/a b: Review changes. (Tools: Grep, Write)",
     );
+    expect(projectPersistentAgentMemoryTools(definitions, { ...memory, enabled: false })).toBe(
+      definitions,
+    );
+    expect(projectPersistentAgentMemoryTools(definitions, undefined)).toBe(definitions);
+    expect(projectPersistentAgentMemoryTools(definitions, { ...memory, storageRoot: "" })).toBe(
+      definitions,
+    );
     expect(
-      projectPersistentAgentMemoryTools({
-        memory: { enabled: false, storageRoot: "/storage", use: true },
-        subagents: { profiles: [profile] },
-      }).subagents?.profiles?.[0]?.tools,
-    ).toEqual(["Grep"]);
-    expect(
-      projectPersistentAgentMemoryTools({
-        memory: { enabled: true, storageRoot: "/storage", use: true },
-        subagents: { profiles: [customProfile({ memory: "project" })] },
-      }).subagents?.profiles?.[0]?.tools,
+      projectPersistentAgentMemoryTools(
+        { activeAgents: [customProfile({ memory: "project" })] },
+        memory,
+      ).activeAgents[0]?.tools,
     ).toBeUndefined();
     expect(
-      projectPersistentAgentMemoryTools({
-        memory: { enabled: true, storageRoot: "/storage", use: true },
-        subagents: { profiles: [customProfile({ memory: "project", tools: [] })] },
-      }).subagents?.profiles?.[0]?.tools,
+      projectPersistentAgentMemoryTools(
+        { activeAgents: [customProfile({ memory: "project", tools: [] })] },
+        memory,
+      ).activeAgents[0]?.tools,
     ).toEqual(["Write", "Edit"]);
-
+    expect(
+      projectPersistentAgentMemoryTools({ activeAgents: [projected!] }, memory).activeAgents[0],
+    ).toBe(projected);
+    expect(profile.tools).toEqual(["Grep"]);
   });
 
   it("reads MEMORY.md for every child launch and creates nothing when globally disabled", async () => {

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-automation-cron-update",
-  "spec": "./test/e2e/conversation-session/conversation-session-automation-cron-update.test.ts",
+  "spec": "./test/e2e/conversation-session/automations/conversation-session-automation-cron-update.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-automation-cron-update.json"
@@ -26,7 +26,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "fast-text",
-      "syntheticReason": "动态 ID 来自真实 CronList tool_result，固定 patch 用于验证原地更新和详情回显。"
+      "syntheticReason": "动态 ID 来自真实 CronList tool_result，固定 200 天 interval carrier patch 用于验证原地更新和详情回显。"
     },
     {
       "id": "upstream-conversation-automation-cron-update-compact",

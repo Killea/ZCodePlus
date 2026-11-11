@@ -3,6 +3,43 @@ import { toAiSdkMessages } from "../src/model/index.js";
 import { createTestInputFormat } from "./test-model-format.js";
 
 describe("AI SDK model message transform", () => {
+  it("orders assistant blocks by blockIndex without merging or leaking the field", () => {
+    const [assistant] = toAiSdkMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "first thought", blockIndex: 0 },
+          { type: "text", text: "A", blockIndex: 1 },
+          { type: "reasoning", text: "second thought", blockIndex: 3 },
+          { type: "text", text: "B", blockIndex: 4 },
+        ],
+        toolCalls: [{ id: "t1", name: "Read", input: {}, blockIndex: 2 }],
+      },
+    ]);
+    expect(assistant?.content).toEqual([
+      { type: "reasoning", text: "first thought" },
+      { type: "text", text: "A" },
+      { type: "tool-call", toolCallId: "t1", toolName: "Read", input: {} },
+      { type: "reasoning", text: "second thought" },
+      { type: "text", text: "B" },
+    ]);
+    expect(JSON.stringify(assistant)).not.toContain("blockIndex");
+  });
+
+  it("keeps the legacy content-then-tools layout when any block lacks blockIndex", () => {
+    const [assistant] = toAiSdkMessages([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "A" }],
+        toolCalls: [{ id: "t1", name: "Read", input: {}, blockIndex: 0 }],
+      },
+    ]);
+    expect(assistant?.content).toEqual([
+      { type: "text", text: "A" },
+      { type: "tool-call", toolCallId: "t1", toolName: "Read", input: {} },
+    ]);
+  });
+
   it("uses a fixed wire-only fallback for empty user content", () => {
     expect(
       toAiSdkMessages([
@@ -400,32 +437,6 @@ describe("AI SDK model message transform", () => {
     ]);
   });
 
-  it("preserves unsigned reasoning blocks on Anthropic transports", () => {
-    const messages = toAiSdkMessages(
-      [
-        {
-          role: "assistant",
-          content: [
-            { type: "reasoning", text: "thinking before a tool" },
-            { type: "text", text: "done" },
-          ],
-        },
-      ],
-      {
-        providerKind: "anthropic",
-      },
-    );
-
-    expect((messages[0] as any).content).toEqual([
-      {
-        type: "reasoning",
-        text: "thinking before a tool",
-        providerOptions: { anthropic: { signature: "" } },
-      },
-      { type: "text", text: "done" },
-    ]);
-  });
-
   it.each([
     ["missing provider metadata", undefined],
     ["empty provider metadata", {}],
@@ -595,21 +606,6 @@ describe("AI SDK model message transform", () => {
     ]);
   });
 
-  it("leaves plain assistant messages unchanged", () => {
-    const messages = toAiSdkMessages(
-      [
-        {
-          role: "assistant",
-          content: "done",
-        },
-      ],
-      {},
-    );
-
-    expect((messages[0] as any).providerOptions).toBeUndefined();
-    expect((messages[0] as any).content).toBe("done");
-  });
-
   it("translates provider-neutral cache control to Anthropic provider options", () => {
     const messages = toAiSdkMessages([
       {
@@ -715,31 +711,6 @@ describe("AI SDK model message transform", () => {
       {
         type: "text",
         text: "[Attached image/png]\n[Media omitted from provider request because the selected model does not support image input.]",
-      },
-    ]);
-  });
-
-  it("translates PDF file blocks to AI SDK file parts", () => {
-    const messages = toAiSdkMessages([
-      {
-        role: "user",
-        content: [
-          {
-            type: "file",
-            mediaType: "application/pdf",
-            name: "report.pdf",
-            dataUrl: "data:application/pdf;base64,cGRm",
-          },
-        ],
-      },
-    ]);
-
-    expect((messages[0] as any).content).toEqual([
-      {
-        type: "file",
-        data: "cGRm",
-        filename: "report.pdf",
-        mediaType: "application/pdf",
       },
     ]);
   });

@@ -21,6 +21,7 @@ import {
   requireSession,
   type ZCodeProtocolAgentServerContext,
 } from "../server-types.js";
+import { getSessionLifecycle } from "../session-residency.js";
 import { getMcpUiAppToolRegistry } from "./appToolsProtocol.js";
 import {
   McpUiNotSupportedError,
@@ -218,9 +219,20 @@ export async function openMcpUiInstance(
   rawParams: unknown,
 ) {
   const params = parseParams(zcodeMcpUiOpenInstanceParamsSchema, rawParams);
+  // 冷打开时历史订阅已建立，但 session 可能仍在恢复；直接 requireSession 会让面板停在错误页。
+  // 复用生命周期 owner 的恢复 Promise，等 ready 后再签发实例，不靠延时或重复初始化。
+  await getSessionLifecycle(context).ensureReady(params.sessionId);
   const record = requireSession(context, params.sessionId, { operation: "mcp/uiOpenInstance" });
-  const source = record.app.getMcpAppConnectionSnapshot(params.serverName);
-  if (!source) throw new ProtocolRequestError(-32001, "MCP App connection is unavailable");
+  // session ready 不代表目标 MCP ready；首次签发等待连接，已有凭证校验仍保持同步拒绝失效来源。
+  const source = await record.app.waitForMcpAppConnection(params.serverName);
+  const current = record.app.getMcpAppConnectionSnapshot(params.serverName);
+  if (
+    context.sessions.get(params.sessionId) !== record ||
+    !source ||
+    current?.identity !== source.identity ||
+    current.generation !== source.generation
+  )
+    throw new ProtocolRequestError(-32001, "MCP App connection is unavailable");
   const lease = mcpUiInstances.open(
     {
       workspace: params.workspace.workspaceIdentity?.trim() || params.workspace.workspacePath,

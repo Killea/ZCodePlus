@@ -12,10 +12,21 @@
 - `image`：读取媒体预览并显示图片；当前识别 `apng`、`avif`、`bmp`、`gif`、`ico`、`jpeg`、`jpg`、`png`、`svg`、`webp`
 - `media`：使用原生 `video` / `audio` 控件预览 MP4、MOV、WebM、M4V、MP3、WAV、M4A、OGG、Opus、FLAC 和 WEBA；Desktop 本地文件通过授权 `zcode-media://` URL，Desktop SSH/WSL/Docker 文件通过 Host loopback HTTP Range Proxy，手机 `/remote` 仅使用 workspace-scoped 小文件 inline 读取
 - `pdf`：渲染 PDF 只读预览；当前识别 `pdf`，只提供预览能力，不提供编辑能力。所有入口统一创建 `file` source，由 PreviewPane 的 `resolvePreviewPanePdfSource` 惰性升级为 `pdf`（与 image 的升级模式一致），保证 tab key 全部走 `file:{path}` 去重。数据加载走 `fileService` 的分段读取（`stat` 拿 size；小于 `2MB` 循环 `readFileRange` 拉全量，超过则交给 pdf.js range 按需分段加载），无整档大小上限；旧远端（`stat` 不返回 `size`）回退整档 base64 的 `readMediaPreview` 旧通道，保留其 8MB 上限
-- `office`：以只读模式预览 `.xlsx`、`.xlsm`、`.xls`、`.docx` 和 `.doc`；Excel 以 `.xlsx` 为完整支持路径，`.xlsm` / `.xls` 仅展示渲染库能够解析的数据，`.docx` / `.doc` 统一交给 Word 渲染器
+- `office`：以只读模式预览 `.xlsx`、`.xlsm`、`.xls`、`.docx` 和 `.doc`；Excel 以 `.xlsx` 为完整支持路径，`.xlsm` / `.xls` 仅展示渲染库能够解析的数据，`.docx` / `.doc` 统一交给 Word 渲染器。`.xlsx` 在插件面板可用时优先分流到内置 `spreadsheets` 查看面板，Preview Pane 只承接 `.xlsm` / `.xls` 与回退路径，分流规则见 [office-file-preview](office-file-preview.md) 的入口路由章节
 - `pptx`：渲染 PPTX 只读预览；当前识别 `.pptx`，以左侧垂直缩略图列表和右侧单页预览展示，底部工具栏提供翻页、页码跳转和缩放。所有入口仍创建 `file` source，由 PreviewPane 惰性升级为 `pptx`，保证 tab key 继续走 `file:{path}` 去重。第一期只实现 `PresentationPreviewEngine`，编辑、导出、写回仅保留分层接口。新 Host 使用 `64MB` 上限；旧远端缺少 `stat.size/readFileRange` 时保留 `8MB` base64 兼容上限，并显示独立的本地化提示而不是误报 `64MB` 或透出远端路径。详见 `docs/ui/pptx-preview.md`
 
 ## 文件与文本渲染规则
+
+### 原生媒体控件主题
+
+- `video[controls]` / `audio[controls]` 统一跟随应用已有的 `.dark` 主题类设置 `color-scheme`：浅色为 `light`，深色为 `dark`。沿用 `applyTheme` 对 Zai、旧版偏好和 System 的解析，不单独读取系统偏好。
+- 规则由 UI 公共样式入口加载，覆盖 Preview Pane、聊天附件弹窗、共享媒体预览及云端媒体 Hero；无 `controls` 的缩略图不在范围内。
+- 样式定义在 `packages/ui/src/nativeMediaControls.css`，由 `packages/ui/src/styles.css` 导入；主题解析仍由 `packages/ui/src/useTheme.ts` 的 `applyTheme` 负责。
+- 桌面和手机 Web 共用样式。只改变浏览器原生菜单及控件的外观，保留播放、速度选择、媒体加载及远控数据路径。
+- macOS 视频菜单本地化依赖打包时保留 `en.lproj` / `zh_CN.lproj`；主题样式不能替代语言包修复。
+- 验证要求：单测读取实际媒体样式，覆盖深浅主题与 System、Desktop/Web 表面及无控件缩略图；真实 Electron 验证中英文溢出菜单和速度子菜单，并在桌面/窄屏下检查明暗主题切换。
+
+### 通用渲染规则
 
 - `.md` / `.markdown` 文件和 markdown 文本 source 默认进入预览模式，可在更多菜单切换到源码
 - `.svg` 文件和带 `.svg` path 的文本 source 默认进入 SVG 预览，可切换到代码；切到代码模式后可继续使用自动换行开关
@@ -61,4 +72,5 @@
 - `packages/ui/src/lib/codeViewer.ts`：预览 source 类型、工具调用预览提取、语言和图片类型识别
 - `packages/ui/src/lib/codeViewerSource.ts`：Code Viewer source 路径规范化
 - `packages/ui/src/lib/workspaceSidePane.ts`：Code Viewer tab key 生成与复用
+- `packages/ui/src/plugin-ui/officeViewerOpen.ts`：`.xlsx` 文件打开到内置 spreadsheets 查看面板的路由表、能力门与文档驱动
 - `docs/ui/office-file-preview.md`：Office 文件预览的边界、状态组合和验证契约

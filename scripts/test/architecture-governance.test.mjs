@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout } from "node:timers/promises";
 
 import {
   changedFilesFromGit,
@@ -38,7 +39,21 @@ async function fixture(files, fn) {
     }
     return await fn(cwd);
   } finally {
-    await rm(cwd, { recursive: true, force: true });
+    // Windows 上 git 子进程与索引句柄会短暂滞留，直接 rm(recursive) 偶发
+    // EBUSY（本机连续多轮复现）；指数退避重试，仍失败则放过目录——它在
+    // 系统 temp 下，不影响测试结论。
+    // 注意：清理是 best-effort，这里绝不能 return/throw——finally 中的
+    // return 会丢弃 try 块挂起的断言异常，让治理测试空转通过（评审
+    // CR-01 修复），非 EBUSY 与重试耗尽一律 break 放过目录。
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await rm(cwd, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (attempt === 5 || error.code !== "EBUSY") break;
+        await setTimeout(20 * 2 ** attempt);
+      }
+    }
   }
 }
 
@@ -61,10 +76,21 @@ global:
 
 const POLICY_UNDECLARED = POLICY.replace("requires: [beta]", "requires: []");
 
-test("managed module documents satisfy artifacts without being checked as source", async () => {
+test("fixture 回调中的断言异常必须向上传播（finally 清理不得吞异常）", async () => {
+  // 回归锚点：finally 清理循环曾用 return 收尾，JS 语义下会丢弃 try 块中
+  // 挂起的断言异常，导致整个治理测试文件空转通过（评审 CR-01）。
+  await assert.rejects(
+    fixture({ "architecture-policy.yaml": POLICY }, async () => {
+      throw new Error("intentional assertion failure");
+    }),
+    /intentional assertion failure/,
+  );
+});
+
+test("managed module needs contracts and documentation but no unit test", async () => {
   const files = { "architecture-policy.yaml": POLICY };
   for (const module of ["alpha", "beta"]) {
-    for (const name of ["module.ts", "contract.ts", "contract.example.ts", "contract.test.ts"]) {
+    for (const name of ["module.ts", "contract.ts", "contract.example.ts"]) {
       files[`src/${module}/${name}`] = "export {};\n";
     }
     // 文档示例故意超过源码行数限制且含 import；它们不是可执行的跨模块依赖。

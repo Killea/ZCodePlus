@@ -17,10 +17,11 @@ import {
   TID_MODEL_PROVIDER_BASE_URL_INPUT,
   TID_MODEL_PROVIDER_MODEL_DELETE_BUTTON,
   TID_MODEL_PROVIDER_MODEL_INPUT,
+  TID_MODEL_PROVIDER_NAME_EDIT_BUTTON,
   TID_MODEL_PROVIDER_NAME_INPUT,
   testId,
-} from "@zcode/shared";
-import { InfoIcon, LockKeyholeIcon, Plus, Trash2, MoreHorizontal } from "lucide-react";
+} from "@zcode/shared/test-ids";
+import { InfoIcon, LockKeyholeIcon, Plus, Pencil, Trash2, MoreHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button.js";
 import { Input } from "@/components/ui/input.js";
 import {
@@ -28,6 +29,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useServices } from "@/hooks/useServices.js";
@@ -68,30 +70,68 @@ export function shouldShowProviderApiFormat(
 export function ProviderCardHeader({
   providerName,
   logo,
+  editingName,
+  nameValue,
+  nameEditable = true,
+  onNameChange,
+  onNameBlur,
+  onNameKeyDown,
+  onNameCompositionEnd,
+  onNameCompositionStart,
+  onStartEditName,
   onDelete,
   actionsVisible = true,
   providerToggle,
 }: {
   providerName: string;
   logo?: ProviderConfigObject["logo"];
+  editingName: boolean;
+  nameValue: string;
+  nameEditable?: boolean;
+  onNameChange: (value: string) => void;
+  onNameBlur: () => void;
+  onNameKeyDown: (event: ReactKeyboardEvent) => void;
+  onNameCompositionEnd?: () => void;
+  onNameCompositionStart?: () => void;
+  onStartEditName: () => void;
   onDelete?: () => void;
   actionsVisible?: boolean;
   providerToggle?: ReactNode;
 }) {
   const { intl } = useZCodeIntl();
-  const actionsMenuVisible = actionsVisible && Boolean(onDelete);
+  const renameRequestedRef = useRef(false);
+  const secondaryActionsVisible = actionsVisible && (nameEditable || Boolean(onDelete));
 
   return (
     <div className="flex items-center justify-between gap-3" data-testid="model-provider-header">
       <div className="flex min-w-0 items-center gap-2">
         <ProviderLogo logo={logo} className="size-5" />
-        <div className="min-w-0 truncate text-ui-lg font-semibold text-foreground">
-          {providerName}
-        </div>
+        {editingName ? (
+          <Input
+            {...TECHNICAL_INPUT_ATTRIBUTES}
+            autoFocus
+            data-testid={TID_MODEL_PROVIDER_NAME_INPUT}
+            type="text"
+            size="lg"
+            className="w-auto min-w-0 text-ui-lg font-semibold"
+            value={nameValue}
+            onChange={(event) => onNameChange(event.target.value)}
+            onCompositionEnd={onNameCompositionEnd}
+            onCompositionStart={onNameCompositionStart}
+            onBlur={onNameBlur}
+            onKeyDown={onNameKeyDown}
+          />
+        ) : (
+          <>
+            <div className="min-w-0 truncate text-ui-lg font-semibold text-foreground">
+              {providerName}
+            </div>
+          </>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {providerToggle}
-        {actionsMenuVisible ? (
+        {secondaryActionsVisible ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -104,11 +144,35 @@ export function ProviderCardHeader({
                 <MoreHorizontal className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem variant="destructive" onSelect={onDelete}>
-                <Trash2 className="size-3.5" />
-                {intl.formatMessage({ id: "common.delete" })}
-              </DropdownMenuItem>
+            <DropdownMenuContent
+              align="end"
+              onCloseAutoFocus={(event) => {
+                // 退场动画中的菜单仍会因鼠标移动抢焦点，必须关闭后再挂载并聚焦输入框。
+                if (renameRequestedRef.current) {
+                  event.preventDefault();
+                  renameRequestedRef.current = false;
+                  onStartEditName();
+                }
+              }}
+            >
+              {nameEditable ? (
+                <DropdownMenuItem
+                  data-testid={TID_MODEL_PROVIDER_NAME_EDIT_BUTTON}
+                  onSelect={() => {
+                    renameRequestedRef.current = true;
+                  }}
+                >
+                  <Pencil className="size-3.5" />
+                  {intl.formatMessage({ id: "settings.modelProvider.renameProvider" })}
+                </DropdownMenuItem>
+              ) : null}
+              {nameEditable && onDelete ? <DropdownMenuSeparator /> : null}
+              {onDelete ? (
+                <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+                  <Trash2 className="size-3.5" />
+                  {intl.formatMessage({ id: "common.delete" })}
+                </DropdownMenuItem>
+              ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-command-unknown-recovery",
-  "spec": "./test/e2e/conversation-session/conversation-session-command-unknown-recovery.test.ts",
+  "spec": "./test/e2e/conversation-session/execution/conversation-session-command-unknown-recovery.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-command-unknown-recovery.json"

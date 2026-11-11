@@ -3,6 +3,10 @@
 话题输入材料的新实现以 [话题输入材料重构](bots-topic-input-materials.md) 为准；
 下文历史记录中的正文拼接引用与 bot_topic_context 自动注入将由标准引用和文本附件替代。
 
+架构登记沿用两个既有边界：`conversation-quote-context` 只生成模型可见引用和可信来源说明；
+`window-topic-resource-relay` 绑定物理连接与 logical session，委托已有资源转发通道执行校验、读取与取消。
+登记不改变 canonical 输入、Bot 投递 owner 或默认停用渠道发送入口的行为。
+
 ## Identity and activation
 
 One enabled group has one default conversation, plus independent topic conversations.
@@ -21,6 +25,23 @@ without cancelling accepted work. Re-enable preserves context, not missed output
 Removal from the group, unbinding or owner replacement revokes group access;
 joining again requires explicit owner activation. Both ordinary Feishu/Lark groups
 and dedicated topic groups are supported. Other providers are excluded.
+
+### 冷恢复后的模型选择
+
+已绑定 task 的模型由 Agent Session 持久化，不从 Bot 草稿或任务索引恢复。
+冷恢复时 Provider 暂不可用可以使运行绑定为空，但必须保留 Session 原选择。
+Provider 恢复后，群输入未显式携带模型时，V4 接纳从当前运行选择或冷恢复保留值
+固定本轮 Selection，继续经过现有模型可用性校验；不要求再次执行 `/model`。
+Provider 仍不可用或选择无效时拒绝输入，不改用默认模型。新选模生效后以新值为准，
+已接纳输入与队列保持原快照。桌面 continuous 与 Web replayable 共用此接纳边界。
+
+```text
+Session 持久选择 → 冷恢复保留值 → V4 模型校验与输入接纳 → 冻结本轮 Selection
+                              ↑ 当前运行选择优先
+```
+
+回归入口：`apps/zcode-cli/packages/bootstrap/tests/protocol-unbound-resume.test.ts`，
+使用真实 Protocol/App/SQLite，在 Provider 缺席时恢复，再发布 Provider 并提交 Bot 输入。
 
 ## Topic collaboration (implementation contract)
 
@@ -222,7 +243,7 @@ Remote CLI <- existing attachment uploader <- bounded chunks + final authorizati
 
 Native verification found that a file reply in the dedicated topic UI offered forward,
 recall and selection actions, but no quote-reply action in the inspected client. The
-archive retains a file placeholder; the optional `ReadSessionContext` topic attachment selector
+archive retains a file placeholder; the `ReadTopicResource` tool
 now requests the original resource through a trusted input and authorization generation.
 Local, SSH/WSL/Docker stdio and standalone WebSocket Server integration are under
 verification; controlled transport tests do not establish native end-to-end acceptance.
@@ -504,11 +525,11 @@ queue attribution retains its compact layout.
 
 # 话题原文回查实现契约
 
-Agent 复用 `ReadSessionContext` 的 `topic` 策略回查已接收输入中保存的话题原文；只能读取当前 session，按消息 ID 或关键词筛选并分页。原文来自可信 `conversationInputIntent.botGroupSource.topicContext`，仅在权威字段不存在时兼容旧 `inputIntent`；不从正文解析身份，也不把摘要当作原文。读取上限、缺口与截断必须返回给模型；尚未获取的消息不声称已归档。下一次 @ 的有限原生 API 读取继续负责新增归档。
+2026-11-03 起，Agent 不再用工具回查话题原文。`ReadSessionContext` 已删除，见 `docs/architecture/zcode-app-control-design.md` 0.8。话题增量已作为 `text/plain` 话题历史附件随用户消息给模型。旧 `topicContext` 原文的兼容读取一并删除。下载话题里的文件或图片改用 `ReadTopicResource`。不把摘要当作原文；尚未获取的消息不声称已归档。下一次 @ 的有限原生 API 读取继续负责新增归档。
 
-该策略不额外调用模型，不执行历史中的命令或审批，不改变队列，沿用既有只读工具权限、取消、trace、结果预算与 tool result 投影。任务摘要来自 model-only `bot_topic_context` 记录，原文与摘要都保留引用依据。
+任务摘要来自 model-only `bot_topic_context` 记录，原文与摘要都保留引用依据。
 
-实现边界：覆盖范围以已归档消息 ID、当前唤起检查点及 `hasGap` 表示，不推断无法读取区间的消息数量。回复操作栏不提供话题详情入口或摘要弹窗；移除此 UI 不改变服务端话题归档及原文回查能力。原文查询只覆盖已读取、已接收的输入背景；未读取的早期历史不会由该工具自动联网补取。真实租户及跨平台验收状态记录于 `docs/testing/bots-e2e-coverage-matrix.md`。
+实现边界：覆盖范围以已归档消息 ID、当前唤起检查点及 `hasGap` 表示，不推断无法读取区间的消息数量。回复操作栏不提供话题详情入口或摘要弹窗；移除此 UI 不改变服务端话题归档。话题原文只覆盖已读取、已接收的输入背景；未读取的早期历史不会自动联网补取。真实租户及跨平台验收状态记录于 `docs/testing/bots-e2e-coverage-matrix.md`。
 
 ## 明确引用与仅提及（2026-09-08）
 
@@ -656,6 +677,17 @@ modelId 和 options.reasoningLevel；不得从 model 配置菜单或 task.model 
 验收覆盖上述正反场景、多人重复操作、话题隔离、恢复后再次提醒，以及按钮拒绝不修改原卡。
 
 ## 原生 mention 节点与渠道回复（2026-09-23）
+
+2026-10-21 当前入口：ReplyToChannel 的默认注册、Host 默认发送接线和模型调用提示仅注释停用，
+权限、协议、发送实现和测试材料完整保留，未来插件尚未实现。下述主动渠道回复与按名字提及
+不再由默认 Agent 暴露。原生输入节点、分工识别、UI 展示、普通最终回复自动回传继续保留；
+模型分工材料不再携带发送用 refId，原提示源码保留为注释。
+
+```text
+Bot 输入 → 持久化来源 → 模型分工上下文 → 最终回复 → Bot 自动回传
+ReplyToChannel 默认注册 / Host 发送接线 / 模型调用提示：注释停用
+ReplyToChannel handler / 权限 / 协议 / Bot 发送实现：完整保留
+```
 
 本次不增加避让规则。可信飞书 mention 在 BotGroupInputSource.contentParts 中按原顺序保存，
 合批逐条保存；appId 与既有 botId/chatId/threadId/messageId 一起界定应用与会话。
@@ -807,6 +839,7 @@ Provider 使用原生 mentions 和卡片中的有序 at 节点恢复可信 menti
 逐条输入 → 停止屏障 → 全批次有效性判断 → 保留原始消息提交
 原生 mention targetId + 当前 bot openId → isCurrentBot → 模型分工
 ```
+
 当前授权、Host 持久化 owner、CLI 单一 admission、desktop continuous/mobile replayable 不变。
 
 模型身份定位补充：除 mention 清单外，逐条输入投影有序 text/channelMention 节点，

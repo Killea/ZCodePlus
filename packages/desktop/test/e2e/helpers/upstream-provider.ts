@@ -1,4 +1,6 @@
 /* eslint-disable max-lines -- Upstream E2E 初始化包含设置页、provider store、模型选择三段探针，集中维护方便失败诊断 */
+import { selectCombinedComposerThoughtLevel } from "./composer-model-picker.js";
+import { ZCODE_AGENT_PROVIDER, encodeCustomModelValue } from "@zcode/shared";
 import {
   TID_CHAT_MODEL_SELECT_GROUP,
   TID_CHAT_MODEL_SELECT_ITEM,
@@ -15,10 +17,8 @@ import {
   TID_SETTINGS_SECTION_NAV,
   TID_TASK_SETTINGS_BUTTON,
   TID_V4_MODEL_CONFIG,
-  ZCODE_AGENT_PROVIDER,
-  encodeCustomModelValue,
   testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   DEFAULT_WORKSPACE,
   clickTestIdByDom,
@@ -589,6 +589,8 @@ export async function selectUpstreamModelById(
 }
 
 interface SelectUpstreamProviderModelOptions {
+  /** 团队行使用完整连接身份；普通 Provider 默认沿用 registry key。 */
+  providerGroupKey?: string;
   afterModelItemClick?: () => Promise<boolean> | boolean;
   includePlainModelFallback?: boolean;
   providerId?: string;
@@ -602,15 +604,14 @@ export async function selectRegistryProviderModelById(
     includePlainModelFallback = true,
     providerId = UPSTREAM_PROVIDER_ID,
     providerName = UPSTREAM_PROVIDER_NAME,
+    providerGroupKey = `registry-provider:${providerId}`,
   }: SelectUpstreamProviderModelOptions = {},
 ) {
   const modelItemTestIds = getUpstreamProviderModelValues(modelId, {
     includePlainModelFallback,
     providerId,
   }).map((value) => testId(TID_CHAT_MODEL_SELECT_ITEM, value));
-  const providerGroupTestIds = [
-    testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${providerId}`),
-  ];
+  const providerGroupTestIds = [testId(TID_CHAT_MODEL_SELECT_GROUP, providerGroupKey)];
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const trigger = $(sel(TID_CHAT_MODEL_SELECT_TRIGGER));
@@ -684,6 +685,11 @@ export async function selectRegistryProviderModelById(
         includePlainModelFallback,
         providerId,
       });
+      if (
+        (await trigger.getAttribute("data-composer-combined-model")) === "true" &&
+        (await trigger.getAttribute("aria-expanded")) === "true"
+      )
+        await browser.keys("Escape");
     }
 
     await waitForModelSwitchIdle(`${providerName} 模型 ${modelId} 切换持久化没有完成`);
@@ -741,14 +747,17 @@ async function isUpstreamModelSelected(
   return browser.execute(
     (triggerTestId, expectedModel, modelValues) => {
       const trigger = document.querySelector<HTMLElement>(`[data-testid="${triggerTestId}"]`);
-      const currentValue = trigger?.dataset.modelCurrentValue?.trim() ?? "";
+      const rawCurrentValue = trigger?.dataset.modelCurrentValue;
+      const currentValue = rawCurrentValue?.trim() ?? "";
       if (currentValue && modelValues.includes(currentValue)) {
         return true;
       }
       // 修复原因：自定义模型已被选中时，Radix 二级菜单可能只展示 provider 分组，
       // 不再稳定挂载当前模型项。E2E 以工具栏当前选择作为最终语义，避免误判。
-      // 若组件尚未暴露 data-model-current-value，才退回可见文本；新组件优先用严格 value。
-      return !currentValue && (trigger?.innerText ?? "").includes(expectedModel);
+      // 只有组件根本没暴露 data-model-current-value 时才退回可见文本；属性存在但为空串是
+      // 明确的「未选中 / 当前选择已失效」占位态（ModelConfigSelect 始终渲染该属性），此时
+      // 触发器文本仍会显示失效的模型 id，按文本匹配会把「没选中」误判成「已选中」并跳过点击。
+      return rawCurrentValue === undefined && (trigger?.innerText ?? "").includes(expectedModel);
     },
     TID_CHAT_MODEL_SELECT_TRIGGER,
     modelId,
@@ -795,6 +804,10 @@ export async function selectUpstreamThoughtLevelValue(thoughtLevel: string) {
     return;
   }
 
+  if (await selectCombinedComposerThoughtLevel(thoughtLevel)) {
+    await waitForUpstreamThoughtLevelSelectedValue(thoughtLevel);
+    return;
+  }
   await waitForTestIdByDom(TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER, {
     timeout: 45000,
     timeoutMsg: "聊天工具栏没有出现 上游 思考深度选择器",
@@ -1087,6 +1100,14 @@ async function waitForUpstreamProviderSaved(
   );
 }
 
+/** 主模型菜单已打开时，展开真实 Provider 子菜单供候选与选择态断言。 */
+export async function openComposerProviderList() {
+  const trigger = $('[data-testid="composer-provider-trigger"]');
+  await trigger.waitForClickable({ timeout: 15000 });
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
+  await $("[data-composer-provider-list]").waitForDisplayed({ timeout: 15000 });
+}
+
 async function openModelMenuUntilModelVisible(
   providerGroupTestIds: string[],
   modelItemTestIds: string[],
@@ -1095,6 +1116,13 @@ async function openModelMenuUntilModelVisible(
   // 直接展开为模型项列表。用例的语义是“用户能选择目标模型”，不能强绑某一种菜单层级。
   if (await hasAnyExactTestId(modelItemTestIds)) {
     return true;
+  }
+  const combinedProvider = $('[data-testid="composer-provider-trigger"]');
+  if (
+    (await combinedProvider.isExisting()) &&
+    (await combinedProvider.getAttribute("aria-expanded")) !== "true"
+  ) {
+    await combinedProvider.click();
   }
   for (const providerGroupTestId of providerGroupTestIds) {
     if (!(await hasExactTestId(providerGroupTestId))) {

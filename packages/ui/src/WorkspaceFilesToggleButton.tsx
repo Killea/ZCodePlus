@@ -1,4 +1,4 @@
-import { TID_WORKSPACE_FILES_TOGGLE } from "@zcode/shared";
+import { TID_WORKSPACE_FILES_TOGGLE } from "@zcode/shared/test-ids";
 import { FolderTreeIcon } from "lucide-react";
 import { cn } from "@/components/lib/utils.js";
 import { Button } from "@/components/ui/button.js";

@@ -109,11 +109,6 @@ describe("NodeExecutionAdapter", () => {
     const capable = adapter as BashBackgroundLifecycleCapableAdapter;
 
     try {
-      const removedMethodName = ["run", "Backgroundable"].join("");
-      expect(removedMethodName in adapter).toBe(false);
-      expect(capable.runBashWithBackgroundLifecycle).toBeTypeOf("function");
-      expect(capable.waitForBackgroundTask).toBeTypeOf("function");
-
       const result = await capable.runBashWithBackgroundLifecycle!(
         {
           command: {
@@ -618,9 +613,6 @@ describe("NodeExecutionAdapter", () => {
     const capable = adapter as BashBackgroundLifecycleCapableAdapter;
 
     try {
-      expect(capable.runBashWithBackgroundLifecycle).toBeTypeOf("function");
-      expect(capable.waitForBackgroundTask).toBeTypeOf("function");
-
       const result = await capable.runBashWithBackgroundLifecycle!(
         {
           command: {
@@ -661,8 +653,6 @@ describe("NodeExecutionAdapter", () => {
     const capable = adapter as BashBackgroundLifecycleCapableAdapter;
 
     try {
-      expect(capable.runBashWithBackgroundLifecycle).toBeTypeOf("function");
-
       const result = await capable.runBashWithBackgroundLifecycle!(
         {
           command: {
@@ -2721,6 +2711,24 @@ describe("NodeExecutionAdapter", () => {
       file: "C:\\Windows\\System32\\cmd.exe",
       shell: false,
     });
+  });
+
+  it("resolves a Windows command from a quoted PATH entry", () => {
+    const resolved = resolveExecutionCommand(
+      { mode: "argv", file: "pnpm", args: ["install"] },
+      {
+        cwd: "C:\\repo",
+        env: {
+          ComSpec: "C:\\Windows\\System32\\cmd.exe",
+          Path: '"C:\\Program Files\\node tools";C:\\Windows',
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        exists: (path) => path === "C:\\Program Files\\node tools\\pnpm.cmd",
+        platform: "win32",
+      },
+    );
+
+    expect(resolved.args.at(-1)).toBe('"C:\\Program Files\\node tools\\pnpm.cmd" install');
   });
 
   it("keeps Windows .exe argv commands shell-free after PATH resolution", () => {

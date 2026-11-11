@@ -20,11 +20,13 @@ import type {
   TurnStartedPayload,
 } from "@zcode/contracts";
 import { getModelUsageTotalTokens, SessionEventType } from "@zcode/contracts";
-import { parseAutomationRunId } from "@zcode/shared";
+import { parseAutomationRunId, sanitizeTelemetrySkillName } from "@zcode/shared";
 import { workflowLifecycleFactFromProgress } from "./conversation-telemetry-workflow-facts.js";
 import {
   conversationTelemetryFactSchema,
+  modelRequestMetricsFactSchema,
   type ConversationTelemetryFact,
+  type ModelRequestMetricsFact,
 } from "@zcode/shared/zcode-protocol-v4";
 
 const MAX_TRACKED_LIFECYCLE_KEYS = 2_000;
@@ -108,7 +110,11 @@ function skillTelemetryFactFields(
   const qualifiedName = optionalString(value.qualifiedName);
   const pluginId = optionalString(value.pluginId);
   const source = optionalString(value.source);
+  // 仅消费加载结果 metadata；请求参数不证明技能存在，不能进入遥测。
+  const name =
+    source && value.name !== undefined ? sanitizeTelemetrySkillName(value.name) : undefined;
   return {
+    ...(name ? { skillName: name } : {}),
     ...(qualifiedName ? { skillQualifiedName: qualifiedName } : {}),
     ...(pluginId ? { skillPluginId: pluginId } : {}),
     ...(source ? { skillSource: source } : {}),
@@ -157,6 +163,28 @@ function eventTimestamp(event: SessionEvent): number {
   const value =
     event.timestamp instanceof Date ? event.timestamp.getTime() : Number(event.timestamp);
   return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function factBase(
+  sessionId: string,
+  event: SessionEvent,
+  runtimeMetadata: { memoryEnabled?: boolean } | undefined,
+) {
+  const turnId = event.turnId ? String(event.turnId) : undefined;
+  return {
+    turnKey: turnId ? `${sessionId}\0${turnId}` : undefined,
+    base: {
+      ...(runtimeMetadata?.memoryEnabled !== undefined
+        ? { memoryEnabled: runtimeMetadata.memoryEnabled }
+        : {}),
+      version: 1 as const,
+      eventId: String(event.id),
+      eventSeq: Math.max(0, Math.floor(event.sequenceNumber)),
+      occurredAt: eventTimestamp(event),
+      sessionId,
+      ...(turnId ? { turnId } : {}),
+    },
+  };
 }
 
 function automationAdmission(inputId: string | undefined, automationId: string | undefined) {
@@ -300,24 +328,55 @@ export class ConversationTelemetryFactNormalizer {
   }>();
   private readonly completedModelRequests = new BoundedValueMap<CompletedModelRequestIdentity[]>();
 
+  /**
+   * 模型请求指标：只由 `model_request_completed` 产生，供扩展进程算生成速率。
+   * 走独立通知，不进 ConversationTelemetryFact（docs/monitoring/conversation-telemetry-v4.md「模型请求指标」）。
+   * 必须在同一事件的 normalize 之后调用，sourceCommandId 依赖 normalize 记下的轮次输入。
+   */
+  normalizeModelRequestMetrics(
+    sessionId: string,
+    event: SessionEvent,
+    runtimeMetadata?: { memoryEnabled?: boolean },
+  ): ModelRequestMetricsFact | null {
+    if (event.type !== SessionEventType.ModelNetworkStatus) return null;
+    const payload = event.payload as ModelNetworkStatusPayload;
+    if (payload.type !== "model_request_completed") return null;
+    const { base, turnKey } = factBase(sessionId, event, runtimeMetadata);
+    const sourceCommandId = turnKey ? this.sourceCommandByTurn.get(turnKey) : undefined;
+    const usage = recordValue(payload.usage);
+    const token = (value: unknown) => nonNegative(value);
+    const usageFields = {
+      inputTokens: token(usage.inputTokens),
+      outputTokens: token(usage.outputTokens),
+      reasoningTokens: token(usage.reasoningTokens),
+      cacheReadTokens: token(usage.cacheReadTokens),
+      cacheWriteTokens: token(usage.cacheWriteTokens),
+      totalTokens: token(usage.totalTokens),
+    };
+    return modelRequestMetricsFactSchema.parse({
+      ...base,
+      kind: "model.request.metrics",
+      ...(sourceCommandId ? { sourceCommandId } : {}),
+      requestId: String(payload.requestId),
+      providerId: String(payload.providerId),
+      modelId: String(payload.modelId),
+      ...(payload.querySource ? { querySource: payload.querySource } : {}),
+      ...(payload.queryId ? { queryId: String(payload.queryId) } : {}),
+      durationMs: nonNegative(payload.durationMs) ?? 0,
+      ...(nonNegative(payload.timeToFirstContentMs) !== undefined
+        ? { timeToFirstContentMs: payload.timeToFirstContentMs }
+        : {}),
+      ...Object.fromEntries(Object.entries(usageFields).filter(([, value]) => value !== undefined)),
+    });
+  }
+
   normalize(
     sessionId: string,
     event: SessionEvent,
     runtimeMetadata?: { modelName?: string; modelProvider?: string; memoryEnabled?: boolean },
   ): ConversationTelemetryFact | null {
     const turnId = event.turnId ? String(event.turnId) : undefined;
-    const turnKey = turnId ? `${sessionId}\0${turnId}` : undefined;
-    const base = {
-      ...(runtimeMetadata?.memoryEnabled !== undefined
-        ? { memoryEnabled: runtimeMetadata.memoryEnabled }
-        : {}),
-      version: 1 as const,
-      eventId: String(event.id),
-      eventSeq: Math.max(0, Math.floor(event.sequenceNumber)),
-      occurredAt: eventTimestamp(event),
-      sessionId,
-      ...(turnId ? { turnId } : {}),
-    };
+    const { base, turnKey } = factBase(sessionId, event, runtimeMetadata);
     const sourceCommandId = turnKey ? this.sourceCommandByTurn.get(turnKey) : undefined;
 
     switch (event.type) {
@@ -335,6 +394,13 @@ export class ConversationTelemetryFactNormalizer {
         return conversationTelemetryFactSchema.parse({
           ...base,
           kind: "turn.started",
+          ...((payload.intent?.inputOrigin ?? payload.inputOrigin)
+            ? { inputOrigin: payload.intent?.inputOrigin ?? payload.inputOrigin }
+            : {}),
+          ...(runtimeMetadata?.modelName ? { modelName: runtimeMetadata.modelName } : {}),
+          ...(runtimeMetadata?.modelProvider
+            ? { modelProvider: runtimeMetadata.modelProvider }
+            : {}),
           ...(inputId ? { sourceCommandId: inputId } : {}),
           ...automationAdmission(inputId, optionalString(payload.automationId)),
           ...(optionalString(payload.offPeakTaskId)
@@ -512,6 +578,9 @@ export class ConversationTelemetryFactNormalizer {
             : {}),
           ...(result?.result.error ? { errorMessage: result.result.error.message } : {}),
           ...skillTelemetryFactFields(toolName, error?.skillMetadata ?? result?.skillMetadata),
+          ...((error?.pluginId ?? result?.pluginId)
+            ? { pluginId: error?.pluginId ?? result?.pluginId, pluginComponent: "mcp" }
+            : {}),
           // subagent mirror 把父子关联放在工具事件 payload 顶层，旧 normalizer
           // 只读取 result.display，导致 agent_id 等字段在进入 agent_step 前被静默丢弃。
           ...mirroredSubagentToolFields(rawPayload, display),

@@ -1,13 +1,20 @@
 {
   "version": 1,
   "caseName": "conversation-session-model-provider-settings-transition",
-  "spec": "./test/e2e/conversation-session/conversation-session-model-provider-settings-transition.test.ts",
+  "spec": "./test/e2e/conversation-session/models/conversation-session-model-provider-settings-transition.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-model-provider-settings-transition.json"
   ],
   "fileFixtures": [],
   "requests": [
+    {
+      "id": "model-provider-transition-title",
+      "kind": "common",
+      "timingPolicy": "fast-text",
+      "source": "synthetic",
+      "syntheticReason": "标题生成不属于设置页往返的模型选择语义，但首发后的请求必须完整回放。"
+    },
     {
       "id": "model-provider-transition-s01",
       "kind": "main",

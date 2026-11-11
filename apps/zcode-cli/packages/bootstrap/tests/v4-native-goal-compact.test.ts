@@ -81,6 +81,73 @@ async function settle() {
 }
 
 describe("v4 原生 compact", () => {
+  it.each([false, true])("compact 固定提交的 B：busy=%s", async (busy) => {
+    const modelSelection = { providerId: "provider-b", modelId: "model-b" };
+    const app = makeApp();
+    const record = makeRecord({
+      app,
+      ...(busy ? { activeAbortController: new AbortController() } : {}),
+    });
+    await new V4CommandExecutor(makeHost(record)).execute(envelope("compact", { modelSelection }));
+    const call = (busy ? app.steerTurn : app.submitPrompt).mock.calls[0];
+    expect(call?.[0]).toBe("/compact");
+    expect(call?.[1]).toMatchObject({
+      intent: { kind: "compact", sourceCommandId: "cmd-1", modelSelection },
+    });
+    expect(call?.[1]?.intent).not.toHaveProperty("mode");
+    expect(call?.[1]?.intent).not.toHaveProperty("planEnabled");
+    await settle();
+  });
+
+  it("旧 compact 在接收时固定 A，后台起跑前切到 C 不改写请求", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    const executing = new V4CommandExecutor(makeHost(record)).execute(envelope("compact", {}));
+    // Selection 在接收时 structuredClone 固定；后台 submitPrompt 之前改模型不能回写进请求。
+    app.getModel.mockReturnValue("provider-c/model-c");
+    await executing;
+    await settle();
+    expect(app.submitPrompt).toHaveBeenCalledWith(
+      "/compact",
+      expect.objectContaining({
+        intent: expect.objectContaining({
+          modelSelection: {
+            providerId: "primary-provider",
+            modelId: "default-model",
+          },
+        }),
+      }),
+    );
+    await settle();
+  });
+
+  it("compact 的 Selection 不在 Worker Registry 时在接纳前拒绝，不进入 Core 建模", async () => {
+    // Bug 根因：体验套餐到期后 Provider 下架，排队/直接的 /compact 仍按会话常驻选择进入 Core，
+    // 以 "Provider Registry 中不存在 Provider" 的 TurnError 结束。现在与 sendText 共用同一份准入。
+    const app = makeApp({ listModels: () => [] });
+    const record = makeRecord({ app });
+    await expect(
+      new V4CommandExecutor(makeHost(record)).execute(
+        envelope("compact", {
+          modelSelection: { providerId: "account:bigmodel-start-plan", modelId: "glm-5" },
+        }),
+      ),
+    ).rejects.toMatchObject({ reasonCode: "modelUnavailable" });
+    expect(app.submitPrompt).not.toHaveBeenCalled();
+    expect(app.steerTurn).not.toHaveBeenCalled();
+    expect(record.activeAbortController).toBeUndefined();
+  });
+
+  it("compact 的 Selection 在 Worker Registry 时放行", async () => {
+    const app = makeApp({
+      listModels: () => [{ ref: { providerId: "primary-provider", modelId: "default-model" } }],
+    });
+    const record = makeRecord({ app });
+    await new V4CommandExecutor(makeHost(record)).execute(envelope("compact", {}));
+    await settle();
+    expect(app.submitPrompt).toHaveBeenCalledWith("/compact", expect.anything());
+  });
+
   it("正路径：后台 submitPrompt('/compact') + 上锁 + ready 边界释放", async () => {
     let finishCompact!: () => void;
     const compactGate = new Promise<Record<string, never>>((resolve) => {
@@ -191,15 +258,20 @@ describe("v4 原生 compact", () => {
   });
 
   it("goal verifier busy routing：即使没有 steerable active turn，也进入 deferred FIFO", async () => {
+    const modelSelection = { providerId: "provider-b", modelId: "model-b" };
     const enqueueDeferredInput = vi.fn().mockResolvedValue({ kind: "queued" });
     const app = makeApp({ enqueueDeferredInput });
     const record = makeRecord({ app });
     await new V4CommandExecutor(
       makeHost(record, { getInputRoutingMode: vi.fn().mockReturnValue("enqueue") }),
-    ).execute(envelope("compact", {}));
+    ).execute(envelope("compact", { modelSelection }));
     expect(enqueueDeferredInput).toHaveBeenCalledWith(
       "/compact",
-      expect.objectContaining({ commandKind: "compact", delivery: "queue" }),
+      expect.objectContaining({
+        commandKind: "compact",
+        delivery: "queue",
+        intent: expect.objectContaining({ modelSelection }),
+      }),
     );
     expect(app.submitPrompt).not.toHaveBeenCalled();
   });
@@ -323,6 +395,23 @@ describe("v4 原生 sendGoalCommand", () => {
     expect(host.legacyMutations).toEqual(["goal_set", "goal_continuation_completed"]);
   });
 
+  it("set 的 Selection 不在 Worker Registry 时在写目标前拒绝，不改 target、不续跑", async () => {
+    // Bug 根因：目标续跑没有模型准入，Provider 下架后 /goal 先写入目标再在 Core 建模失败。
+    const app = makeApp({ listModels: () => [] });
+    const record = makeRecord({ app });
+    await expect(
+      new V4CommandExecutor(makeHost(record)).execute(
+        envelope("sendGoalCommand", {
+          text: "新目标",
+          modelSelection: { providerId: "account:bigmodel-start-plan", modelId: "glm-5" },
+        }),
+      ),
+    ).rejects.toMatchObject({ reasonCode: "modelUnavailable" });
+    expect(app.setTarget).not.toHaveBeenCalled();
+    expect(app.continueActiveTarget).not.toHaveBeenCalled();
+    expect(record.activeAbortController).toBeUndefined();
+  });
+
   it("重复 set：已有 target 收敛 replace 语义（reason=goal_replaced）", async () => {
     const app = makeApp({
       readTarget: vi
@@ -431,6 +520,24 @@ describe("v4 原生 resumeGoal", () => {
     expect(app.updateTargetStatus).not.toHaveBeenCalled();
     expect(app.continueActiveTarget).not.toHaveBeenCalled();
   });
+  it("会话常驻模型不在 Worker Registry 时拒绝恢复，不改 target 状态", async () => {
+    const app = makeApp({
+      listModels: () => [],
+      runtime: {
+        getActiveTurnInfo: vi.fn().mockReturnValue(undefined),
+        getSessionModelSelection: () => ({
+          providerId: "account:bigmodel-start-plan",
+          modelId: "glm-5",
+        }),
+      },
+    });
+    await expect(
+      new V4CommandExecutor(makeHost(makeRecord({ app }))).execute(envelope("resumeGoal", {})),
+    ).rejects.toMatchObject({ reasonCode: "modelUnavailable" });
+    expect(app.updateTargetStatus).not.toHaveBeenCalled();
+    expect(app.continueActiveTarget).not.toHaveBeenCalled();
+  });
+
   it("正路径：updateTargetStatus(active) + 后台续跑", async () => {
     const app = makeApp();
     const record = makeRecord({ app });
@@ -510,11 +617,8 @@ describe("v4 原生 pauseGoal", () => {
 });
 
 describe("supports 分流（goal/compact 组）", () => {
-  it("compact/sendGoalCommand/pauseGoal/resumeGoal 已原生", () => {
+  it("pauseGoal 已原生", () => {
     const executor = new V4CommandExecutor(makeHost(makeRecord()));
-    expect(executor.supports("compact")).toBe(true);
-    expect(executor.supports("sendGoalCommand")).toBe(true);
     expect(executor.supports("pauseGoal")).toBe(true);
-    expect(executor.supports("resumeGoal")).toBe(true);
   });
 });

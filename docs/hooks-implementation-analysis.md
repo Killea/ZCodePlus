@@ -34,7 +34,7 @@ ZCode hooks **不是单一模块**，分两层，行为可能不一致：
 | `PostToolUseFailure` | tool 失败后                                   | 否                             | `tool/executor/hook-flow.ts`                         |
 | `Stop`               | turn 即将 complete 前                         | 是（可续跑，上限 3 次）        | `runtime/methods/turn-stop.ts`                       |
 
-`SessionStart` 的 `source` matcher 值：`startup | resume | clear | compact`。
+`SessionStart` 的 `source` matcher 值：`startup | resume | fork | clear | compact`（分叉会话在第一条输入之前打开时用 `fork`）。
 
 ---
 
@@ -124,7 +124,7 @@ Hook 触发
 - **stdout**：空输出或非 JSON 文本作为成功 diagnostic；JSON 输出校验已知字段，未知字段忽略
 - **exit code 0**：正常，解析 stdout
 - **exit code 2**：阻断（PreToolUse / PermissionRequest / UserPromptSubmit；Stop 的 continue 语义另算）
-- **其他 exit code**：非阻断错误，记 diagnostic
+- **其他 exit code**：非阻断错误，记 diagnostic；`PreToolUse` Hook 配了 `onError: "deny"` 时按 exit code 2 拦截（见 `docs/hooks-runtime-contract.md`「stdout、退出码与事件效果」）
 
 Claude 兼容输入投影集中在 `configured-runner-input.ts`，避免不同事件分别拼接后产生字段漂移。
 
@@ -248,7 +248,7 @@ Lifecycle additional context 以 `hook_context` attachment 注入 message histor
 | 插件兼容规范           | `docs/plugin-hooks-compat.md`                                                                 |
 | v2 设计 / 验收         | `apps/zcode-cli/docs/design/v2/hooks.md`                                                      |
 | 7 事件合同测试         | `apps/zcode-cli/packages/core/tests/hooks-seven-events.test.ts`                               |
-| 整体桌面 E2E           | `packages/desktop/test/e2e/conversation-session/conversation-session-hooks-lifecycle.test.ts` |
+| 整体桌面 E2E           | `packages/desktop/test/e2e/conversation-session/hooks/conversation-session-hooks-lifecycle.test.ts` |
 
 ---
 
@@ -273,5 +273,5 @@ pnpm exec vitest run packages/services/test/hooksService.test.ts packages/ui/tes
 
 # 整体 7 事件桌面 lifecycle
 pnpm --filter @zcode/desktop exec wdio run wdio.conf.ts \
-  --spec './test/e2e/conversation-session/conversation-session-hooks-lifecycle.test.ts'
+  --spec './test/e2e/conversation-session/hooks/conversation-session-hooks-lifecycle.test.ts'
 ```

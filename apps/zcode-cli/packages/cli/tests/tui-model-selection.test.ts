@@ -161,9 +161,6 @@ test("picker reference survives composer submission and selects the catalog reas
     turnRef: { current: undefined },
     applyResult: noop,
     applySessionEvent: noop,
-    requestPermission: async () => {
-      throw new Error("No permissions requested by model selection");
-    },
     options: {
       submitPrompt: async (input, options) => {
         submitted = input;
@@ -270,6 +267,7 @@ test("TUI persists defaults through the shared repository across new sessions an
     skipUserConfig: true,
     loadDotenv: () => ({ keys: [], loaded: false, path: "" }),
     createZCodeApp: async (options: ZCodeAppOptions) => {
+      assert.equal(options.modelSelectionMode, "cli-default");
       const f = fixture(
         options.resume ? restoredSelection : options.configuredDefaultModelSelection,
       );

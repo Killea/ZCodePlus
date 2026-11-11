@@ -28,7 +28,32 @@ CDD01 已迁入 formal 路径，但单 spec Docker `replay-isolated` 运行
 历史 `conversation-session-admission`、`conversation-session-needs-docker-fix` 和 `conversation-session-tool-cross-product` preset 已删除。需要定位某个 case 时统一使用 `E2E_SPEC` 指定 direct-root spec；只有取得绿色证据后才能用 `e2e:docker:admit` 登记到 verified 集合。
 
 | Spec | 迁移状态 |
-| --- | --- |
+| ---- | -------- |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-amend.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-artifacts.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-compile.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-confirm.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-cross-session.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-english-dark.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-lookup.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-notify.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-overflow.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-questions.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-restart.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-resume.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run-pane-details.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run-permissions.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-run.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-save-from-chat.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-save-window.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-snippet.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-stop.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-transcript.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on-user-choice.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-always-on.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-disabled.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-gray-on-demand.test.ts` | verified |
+| `./test/e2e/conversation-session/workflows/conversation-session-dynamic-workflow-holes.test.ts` | verified |
 <!-- conversation-session-verified-table-end -->
 
 运行入口：
@@ -80,6 +105,9 @@ pnpm --filter @zcode/desktop e2e:docker:admit -- \
 
 `e2e:docker:admit` 会同步 `scripts/test-desktop-e2e-container.sh` 和本文的 suite 表格。
 它只接受正式路径下的 spec；`manual-review/pending` 仍然禁止直接进入 Docker preset。
+表格准入按列结构和结束标记验证，不依赖分隔线的横线数量或标记前的空行。
+新增 verified 行必须与表头和已有行连续，不能被格式化产生的空行隔成表外文本；
+写入保留文档的 LF/CRLF 换行，重复登记同一 spec 不新增行。
 
 ## 历史运行记录（已失效的 legacy 路径）
 
@@ -99,7 +127,7 @@ pnpm --filter @zcode/desktop e2e:docker:admit -- \
 总耗时 3 分 35 秒。
 
 2026-06-24 在 `staging` 上执行
-`E2E_SPEC=./test/e2e/conversation-session/manual-review/pending/conversation-session-running-actions.test.ts pnpm run test:e2e:container`，
+`E2E_SPEC=./test/e2e/conversation-session/execution/conversation-session-running-actions.test.ts pnpm run test:e2e:container`，
 产物目录：`packages/desktop/.e2e-artifacts/desktop-e2e-20260624-110228-90545`。
 
 这次使用当前工作树重建 Docker 镜像后，`conversation-session-running-actions` 单 spec
@@ -113,7 +141,7 @@ pnpm --filter @zcode/desktop e2e:docker:admit -- \
 `conversation-session-running-actions`：9 个通过，0 个失败，WDIO 总耗时 3 分 54 秒。
 
 2026-07-09 在 `feat/markdown-table-inline-scroll` 上执行
-`E2E_SPEC=./test/e2e/conversation-session/conversation-session-markdown-table-enhanced-scroll.test.ts pnpm run test:e2e:container`。
+`E2E_SPEC=./test/e2e/conversation-session/presentation/conversation-session-markdown-table-enhanced-scroll.test.ts pnpm run test:e2e:container`。
 
 这次 Docker 准入没有进入 WDIO replay：镜像构建阶段 `apt-get install` 从 `deb.debian.org`
 拉取多个 Debian 包时持续返回 `400 Bad Request [IP: 198.18.0.158 80]`，build 在

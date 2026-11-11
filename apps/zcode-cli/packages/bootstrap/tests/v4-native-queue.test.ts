@@ -7,6 +7,8 @@ import { SessionEventType, type SessionEvent } from "@zcode/contracts";
 import type { CommandEnvelope, QueueItem } from "@zcode/shared/zcode-protocol-v4";
 import { V4CommandExecutor } from "../src/zcode-protocol-v4/commands/executor.js";
 import {
+  V4QueueEditLockLostError,
+  V4QueueItemEditLockedError,
   V4QueueItemTextUnavailableError,
   V4QueueItemReservedError,
   V4QueueItemNotEditableError,
@@ -14,6 +16,7 @@ import {
 } from "../src/zcode-protocol-v4/commands/handlers/queue.js";
 import { V4CommandNoopError } from "../src/zcode-protocol-v4/index.js";
 import { shouldAutoDrainV4QueueHead } from "../src/zcode-protocol-v4/queue-auto-drain.js";
+import { computeInputRouting } from "../src/zcode-protocol-v4/projection-state.js";
 import type {
   V4CommandCoreHost,
   V4SessionRecordView,
@@ -53,7 +56,9 @@ function makeApp(overrides: Record<string, unknown> = {}) {
     markQueueItemPromoting: vi.fn().mockResolvedValue(true),
     releaseQueueItemReservation: vi.fn().mockResolvedValue(true),
     removeQueueItem: vi.fn().mockResolvedValue(true),
-    editQueueItem: vi.fn().mockResolvedValue(true),
+    editQueueItem: vi.fn().mockResolvedValue("edited"),
+    lockQueueItemEdit: vi.fn().mockResolvedValue("locked"),
+    releaseQueueItemEdit: vi.fn().mockResolvedValue(true),
     reorderQueueItem: vi.fn().mockResolvedValue(true),
     setQueueAutoDrain: vi.fn().mockResolvedValue(undefined),
     setFollowupMode: vi.fn().mockResolvedValue(undefined),
@@ -82,6 +87,11 @@ function makeApp(overrides: Record<string, unknown> = {}) {
  * 加速轮的协议原形：Selection 指向隐藏的加速卡内建 Provider（端点/能力来自 Provider Config），
  * 只有卡 JWT 与卡 ID 作为本次执行的动态鉴权随 modelExecution 下发。
  */
+const ORDINARY_MODEL_SELECTION = {
+  providerId: "builtin:bigmodel-coding-plan",
+  modelId: "GLM-5.3",
+};
+
 const HIGHSPEED_MODEL_SELECTION = {
   providerId: "account:bigmodel-highspeed-card",
   modelId: "GLM-5.3",
@@ -95,11 +105,17 @@ const HIGHSPEED_MODEL_EXECUTION = {
   },
   selectionFallback: {
     providerId: "account:bigmodel-highspeed-card",
+    target: ORDINARY_MODEL_SELECTION,
     rules: [
       { reason: "highspeed_card_expired" as const, providerErrorCode: "3402" },
       { reason: "highspeed_request_failed" as const },
     ],
   },
+};
+
+const HIGHSPEED_QUEUED_EXECUTION = {
+  modelSelection: HIGHSPEED_MODEL_SELECTION,
+  modelExecution: HIGHSPEED_MODEL_EXECUTION,
 };
 
 function queueItem(overrides: Partial<QueueItem> = {}): QueueItem {
@@ -252,7 +268,192 @@ describe("v4 原生 queue 单项命令", () => {
     await new V4CommandExecutor(makeHost(record)).execute(
       envelope("editQueueItem", { queueItemId: "q-1", newText: "改后文本" }),
     );
-    expect(app.editQueueItem).toHaveBeenCalledWith("q-1", "改后文本");
+    expect(app.editQueueItem).toHaveBeenCalledWith("q-1", "改后文本", {});
+  });
+
+  it("editQueueItem：composer 编辑态写回附件与配置，并携带 editorId 由同一调用释放锁", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    const deleteQueuedTurnExecution = vi.fn();
+    const host = makeHost(record, {
+      getQueueItem: vi.fn().mockReturnValue(queueItem()),
+      deleteQueuedTurnExecution,
+    });
+    const attachments = [
+      { ref: "artifact://new", fileName: "new.png", mime: "image/png", bytes: 3 },
+    ];
+    const modelSelection = { providerId: "provider-edit", modelId: "model-edit" };
+    await new V4CommandExecutor(host).execute(
+      envelope("editQueueItem", {
+        queueItemId: "q-1",
+        newText: "改后文本",
+        editorId: "editor-a",
+        attachments,
+        modelSelection,
+        mode: "yolo",
+        planEnabled: true,
+      }),
+    );
+    expect(app.editQueueItem).toHaveBeenCalledWith(
+      "q-1",
+      "改后文本",
+      expect.objectContaining({
+        editorId: "editor-a",
+        attachmentRefs: attachments,
+        modelSelection,
+        mode: "yolo",
+        planEnabled: true,
+        // 用户改了模型：入队时冻结的 Highspeed 卡与暂存凭据不能再覆盖新选择。
+        dropHighspeed: true,
+      }),
+    );
+    expect(deleteQueuedTurnExecution).toHaveBeenCalledWith("s1", "source-command-q1");
+  });
+
+  it("editQueueItem：锁已不属于本编辑器或项被他人冻结时拒绝，未命中返回 noop", async () => {
+    for (const [result, expected] of [
+      ["lockLost", V4QueueEditLockLostError],
+      ["editLocked", V4QueueItemEditLockedError],
+      ["missing", V4CommandNoopError],
+    ] as const) {
+      const app = makeApp({ editQueueItem: vi.fn().mockResolvedValue(result) });
+      const record = makeRecord({ app });
+      await expect(
+        new V4CommandExecutor(makeHost(record)).execute(
+          envelope("editQueueItem", { queueItemId: "q-1", newText: "x", editorId: "editor-a" }),
+        ),
+      ).rejects.toBeInstanceOf(expected);
+    }
+  });
+
+  it("applyQueueItemsConfig：只改仍可改写的排队项的模型/mode，正文不变，其余跳过", async () => {
+    const editQueueItem = vi
+      .fn()
+      .mockImplementation(async (id: string) => (id === "q-locked" ? "editLocked" : "edited"));
+    const app = makeApp({ editQueueItem });
+    const record = makeRecord({ app });
+    const items: Record<string, QueueItem> = {
+      "q-1": queueItem(),
+      "q-reserved": queueItem({
+        queueItemId: "q-reserved",
+        dispatch: { state: "reserved" } as QueueItem["dispatch"],
+      }),
+      "q-compact": queueItem({ queueItemId: "q-compact", kind: "compact", text: "/compact" }),
+      "q-locked": queueItem({ queueItemId: "q-locked", sourceCommandId: "source-locked" }),
+    };
+    const deleteQueuedTurnExecution = vi.fn();
+    const host = makeHost(record, {
+      getQueueItem: vi.fn().mockImplementation((_s: string, id: string) => items[id] ?? null),
+      deleteQueuedTurnExecution,
+    });
+    const modelSelection = { providerId: "provider-edit", modelId: "model-edit" };
+    await new V4CommandExecutor(host).execute(
+      envelope("applyQueueItemsConfig", {
+        queueItemIds: ["q-1", "q-missing", "q-reserved", "q-compact", "q-locked"],
+        modelSelection,
+        mode: "yolo",
+      }),
+    );
+    // 正文缺省 = core 保留原输入：投影 text 经过 genUi 归一化，写回会丢上下文。
+    expect(editQueueItem).toHaveBeenCalledWith("q-1", undefined, {
+      modelSelection,
+      mode: "yolo",
+      dropHighspeed: true,
+    });
+    expect(editQueueItem).toHaveBeenCalledTimes(2);
+    expect(editQueueItem).toHaveBeenCalledWith("q-locked", undefined, expect.anything());
+    expect(deleteQueuedTurnExecution).toHaveBeenCalledTimes(1);
+    expect(deleteQueuedTurnExecution).toHaveBeenCalledWith("s1", "source-command-q1");
+  });
+
+  it("applyQueueItemsConfig：只改 mode 时不动模型与 Highspeed；一项都没改到返回 noop", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    const deleteQueuedTurnExecution = vi.fn();
+    const host = makeHost(record, {
+      getQueueItem: vi.fn().mockReturnValue(queueItem()),
+      deleteQueuedTurnExecution,
+    });
+    await new V4CommandExecutor(host).execute(
+      envelope("applyQueueItemsConfig", { queueItemIds: ["q-1"], mode: "yolo" }),
+    );
+    expect(app.editQueueItem).toHaveBeenCalledWith("q-1", undefined, { mode: "yolo" });
+    expect(deleteQueuedTurnExecution).not.toHaveBeenCalled();
+
+    const missingHost = makeHost(makeRecord({ app: makeApp() }), {
+      getQueueItem: vi.fn().mockReturnValue(null),
+    });
+    await expect(
+      new V4CommandExecutor(missingHost).execute(
+        envelope("applyQueueItemsConfig", { queueItemIds: ["q-1"], mode: "yolo" }),
+      ),
+    ).rejects.toBeInstanceOf(V4CommandNoopError);
+  });
+
+  it("lockQueueItemEdit：锁归属取 editorId + 信封 clientId，结果映射为可判别的 guard", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    await new V4CommandExecutor(makeHost(record)).execute({
+      ...envelope("lockQueueItemEdit", { queueItemId: "q-1", editorId: "editor-a" }),
+      clientId: "client-a",
+      inputOrigin: "mobile",
+    });
+    expect(app.lockQueueItemEdit).toHaveBeenCalledWith("q-1", {
+      editorId: "editor-a",
+      clientId: "client-a",
+      inputOrigin: "mobile",
+    });
+    for (const [result, expected] of [
+      ["reserved", V4QueueItemReservedError],
+      ["lockedByOther", V4QueueItemEditLockedError],
+      ["missing", V4CommandNoopError],
+    ] as const) {
+      const failing = makeApp({ lockQueueItemEdit: vi.fn().mockResolvedValue(result) });
+      await expect(
+        new V4CommandExecutor(makeHost(makeRecord({ app: failing }))).execute(
+          envelope("lockQueueItemEdit", { queueItemId: "q-1", editorId: "editor-a" }),
+        ),
+      ).rejects.toBeInstanceOf(expected);
+    }
+  });
+
+  it("releaseQueueItemEdit：解锁后重评自动续跑；无锁返回 noop", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    const afterLegacyStateMutation = vi.fn().mockResolvedValue(undefined);
+    await new V4CommandExecutor(makeHost(record, { afterLegacyStateMutation })).execute(
+      envelope("releaseQueueItemEdit", { queueItemId: "q-1" }),
+    );
+    expect(app.releaseQueueItemEdit).toHaveBeenCalledWith("q-1");
+    expect(afterLegacyStateMutation).toHaveBeenCalledWith(record, "queue_edit_lock_released");
+    const unlocked = makeApp({ releaseQueueItemEdit: vi.fn().mockResolvedValue(false) });
+    await expect(
+      new V4CommandExecutor(makeHost(makeRecord({ app: unlocked }))).execute(
+        envelope("releaseQueueItemEdit", { queueItemId: "q-1" }),
+      ),
+    ).rejects.toBeInstanceOf(V4CommandNoopError);
+  });
+
+  it("冻结项：删除、重排与立即发送都返回 guard.queueItemEditLocked，且不触碰 core", async () => {
+    const lock = { editorId: "editor-a", clientId: "desktop" };
+    const app = makeApp({ runtime: { getPendingInputEditLock: vi.fn(() => lock) } });
+    const record = makeRecord({ app });
+    const host = makeHost(record, { getQueueItem: vi.fn().mockReturnValue(queueItem()) });
+    const executor = new V4CommandExecutor(host);
+    await expect(
+      executor.execute(envelope("deleteQueueItem", { queueItemId: "q-1" })),
+    ).rejects.toBeInstanceOf(V4QueueItemEditLockedError);
+    await expect(
+      executor.execute(
+        envelope("reorderQueueItem", { queueItemId: "q-1", beforeQueueItemId: null }),
+      ),
+    ).rejects.toBeInstanceOf(V4QueueItemEditLockedError);
+    await expect(
+      executor.execute(envelope("sendQueuedNow", { queueItemId: "q-1" })),
+    ).rejects.toBeInstanceOf(V4QueueItemEditLockedError);
+    expect(app.removeQueueItem).not.toHaveBeenCalled();
+    expect(app.reorderQueueItem).not.toHaveBeenCalled();
+    expect(app.reserveQueueItem).not.toHaveBeenCalled();
   });
 
   it("editQueueItem：typed compact 不可编辑，避免 kind 与可见文本分裂", async () => {
@@ -348,6 +549,59 @@ describe("v4 普通 queue 自动消费 goal gate", () => {
   );
 });
 
+describe("v4 queue 冻结编辑（composer 编辑态）", () => {
+  it("队首冻结时自动续跑停住，后面的项保持等待", () => {
+    expect(
+      shouldAutoDrainV4QueueHead({
+        autoDrain: true,
+        dispatchState: "queued",
+        editLocked: true,
+        sessionBusy: false,
+        targetStatus: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("队首冻结且自动续跑开启时，空闲态新输入排到队尾，不 startNow 越过冻结项", () => {
+    const context = {
+      phase: "completedSuccess" as const,
+      goalStatus: null,
+      compacting: false,
+      goalVerifying: false,
+      queueLength: 2,
+      autoDrain: true,
+      queueHeadEditLocked: true,
+    };
+    expect(computeInputRouting(context, "queue")).toEqual({
+      mode: "enqueue",
+      reasonCode: "queueHeadEditLocked",
+    });
+    // autoDrain=false 仍是暂停队列的选择语义，不被冻结改写。
+    expect(computeInputRouting({ ...context, autoDrain: false }, "queue").mode).toBe("choice");
+  });
+
+  it("sendText：队首冻结时强制进入 FIFO，即使 Core 空闲", async () => {
+    const app = makeApp();
+    const record = makeRecord({ app });
+    const host = makeHost(record, {
+      getInputRoutingMode: () => "enqueue",
+      isQueueHeadEditLocked: () => true,
+    });
+    await new V4CommandExecutor(host).execute(
+      envelope("sendText", {
+        text: "新输入",
+        modelSelection: { providerId: "provider-a", modelId: "model-a" },
+        mode: "build",
+        planEnabled: false,
+      }),
+    );
+    expect(app.sendInput).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "新输入" }),
+      expect.objectContaining({ requireQueue: true }),
+    );
+  });
+});
+
 describe("v4 原生 sendQueuedNow", () => {
   it("Highspeed queue 在卡仍有效时于提升边界应用单轮执行材料", async () => {
     const app = makeApp();
@@ -356,8 +610,8 @@ describe("v4 原生 sendQueuedNow", () => {
     const host = makeHost(record, {
       getQueueItem: vi.fn().mockReturnValue(
         queueItem({
-          // 加速卡的 Selection 随队列项持久化；凭据不入队列面，只在 CLI 内存按 sourceCommandId 暂存。
-          modelSelection: HIGHSPEED_MODEL_SELECTION,
+          // 队列持久化普通提交模型；临时 Highspeed Selection 与凭据只在 CLI 内存暂存。
+          modelSelection: ORDINARY_MODEL_SELECTION,
           highspeed: {
             schemaVersion: 1,
             cardId: "card-1",
@@ -369,7 +623,7 @@ describe("v4 原生 sendQueuedNow", () => {
           },
         }),
       ),
-      readQueuedTurnExecution: vi.fn().mockReturnValue(HIGHSPEED_MODEL_EXECUTION),
+      readQueuedTurnExecution: vi.fn().mockReturnValue(HIGHSPEED_QUEUED_EXECUTION),
       deleteQueuedTurnExecution,
     });
 
@@ -391,6 +645,7 @@ describe("v4 原生 sendQueuedNow", () => {
     await expect(
       sendOptions.modelExecution.requestDependencies.requestAuth.source.resolve(),
     ).resolves.toEqual(HIGHSPEED_MODEL_EXECUTION.requestAuth);
+    expect(sendOptions.modelExecution.selectionFallback?.target).toEqual(ORDINARY_MODEL_SELECTION);
     // 凭据已冻结进本轮，暂存副本立即销毁，避免同一张卡被后续队列项复用。
     expect(deleteQueuedTurnExecution).toHaveBeenCalledWith("s1", "source-command-q1");
   });
@@ -418,7 +673,7 @@ describe("v4 原生 sendQueuedNow", () => {
       getQueueItem: vi
         .fn()
         .mockReturnValue(
-          queueItem({ highspeed: highspeedMeta, modelSelection: HIGHSPEED_MODEL_SELECTION }),
+          queueItem({ highspeed: highspeedMeta, modelSelection: ORDINARY_MODEL_SELECTION }),
         ),
       readQueuedTurnExecution: vi.fn().mockReturnValue(undefined),
     });
@@ -448,7 +703,7 @@ describe("v4 原生 sendQueuedNow", () => {
     ).resolves.toEqual(refreshedExecution.requestAuth);
   });
 
-  it("Highspeed queue 提升时卡已过期则去掉加速标记并使用 session 模型", async () => {
+  it("Highspeed queue 提升时卡已过期则去掉加速标记并使用队列项普通模型", async () => {
     const sessionSelection = {
       providerId: "builtin:bigmodel-team-coding-plan",
       modelId: "GLM-5.3",
@@ -461,7 +716,7 @@ describe("v4 原生 sendQueuedNow", () => {
     const host = makeHost(record, {
       getQueueItem: vi.fn().mockReturnValue(
         queueItem({
-          modelSelection: HIGHSPEED_MODEL_SELECTION,
+          modelSelection: ORDINARY_MODEL_SELECTION,
           highspeed: {
             schemaVersion: 1,
             cardId: "expired-card",
@@ -473,7 +728,7 @@ describe("v4 原生 sendQueuedNow", () => {
           },
         }),
       ),
-      readQueuedTurnExecution: vi.fn().mockReturnValue(HIGHSPEED_MODEL_EXECUTION),
+      readQueuedTurnExecution: vi.fn().mockReturnValue(HIGHSPEED_QUEUED_EXECUTION),
       deleteQueuedTurnExecution,
     });
 
@@ -482,9 +737,46 @@ describe("v4 原生 sendQueuedNow", () => {
     const sendOptions = app.sendInput.mock.calls[0]?.[1];
     expect(sendOptions?.modelExecution).toBeUndefined();
     expect(sendOptions?.intent?.highspeed).toBeUndefined();
-    // 退回必须同时改写 Selection：只删卡标记会让本轮带着加速 provider 却没有任何凭据。
-    expect(sendOptions?.intent?.modelSelection).toEqual(sessionSelection);
+    // 队列项是发送时快照；降级不得回看之后可能已变化的 Session 模型。
+    expect(sendOptions?.intent?.modelSelection).toEqual(ORDINARY_MODEL_SELECTION);
+    expect(sendOptions?.intent?.modelSelection).not.toEqual(sessionSelection);
     expect(deleteQueuedTurnExecution).toHaveBeenCalledWith("s1", "source-command-q1");
+  });
+
+  it("旧队列把 Highspeed Provider 持久化且 execution 缺失时迁移回会话普通模型", async () => {
+    const sessionSelection = {
+      providerId: "builtin:bigmodel-team-coding-plan",
+      modelId: "GLM-5.3",
+    };
+    const app = makeApp({
+      runtime: { getSessionModelSelection: vi.fn().mockReturnValue(sessionSelection) },
+    });
+    const record = makeRecord({ app });
+    const host = makeHost(record, {
+      getQueueItem: vi.fn().mockReturnValue(
+        queueItem({
+          modelSelection: HIGHSPEED_MODEL_SELECTION,
+          highspeed: {
+            schemaVersion: 1,
+            cardId: "legacy-card",
+            taskId: "s1",
+            provider: "bigmodel",
+            model: "GLM-5.3",
+            issuedAt: 1,
+            expiresAt: Date.now() + 60_000,
+          },
+        }),
+      ),
+      readQueuedTurnExecution: vi.fn().mockReturnValue(undefined),
+    });
+
+    await new V4CommandExecutor(host).execute(envelope("sendQueuedNow", { queueItemId: "q-1" }));
+
+    const sendOptions = app.sendInput.mock.calls[0]?.[1];
+    expect(sendOptions?.modelExecution).toBeUndefined();
+    expect(sendOptions?.intent?.highspeed).toBeUndefined();
+    expect(sendOptions?.intent?.modelSelection).toEqual(sessionSelection);
+    expect(sendOptions?.intent?.modelSelection).not.toEqual(HIGHSPEED_MODEL_SELECTION);
   });
 
   it("promotes quote-only input with its original sender metadata", async () => {
@@ -546,7 +838,7 @@ describe("v4 原生 sendQueuedNow", () => {
     },
   );
 
-  it("软门禁:TurnStarted projection commit 后直接 promoted/remove(不再等 review ACK)", async () => {
+  it("Core admission 后直接 promoted/remove，不等待 turn completion", async () => {
     const turnGate = deferred<void>();
     const app = makeApp({
       sendInput: vi.fn().mockResolvedValue({
@@ -560,7 +852,7 @@ describe("v4 原生 sendQueuedNow", () => {
 
     await new V4CommandExecutor(host).execute(envelope("sendQueuedNow", { queueItemId: "q-1" }));
 
-    // 软门禁:TurnStarted commit 后 queue item 直接 promoted/remove
+    // Core admission 完成后就移除队列项，不等待后台 turn 结束。
     expect(app.removeQueueItem).toHaveBeenCalledWith(
       "q-1",
       expect.objectContaining({ reason: "promoted", reservationId: "cmd-q1" }),
@@ -646,41 +938,54 @@ describe("v4 原生 sendQueuedNow", () => {
     );
   });
 
-  it("compact queue item：sendQueuedNow 走手动 compact path，不作为普通 prompt 重发", async () => {
-    let finishCompact!: () => void;
-    const compactGate = new Promise<Record<string, never>>((resolve) => {
-      finishCompact = () => resolve({});
-    });
-    const app = makeApp({ submitPrompt: vi.fn().mockReturnValue(compactGate) });
-    const record = makeRecord({ app });
-    const host = makeHost(record, {
-      getQueueItem: vi.fn().mockReturnValue(
-        queueItem({
-          queueItemId: "q-compact",
-          sourceCommandId: "source-compact",
-          kind: "compact",
-          text: "/compact",
-          attachments: [],
+  it.each([false, true])(
+    "compact queue item：提升保留原选择，autoDrain=%s",
+    async (autoDrainPromotion) => {
+      let finishCompact!: () => void;
+      const compactGate = new Promise<Record<string, never>>((resolve) => {
+        finishCompact = () => resolve({});
+      });
+      const app = makeApp({ submitPrompt: vi.fn().mockReturnValue(compactGate) });
+      const record = makeRecord({ app });
+      const host = makeHost(record, {
+        getQueueItem: vi.fn().mockReturnValue(
+          queueItem({
+            queueItemId: "q-compact",
+            sourceCommandId: "source-compact",
+            kind: "compact",
+            text: "/compact",
+            attachments: [],
+          }),
+        ),
+        recordPersistentCommandFact: vi.fn().mockResolvedValue(undefined),
+      });
+      await new V4CommandExecutor(host).execute(
+        Object.assign(envelope("sendQueuedNow", { queueItemId: "q-compact" }), {
+          __v4ExecutionContext: autoDrainPromotion ? { autoDrainPromotion: true } : undefined,
         }),
-      ),
-      recordPersistentCommandFact: vi.fn().mockResolvedValue(undefined),
-    });
-    await new V4CommandExecutor(host).execute(
-      envelope("sendQueuedNow", { queueItemId: "q-compact" }),
-    );
-    expect(app.submitPrompt).toHaveBeenCalledWith(
-      "/compact",
-      expect.objectContaining({ inputId: "source-compact" }),
-    );
-    expect(app.sendInput).not.toHaveBeenCalled();
-    expect(app.removeQueueItem).toHaveBeenCalledWith(
-      "q-compact",
-      expect.objectContaining({ reason: "promoted", reservationId: "cmd-q1" }),
-    );
-    expect(host.legacyMutations).toContain("queue_compact_promoted");
-    finishCompact();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
+      );
+      expect(app.submitPrompt).toHaveBeenCalledWith(
+        "/compact",
+        expect.objectContaining({
+          inputId: "source-compact",
+          intent: expect.objectContaining({
+            sourceCommandId: "source-compact",
+            queueItemId: "q-compact",
+            admissionSeq: 7,
+            modelSelection: queueItem().modelSelection,
+          }),
+        }),
+      );
+      expect(app.sendInput).not.toHaveBeenCalled();
+      expect(app.removeQueueItem).toHaveBeenCalledWith(
+        "q-compact",
+        expect.objectContaining({ reason: "promoted", reservationId: "cmd-q1" }),
+      );
+      expect(host.legacyMutations).toContain("queue_compact_promoted");
+      finishCompact();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+  );
 
   it("运行中会话：stop（只 abort 不 await）→ 轮询等 finally 释放锁 → 重发", async () => {
     const calls: string[] = [];
@@ -716,14 +1021,52 @@ describe("v4 原生 sendQueuedNow", () => {
     );
   });
 
+  it("automation queue 提升时回放可信身份，并在该 turn 结束后清理", async () => {
+    const completion = deferred<unknown>();
+    const app = makeApp({
+      sendInput: vi.fn().mockImplementation(async (_input, options) => {
+        options?.onTurnStartedObserved?.({
+          id: "event-automation-queue-turn-started",
+          type: SessionEventType.TurnStarted,
+          payload: { messageId: "msg-automation-queue-turn-started" },
+        });
+        return {
+          completion: completion.promise,
+          kind: "started_turn",
+          turnId: "turn-automation-queued",
+        };
+      }),
+    });
+    const record = makeRecord({ app });
+    const item = queueItem({ attachments: [], automationId: "automation-queued" });
+
+    await new V4CommandExecutor(makeHost(record, { getQueueItem: () => item })).execute(
+      envelope("sendQueuedNow", { queueItemId: item.queueItemId }),
+    );
+
+    expect(app.sendInput).toHaveBeenCalledWith(
+      expect.objectContaining({ text: item.text }),
+      expect.objectContaining({
+        automationId: "automation-queued",
+        inputId: item.sourceCommandId,
+        requireIdle: true,
+      }),
+    );
+    expect(record.activeAutomationId).toBe("automation-queued");
+
+    completion.resolve({});
+    await flushDetachedWork();
+    expect(record.activeAutomationId).toBeUndefined();
+  });
+
+  // 手动提升实际抢占旧执行时，被点文本同样是普通用户消息，与自动 drain 相同。
   it.each([
-    { stopKind: "stopped", withAttachment: false, autoDrain: false, expected: "user_steer" },
-    { stopKind: "idle", withAttachment: false, autoDrain: false, expected: undefined },
-    { stopKind: "stopped", withAttachment: true, autoDrain: false, expected: undefined },
-    { stopKind: "stopped", withAttachment: false, autoDrain: true, expected: undefined },
+    { stopKind: "stopped", withAttachment: false, autoDrain: false },
+    { stopKind: "idle", withAttachment: false, autoDrain: false },
+    { stopKind: "stopped", withAttachment: false, autoDrain: true },
   ])(
-    "队列立即发送 human 提示：$stopKind / attachment=$withAttachment / auto=$autoDrain",
-    async ({ stopKind, withAttachment, autoDrain, expected }) => {
+    "队列立即发送仍是普通用户输入：$stopKind / attachment=$withAttachment / auto=$autoDrain",
+    async ({ stopKind, withAttachment, autoDrain }) => {
       const stopActiveForegroundExecution = vi
         .fn()
         .mockReturnValue(
@@ -743,7 +1086,7 @@ describe("v4 原生 sendQueuedNow", () => {
       expect(app.sendInput).toHaveBeenCalledTimes(1);
       const [input, options] = app.sendInput.mock.calls[0]!;
       expect(input.text).toBe(item.text);
-      expect(options.inputPresentation).toBe(expected);
+      expect(options).not.toHaveProperty("inputPresentation");
       expect(options).toMatchObject({
         inputId: item.sourceCommandId,
         requireIdle: true,
@@ -1052,36 +1395,20 @@ describe("v4 原生 sendQueuedNow", () => {
     expect(app.removeQueueItem).not.toHaveBeenCalled();
   });
 
-  it("start barrier 失败：释放 reservation，原 queue item 不移除", async () => {
-    const app = makeApp();
+  it("start barrier 失败：提升时模型已不在 Registry，释放 reservation，原 queue item 不移除", async () => {
+    // 排队期间 Provider 下架（套餐到期/切账号）：提升走与 sendText 相同的模型准入，在 Core 建模前拒绝。
+    const app = makeApp({ listModels: () => [] });
     const record = makeRecord({ app });
-    const host = makeHost(record, {
-      ensureModelReady: vi.fn().mockRejectedValue(new Error("model unavailable")),
-    });
+    const host = makeHost(record);
     await expect(
       new V4CommandExecutor(host).execute(envelope("sendQueuedNow", { queueItemId: "q-1" })),
-    ).rejects.toThrow("model unavailable");
+    ).rejects.toMatchObject({ reasonCode: "modelUnavailable" });
+    expect(app.sendInput).not.toHaveBeenCalled();
     expect(app.releaseQueueItemReservation).toHaveBeenCalledWith(
       "q-1",
       "cmd-q1",
       expect.any(Object),
     );
     expect(app.removeQueueItem).not.toHaveBeenCalled();
-  });
-});
-
-describe("supports 分流", () => {
-  it("queue 组 6 命令均已原生", () => {
-    const executor = new V4CommandExecutor(makeHost(makeRecord()));
-    for (const type of [
-      "deleteQueueItem",
-      "editQueueItem",
-      "reorderQueueItem",
-      "setAutoDrain",
-      "setFollowupMode",
-      "sendQueuedNow",
-    ] as const) {
-      expect(executor.supports(type)).toBe(true);
-    }
   });
 });

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "caseName": "conversation-session-browser-use-iab-multitab-lifecycle",
-  "spec": "./test/e2e/conversation-session/conversation-session-browser-use-iab-multitab-lifecycle.test.ts",
+  "spec": "./test/e2e/conversation-session/browser-use/conversation-session-browser-use-iab-multitab-lifecycle.test.ts",
   "providerFixtures": [
     "./test/e2e/fixtures/upstream/common.json",
     "./test/e2e/fixtures/upstream/conversation-session/conversation-session-browser-use-iab-multitab-lifecycle.json"
@@ -38,7 +38,7 @@
       "kind": "main",
       "source": "synthetic",
       "timingPolicy": "fast-text",
-      "syntheticReason": "稳定验证模型可见 list，并把真实 tool result 中的 A/B stable id 动态注入下一次模型响应。"
+      "syntheticReason": "稳定验证模型可见 list；A/B stable id 必须从真实 tool result 动态注入下一次模型响应。"
     },
     {
       "id": "upstream-browser-use-multitab-action",
