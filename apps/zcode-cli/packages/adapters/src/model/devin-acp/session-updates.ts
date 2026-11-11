@@ -122,8 +122,9 @@ export function resolvePermissionOutcome(params: unknown): unknown {
   // 只选 allow_once：allow_always 会把规则永久写进 Devin 配置，等于绕过
   // 用户选的 ask/plan 模式。没有 once 选项就 cancelled——宁可阻断也不能
   // 替用户签永久授权。
-  // 产品边界（未决）：自动批准本质是 ZCode 侧缺少审批 UI 通道；待有真正的
-  // elicitation 通路时应改为转发给用户决策。
+  // 产品边界（暂缓）：当前实际使用以 bypass/完全权限模式为主，Devin 不会
+  // 发 request_permission，自动批准的路径基本不触发；接入真正的审批 UI
+  // 通道（elicitation）前不做进一步处理。
   const allow = options.find((option) => option.kind === "allow_once");
   if (allow?.optionId) {
     return { outcome: { outcome: "selected", optionId: allow.optionId } };

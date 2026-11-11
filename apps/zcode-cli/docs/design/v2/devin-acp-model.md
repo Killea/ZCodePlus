@@ -267,8 +267,10 @@ session，"请总结这段对话"这类指令会成为 Devin 的真实上下文�
   prompt 先于 mode 生效。
 - prompt 失败（超时/中止/传输错误）会把 ACP session 标脏并触发重建：
   Devin 侧状态未知，不能按"已同步"续聊。
-- `request_permission` 优先 `allow_once`：`allow_always` 会把规则永久
-  写进 Devin 配置，绕过用户选的 ask/plan 模式。
+- `request_permission` 只选 `allow_once`（无 once → cancelled）：
+  `allow_always` 会把规则永久写进 Devin 配置，绕过用户选的 ask/plan
+  模式。当前使用以 bypass/完全权限为主，该路径基本不触发；接入审批
+  UI 通道前不进一步处理。
 - session cwd = runtime `workingDirectory`（非 `process.cwd()`）；
   `authenticate` 浏览器 PKCE 用 10min 超时；stdin 'error'(EPIPE) 有
   监听兜底（否则未处理 error 事件会让整个 agent 进程崩溃）。
