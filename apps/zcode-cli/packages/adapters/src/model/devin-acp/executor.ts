@@ -16,6 +16,7 @@ import {
 import {
   extractForwardableContext,
   flattenTranscriptForNewSession,
+  serializeTranscriptMessage,
   type DevinContextForwardPolicy,
 } from "./context-filter.js";
 
@@ -35,7 +36,8 @@ function bridgePoolKey(options: DevinModelExecutorOptions): string {
     modelId: options.modelId ?? null,
     mode: options.mode ?? null,
     cwd: options.cwd,
-    promptTimeoutMs: options.promptTimeoutMs,
+    // promptTimeoutMs 不进 key：它是请求期参数，经 updateDeps 热更新，
+    // 改超时不应白白重启 devin 进程（重启=重新 authenticate）。
     mcpPassthrough: options.listMcpServers ? true : false,
   });
 }
@@ -75,14 +77,14 @@ export class DevinModelExecutor implements ModelExecutor {
       // Map 保序=插入序；超限驱逐最旧项并 dispose，否则配置每次变更
       // 都会多留一个常驻 devin acp 子进程陪跑到 agent 退出。
       while (pool.size > BRIDGE_POOL_MAX) {
-        const oldestKey = pool.keys().next().value;
-        if (oldestKey === undefined) break;
-        const evicted = pool.get(oldestKey);
-        pool.delete(oldestKey);
-        void evicted?.dispose();
+        // 跳过还有在途 prompt 的 bridge：dispose 会杀掉正在跑的任务。
+        const evictable = [...pool.entries()].find(([, b]) => b.inFlight === 0);
+        if (!evictable) break;
+        pool.delete(evictable[0]);
+        void evictable[1].dispose();
       }
     } else {
-      // 同 key 复用时刷新注入依赖（logger / listMcpServers getter 可能换了实例）。
+      // 同 key 复用时刷新注入依赖（logger / listMcpServers getter / 超时可变）。
       bridge.updateDeps(options);
       // LRU touch：移到末尾。
       pool.delete(key);
@@ -123,7 +125,19 @@ export class DevinModelExecutor implements ModelExecutor {
     // 后续回复（表现为压缩后"指令丢失"）。sidecar 一律按 operation 分键走独立 session。
     const isMainTurn = operation === undefined || operation === "agent_step";
     const sessionKey = isMainTurn ? sessionId : `${sessionId}#${operation}`;
-    const handle = await this.bridge.ensureSession(sessionKey);
+    let handle = await this.bridge.ensureSession(sessionKey);
+    if (isMainTurn && !handle.isNew) {
+      // ZCode 侧历史可能被编辑/回滚/fork/换模型——用"Devin 已见前缀 hash"
+      // 校验续聊前提；不一致时废弃 ACP session 重建，否则增量续聊会让
+      // Devin 在错误历史上继续（又一种"上下文丢失"）。
+      const prefixHash = hashMessagesForSync(
+        request.messages.slice(0, unseenStartIndex(request.messages)),
+      );
+      if (handle.syncedHash !== prefixHash) {
+        await this.bridge.invalidateSession(sessionKey);
+        handle = await this.bridge.ensureSession(sessionKey);
+      }
+    }
     const parts = isMainTurn
       ? this.buildPromptParts(request.messages, handle.isNew)
       : this.buildSidecarParts(request.messages);
@@ -156,17 +170,33 @@ export class DevinModelExecutor implements ModelExecutor {
       }
     };
 
+    // 用自有 AbortController 合并外部 signal：generator 被丢弃时 abort() 既让
+    // 在途请求走 session/cancel，也让排队中的 prompt 根本不再发出——不能直接
+    // cancel session（那会误伤同 session 上别人正在跑的 prompt）。
+    const cancel = new AbortController();
+    const upstream = request.abortSignal;
+    if (upstream) {
+      if (upstream.aborted) cancel.abort();
+      else upstream.addEventListener("abort", () => cancel.abort(), { once: true });
+    }
     let promptSettled = false;
     try {
       const promptDone = this.bridge.runPrompt({
         acpSessionId: handle.acpSessionId,
         parts,
-        ...(request.abortSignal ? { signal: request.abortSignal } : {}),
+        signal: cancel.signal,
         onUpdate: (update) => updates.push(update),
       });
       promptDone.then(
         (result) => {
           promptSettled = true;
+          // prompt 成功送达并完成：记录 Devin 已见历史前缀，供下轮续聊校验。
+          if (isMainTurn) {
+            this.bridge.setSyncedHash(
+              sessionKey,
+              hashMessagesForSync(request.messages),
+            );
+          }
           updates.complete(result.stopReason);
         },
         (error: unknown) => {
@@ -186,6 +216,11 @@ export class DevinModelExecutor implements ModelExecutor {
         // usage 快照不产生文本/推理块，只暂存供 finish.usage 使用。
         if (update.kind === "usage") {
           latestUsage = update;
+          continue;
+        }
+        // sidecar 的文本即结果本体（摘要/标题），[devin tool]/[plan] 标记
+        // 混进去就是坏数据——标题里出现 "[devin tool] Ran ls" 之类。
+        if (!isMainTurn && (update.kind === "tool" || update.kind === "plan")) {
           continue;
         }
         if (update.kind === "thought") {
@@ -229,23 +264,29 @@ export class DevinModelExecutor implements ModelExecutor {
       yield* closeText();
       throw error;
     } finally {
-      // 消费方提前 break/丢弃 generator（非 abortSignal 路径）时，Devin 侧任务
-      // 仍在跑且 updates 无界堆积；尽力取消避免泄漏。
-      if (!promptSettled) this.bridge.cancelPrompt(handle.acpSessionId);
+      // 消费方提前 break/丢弃 generator（非 abortSignal 路径）时 abort：
+      // 在途请求走 cancel；排队中的 prompt 因此不再发出。
+      if (!promptSettled) cancel.abort();
+      // sidecar session 一次性使用：复用会让每次 compact/标题调用的完整
+      // 转录在同一 ACP session 里累积膨胀并互相污染。
+      if (!isMainTurn) await this.bridge.invalidateSession(sessionKey);
     }
   }
 
   /**
-   * 组装 prompt parts：[上下文 resource] + [新 session 历史前缀] + [当前 user 文本]。
-   * 多轮历史由 Devin ACP session 自己维护；只有 isNew（新 session/恢复失败/切模型）
-   * 才把 ZCode 历史序列化为文本前缀。
+   * 组装 prompt parts：[上下文 resource] + [新 session 历史前缀] + [未见增量]。
+   * 多轮历史由 Devin ACP session 自己维护；只有 isNew（新 session/恢复失败/
+   * 历史分叉重建）才把 ZCode 历史序列化为文本前缀。
+   * 增量是"最后一条 assistant 之后的全部消息"，不是只有最后一条 user：
+   * steer、附件（prompt_attachment 单独成 user/system 消息）、reminder 等
+   * 同轮多条消息都必须送达。
    */
   private buildPromptParts(
     messages: ModelExecutionRequest["messages"],
     isNewSession: boolean,
   ): DevinAcpPromptPart[] {
-    const lastUserIndex = findLastUserMessageIndex(messages);
-    if (lastUserIndex < 0) return [];
+    if (findLastUserMessageIndex(messages) < 0) return [];
+    const unseenStart = unseenStartIndex(messages);
     const parts: DevinAcpPromptPart[] = [];
 
     if (isNewSession) {
@@ -256,16 +297,19 @@ export class DevinModelExecutor implements ModelExecutor {
           resource: { uri: DEVIN_CONTEXT_RESOURCE_URI, text: context, mimeType: "text/markdown" },
         });
       }
-      const history = messages.slice(0, lastUserIndex);
+      const history = messages.slice(0, unseenStart);
       if (history.length > 0) {
         parts.push({ type: "text", text: flattenTranscriptForNewSession(history) });
       }
     }
 
-    parts.push({
-      type: "text",
-      text: modelMessageContentToText(messages[lastUserIndex].content),
-    });
+    for (const message of messages.slice(unseenStart)) {
+      const text =
+        message.role === "user"
+          ? modelMessageContentToText(message.content)
+          : serializeTranscriptMessage(message);
+      if (text) parts.push({ type: "text", text });
+    }
     return parts;
   }
 
@@ -278,13 +322,42 @@ export class DevinModelExecutor implements ModelExecutor {
   ): DevinAcpPromptPart[] {
     const text = flattenTranscriptForNewSession(messages, {
       // sidecar 的 messages 即任务主体（如 compact 的转录+指令），不是会话历史：
-      // 上限放宽避免摘要输入被砍到失真；system 角色也是 payload 的一部分。
+      // 总上限与单条上限都放宽、tool 结果不再只留一行——否则摘要输入严重失真。
       maxChars: 400_000,
+      messageMaxChars: 50_000,
+      toolMaxChars: 2_000,
       header: "以下是本次调用的完整输入内容：",
       includeSystem: true,
     });
     return text ? [{ type: "text", text }] : [];
   }
+}
+
+/** Devin 未见增量的起点：最后一条 assistant 消息之后（历史以 assistant 结尾）。 */
+function unseenStartIndex(
+  messages: ModelExecutionRequest["messages"],
+): number {
+  const lastUserIndex = findLastUserMessageIndex(messages);
+  const end = lastUserIndex < 0 ? messages.length : lastUserIndex;
+  for (let index = end - 1; index >= 0; index--) {
+    if (messages[index].role === "assistant") return index + 1;
+  }
+  return 0;
+}
+
+/** "Devin 已见历史前缀"的稳定指纹：前缀分叉（编辑/回滚/换模型）时触发重建。 */
+function hashMessagesForSync(
+  messages: ModelExecutionRequest["messages"],
+): string {
+  const hash = createHash("sha256");
+  for (const message of messages) {
+    hash
+      .update(message.role)
+      .update("\0")
+      .update(modelMessageContentToText(message.content))
+      .update("\0");
+  }
+  return hash.digest("hex");
 }
 
 function findLastUserMessageIndex(

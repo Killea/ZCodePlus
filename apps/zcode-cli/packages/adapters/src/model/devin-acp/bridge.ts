@@ -37,15 +37,20 @@ export type DevinAcpUpdate =
 export interface DevinAcpSessionHandle {
   readonly acpSessionId: string;
   readonly isNew: boolean;
+  /** "Devin 已见历史前缀"的指纹；续聊调用方用它判断 ZCode 历史是否分叉。 */
+  readonly syncedHash?: string;
 }
 
 interface SessionRecord {
   acpSessionId: string;
+  syncedHash?: string;
 }
 
 const ACP_PROTOCOL_VERSION = 1;
 const DEFAULT_PROMPT_TIMEOUT_MS = 7_200_000;
 const INITIALIZE_TIMEOUT_MS = 30_000;
+/** 浏览器 PKCE 登录需要用户操作，30s 握手超时远远不够。 */
+const AUTH_TIMEOUT_MS = 600_000;
 const SESSION_NEW_TIMEOUT_MS = 60_000;
 const CONTEXT_RESOURCE_URI = "zcode://context";
 
@@ -69,6 +74,8 @@ export class DevinAcpBridge {
   private readonly updateHandlers = new Map<string, (update: DevinAcpUpdate) => void>();
   /** 每个 ACP session 的工具/plan 标记去重状态；随 sessions 一起清理。 */
   private readonly markerStates = new Map<string, UpdateMarkerState>();
+  /** 在途 prompt 数：LRU 驱逐跳过非 0 的 bridge，避免杀掉运行中的任务。 */
+  inFlight = 0;
 
   constructor(options: DevinAcpBridgeOptions) {
     this.options = options;
@@ -79,8 +86,17 @@ export class DevinAcpBridge {
    * 池化复用时刷新可变的注入依赖。影响握手结果的字段（binary/apiKey/model/mode/cwd）
    * 都在池 key 里，不会走到这里；这里只接收 getter/logger 这类"每实例新引用"的依赖。
    */
-  updateDeps(deps: Pick<DevinAcpBridgeOptions, "listMcpServers" | "logger">): void {
-    this.options = { ...this.options, listMcpServers: deps.listMcpServers };
+  updateDeps(
+    deps: Pick<
+      DevinAcpBridgeOptions,
+      "listMcpServers" | "logger" | "promptTimeoutMs"
+    >,
+  ): void {
+    this.options = {
+      ...this.options,
+      listMcpServers: deps.listMcpServers,
+      promptTimeoutMs: deps.promptTimeoutMs,
+    };
     this.logger = deps.logger;
   }
 
@@ -108,13 +124,40 @@ export class DevinAcpBridge {
       this.creating.set(sessionKey, creating);
     }
     const record = await creating;
+    // await 期间进程可能已重启：旧进程上创建的 sessionId 在新进程里无效，
+    // 落进 map 会变成永不自愈的 session-not-found。
+    if (!this.transport?.isRunning) {
+      throw new Error("Devin ACP process exited during session/new");
+    }
     this.sessions.set(sessionKey, record);
-    return { acpSessionId: record.acpSessionId, isNew: isCreator };
+    return {
+      acpSessionId: record.acpSessionId,
+      isNew: isCreator,
+      ...(record.syncedHash === undefined
+        ? {}
+        : { syncedHash: record.syncedHash }),
+    };
   }
 
-  /** 尽力取消指定 ACP session 上的在途任务（generator 被提前丢弃时调用）。 */
-  cancelPrompt(acpSessionId: string): void {
-    this.transport?.notify("session/cancel", { sessionId: acpSessionId });
+  /** 废弃 sessionKey 对应的 ACP session（历史分叉/sidecar 一次性用完）。 */
+  async invalidateSession(sessionKey: string): Promise<void> {
+    this.sessions.delete(sessionKey);
+  }
+
+  /** 记录"Devin 已见历史前缀"指纹（prompt 成功完成后由调用方写入）。 */
+  setSyncedHash(sessionKey: string, hash: string): void {
+    const record = this.sessions.get(sessionKey);
+    if (record) record.syncedHash = hash;
+  }
+
+  /** prompt 失败（超时/中止/传输错误）后把 session 标脏：Devin 侧状态未知。 */
+  private markSessionDirty(acpSessionId: string): void {
+    for (const [key, record] of this.sessions) {
+      if (record.acpSessionId === acpSessionId) {
+        this.sessions.delete(key);
+        return;
+      }
+    }
   }
 
   async runPrompt(input: {
@@ -143,6 +186,14 @@ export class DevinAcpBridge {
     readonly onUpdate: (update: DevinAcpUpdate) => void;
   }): Promise<{ stopReason: string }> {
     const transport = this.requireTransport();
+    // 排队期间被取消：直接不发，避免 Devin 收到无人消费的孤儿 prompt。
+    if (input.signal?.aborted) {
+      throw new Error("Devin ACP request aborted: session/prompt");
+    }
+    // 每条 prompt 重置去重状态：plan/工具标记的判重以单轮为界，
+    // 跨轮相同内容（如下一轮相同 plan）不应被吞掉。
+    this.markerStates.delete(input.acpSessionId);
+    this.inFlight += 1;
     this.updateHandlers.set(input.acpSessionId, input.onUpdate);
     try {
       const result = await transport.request<{ stopReason?: string }>(
@@ -157,8 +208,12 @@ export class DevinAcpBridge {
     } catch (error) {
       // 超时/中止后尽力取消 Devin 侧任务，避免后台继续执行。
       transport.notify("session/cancel", { sessionId: input.acpSessionId });
+      // prompt 失败后 Devin 侧状态未知（可能半截执行）：session 标脏，下次
+      // ensureSession 走新建+历史前缀，防止续聊在截断的状态上继续。
+      this.markSessionDirty(input.acpSessionId);
       throw error;
     } finally {
+      this.inFlight -= 1;
       this.updateHandlers.delete(input.acpSessionId);
     }
   }
@@ -193,6 +248,8 @@ export class DevinAcpBridge {
     transport.onNotification((method, params) => this.onNotification(method, params));
     transport.onRequest((method, params) => this.onReverseRequest(method, params));
     transport.onExitOnce(() => {
+      // 旧进程晚到的 exit 不能清掉新 transport 上已经创建的 session。
+      if (this.transport !== transport) return;
       this.sessions.clear();
       this.markerStates.clear();
       this.transport = undefined;
@@ -223,11 +280,12 @@ export class DevinAcpBridge {
 
   private async authenticate(transport: AcpTransport): Promise<void> {
     const apiKey = this.options.apiKey?.trim();
+    // ACP 扩展字段约定为 _meta；同时带 meta 兼容未按约定实现的服务端。
     const params = apiKey
-      ? { methodId: "devin-browser", meta: { api_key: apiKey } }
+      ? { methodId: "devin-browser", meta: { api_key: apiKey }, _meta: { api_key: apiKey } }
       : { methodId: "devin-browser" };
     try {
-      await transport.request("authenticate", params, { timeoutMs: INITIALIZE_TIMEOUT_MS });
+      await transport.request("authenticate", params, { timeoutMs: AUTH_TIMEOUT_MS });
     } catch (error) {
       throw new Error(
         "Devin ACP 认证失败：请在 Provider 设置中检查 Devin 登录状态或 API Key。" +
@@ -452,7 +510,11 @@ function resolvePermissionOutcome(params: unknown): unknown {
     options?: Array<{ optionId?: string; kind?: string }>;
   };
   const options = request.options ?? [];
-  const allow = options.find((option) => option.kind?.startsWith("allow"));
+  // 优先 allow_once：allow_always 会把规则永久写进 Devin 配置，等于绕过
+  // 用户选的 ask/plan 模式；没有 once 选项时再退到其他 allow 类。
+  const allow =
+    options.find((option) => option.kind === "allow_once") ??
+    options.find((option) => option.kind?.startsWith("allow"));
   if (allow?.optionId) {
     return { outcome: { outcome: "selected", optionId: allow.optionId } };
   }

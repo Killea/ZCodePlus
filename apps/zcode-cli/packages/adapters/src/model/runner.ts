@@ -171,6 +171,9 @@ export class AiSdkModelAdapter {
           ...(this.devinAcpDeps?.listMcpServers
             ? { listMcpServers: this.devinAcpDeps.listMcpServers }
             : {}),
+          ...(this.devinAcpDeps?.workingDirectory
+            ? { workingDirectory: this.devinAcpDeps.workingDirectory }
+            : {}),
           ...(this.logger ? { logger: this.logger } : {}),
         },
       );

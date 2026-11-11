@@ -23,6 +23,14 @@ const VERSION_PATTERN = /(\d+\.\d+\.\d+)/;
 const EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ""];
 
 /**
+ * Windows 的 .cmd/.bat 在 shell:false 下新版 Node 会直接 EINVAL；
+ * 这类 shim 必须经 cmd.exe 运行。
+ */
+export function needsCmdShell(binaryPath: string): boolean {
+  return platform() === "win32" && /\.(cmd|bat)$/i.test(binaryPath);
+}
+
+/**
  * Devin CLI 二进制发现：access.binaryPath → PATH → 常见安装路径。
  * 只做用户已安装二进制的验证，不分发、不自动安装（与 devin-agent 的不变量一致）。
  */
@@ -45,7 +53,8 @@ function collectCandidates(configuredPath?: string | null): string[] {
   const candidates: string[] = [];
   const pathEnv = process.env.PATH ?? "";
   const isWindows = platform() === "win32";
-  const names = isWindows ? ["devin.exe", "devin.cmd", "devin"] : ["devin"];
+  // Windows 上无扩展名的 devin 是 shell 脚本 shim，spawn 无法执行，不作候选。
+  const names = isWindows ? ["devin.exe", "devin.cmd", "devin.bat"] : ["devin"];
   for (const dir of pathEnv.split(delimiter)) {
     const trimmed = dir.trim();
     if (!trimmed) continue;
@@ -86,7 +95,7 @@ async function probeVersion(path: string): Promise<string | undefined> {
     execFile(
       path,
       ["--version"],
-      { timeout: VERSION_TIMEOUT_MS, shell: false },
+      { timeout: VERSION_TIMEOUT_MS, shell: needsCmdShell(path) },
       (error, stdout) => {
         if (error) return resolve(undefined);
         const match = VERSION_PATTERN.exec(stdout);

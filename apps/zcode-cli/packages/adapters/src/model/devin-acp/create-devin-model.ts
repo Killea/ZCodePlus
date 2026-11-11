@@ -12,6 +12,8 @@ import { DevinModelExecutor } from "./executor.js";
 export interface DevinAcpAdapterDeps {
   /** 返回当前 config 的 mcp.servers；每次 session/new 时读取，保证配置热更新生效。 */
   readonly listMcpServers?: () => Readonly<Record<string, McpServerConfig>>;
+  /** runtime 解析后的 workspace 目录；缺省回退 process.cwd()。 */
+  readonly workingDirectory?: string;
   readonly logger?: Logger;
 }
 
@@ -49,8 +51,9 @@ export function createDevinAcpModel(
     mode: access.mode,
     promptTimeoutMs: access.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS,
     contextForward: access.contextForward,
-    // devin acp 的 session cwd 即 agent 进程 cwd（= 当前 workspace）。
-    cwd: process.cwd(),
+    // session cwd 用 runtime 解析的 workingDirectory（zcode --cwd / 桌面端
+    // spawn 的 cwd 与 process.cwd() 可能不同）；缺省才回退进程 cwd。
+    cwd: deps.workingDirectory ?? process.cwd(),
     ...(mcpPassthrough && deps.listMcpServers
       ? { listMcpServers: deps.listMcpServers }
       : {}),

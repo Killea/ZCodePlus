@@ -56,7 +56,11 @@ interface SectionSlice {
 }
 
 function splitIntoSections(text: string): SectionSlice[] {
-  const matches = [...text.matchAll(SECTION_HEADING_PATTERN)];
+  // 仍按任意 `^# ` 切段（非白名单段如 # Tools 也是真边界），但排除代码块
+  // 内的 `# ` 行——记忆内容里 fenced code 的 `# 注释` 不应把 Memory 段截断。
+  const matches = [...text.matchAll(SECTION_HEADING_PATTERN)].filter(
+    (match) => !isInsideCodeFence(text, match.index ?? 0),
+  );
   const sections: SectionSlice[] = [];
   for (let index = 0; index < matches.length; index++) {
     const match = matches[index];
@@ -65,6 +69,19 @@ function splitIntoSections(text: string): SectionSlice[] {
     sections.push({ title: match[1].trim(), raw: text.slice(start, end).trim() });
   }
   return sections;
+}
+
+const CODE_FENCE_PATTERN = /^```/gm;
+
+function isInsideCodeFence(text: string, index: number): boolean {
+  let fences = 0;
+  CODE_FENCE_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CODE_FENCE_PATTERN.exec(text)) !== null) {
+    if (match.index >= index) break;
+    fences += 1;
+  }
+  return fences % 2 === 1;
 }
 
 /**
@@ -78,27 +95,15 @@ export function flattenTranscriptForNewSession(
     readonly maxChars?: number;
     readonly header?: string;
     readonly includeSystem?: boolean;
+    readonly messageMaxChars?: number;
+    readonly toolMaxChars?: number;
   } = {},
 ): string {
   const lines: string[] = [];
   for (const message of messages) {
     if (message.role === "system" && !options.includeSystem) continue;
-    const text = truncate(modelMessageContentToText(message.content), MESSAGE_MAX_CHARS);
-    if (message.role === "tool") {
-      const status = message.isError ? "失败" : "完成";
-      lines.push(
-        `[tool ${message.toolName ?? "unknown"} ${status}] ${truncate(text, TOOL_RESULT_SUMMARY_MAX_CHARS)}`,
-      );
-      continue;
-    }
-    if (message.toolCalls?.length) {
-      const calls = message.toolCalls
-        .map((call) => call.name ?? call.id)
-        .join(", ");
-      lines.push(`[assistant 调用了工具: ${calls}]`);
-    }
-    if (!text) continue;
-    lines.push(`${message.role}: ${text}`);
+    const line = serializeTranscriptMessage(message, options);
+    if (line !== undefined) lines.push(line);
   }
   if (lines.length === 0) return "";
   const transcript = lines.join("\n");
@@ -112,6 +117,29 @@ export function flattenTranscriptForNewSession(
     trimmed,
     "",
   ].join("\n");
+}
+
+/** 单条消息的转录行（历史前缀与增量续聊共用同一序列化语义）。 */
+export function serializeTranscriptMessage(
+  message: ModelInputMessage,
+  options: { readonly messageMaxChars?: number; readonly toolMaxChars?: number } = {},
+): string | undefined {
+  const messageMax = options.messageMaxChars ?? MESSAGE_MAX_CHARS;
+  const toolMax = options.toolMaxChars ?? TOOL_RESULT_SUMMARY_MAX_CHARS;
+  const text = truncate(modelMessageContentToText(message.content), messageMax);
+  if (message.role === "tool") {
+    const status = message.isError ? "失败" : "完成";
+    return `[tool ${message.toolName ?? "unknown"} ${status}] ${truncate(text, toolMax)}`;
+  }
+  const lines: string[] = [];
+  if (message.toolCalls?.length) {
+    const calls = message.toolCalls
+      .map((call) => call.name ?? call.id)
+      .join(", ");
+    lines.push(`[assistant 调用了工具: ${calls}]`);
+  }
+  if (text) lines.push(`${message.role}: ${text}`);
+  return lines.length === 0 ? undefined : lines.join("\n");
 }
 
 function truncate(text: string, max: number): string {

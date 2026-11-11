@@ -578,6 +578,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
         statusSink: modelTelemetry.statusSink,
         streamIdleTimeoutMs: configResult.config.modelStream.idleTimeoutMs,
         listMcpServers: () => configResult.config.mcp.servers,
+        workingDirectory,
       });
     if (options.modelAdapter && modelTelemetry.statusSink) {
       modelAdapter.addStatusSink(modelTelemetry.statusSink);

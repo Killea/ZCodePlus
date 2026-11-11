@@ -56,8 +56,16 @@ export class AcpTransport {
     this.child = spawn(options.command, [...options.args], {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      shell: false,
+      // Windows .cmd/.bat 需经 cmd.exe，shell:false 在新版 Node 直接 EINVAL。
+      shell:
+        process.platform === "win32" && /\.(cmd|bat)$/i.test(options.command),
       stdio: ["pipe", "pipe", "pipe"],
+    });
+    // devin 关闭管道但进程未退出时，再写 stdin 会触发 stream 'error'(EPIPE)。
+    // 没有监听器的 'error' 事件会让整个 agent 进程崩溃——吞掉并记 debug，
+    // 真正的生命周期处理交给 exit/error 路径。
+    this.child.stdin.on("error", (error: Error) => {
+      this.logger?.debug?.(`[devin-acp stdin] ${error.message}`);
     });
     this.child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     this.child.stderr.on("data", (chunk: Buffer) => {
@@ -143,10 +151,16 @@ export class AcpTransport {
     if (this.closed) return;
     this.closed = true;
     this.failAllPending(new Error("Devin ACP transport closed"));
+    // 先 stdin.end + SIGTERM 给进程优雅退出机会，超时再 SIGKILL。
     this.child.stdin.end();
+    try {
+      this.child.kill("SIGTERM");
+    } catch {
+      // 已退出，忽略。
+    }
     const exited = await new Promise<boolean>((resolve) => {
       if (this.exitCode !== null || this.exitError) return resolve(true);
-      const timer = setTimeout(() => resolve(false), 3000);
+      const timer = setTimeout(() => resolve(false), 2000);
       this.onExitOnce(() => {
         clearTimeout(timer);
         resolve(true);

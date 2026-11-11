@@ -17,6 +17,8 @@ interface CreateModelAdapterBaseOptions {
   statusSink?: ModelStatusSink;
   /** devin-acp Provider 在 session/new 时读取的 MCP 透传配置源。 */
   listMcpServers?: () => Readonly<Record<string, McpServerConfig>>;
+  /** devin-acp session 的 cwd：runtime 解析的 workspace 目录。 */
+  workingDirectory?: string;
 }
 
 export type CreateModelAdapterOptions = CreateModelAdapterBaseOptions & {
@@ -39,8 +41,17 @@ export function createModelAdapter(options: CreateModelAdapterOptions): AiSdkMod
     modelIoFullRetentionEnabled: options.modelIoFullRetentionEnabled,
     streamIdleTimeoutMs: options.streamIdleTimeoutMs,
     statusSink: options.statusSink,
-    ...(options.listMcpServers
-      ? { devinAcp: { listMcpServers: options.listMcpServers } }
+    ...(options.listMcpServers || options.workingDirectory
+      ? {
+          devinAcp: {
+            ...(options.listMcpServers
+              ? { listMcpServers: options.listMcpServers }
+              : {}),
+            ...(options.workingDirectory
+              ? { workingDirectory: options.workingDirectory }
+              : {}),
+          },
+        }
       : {}),
   });
 }

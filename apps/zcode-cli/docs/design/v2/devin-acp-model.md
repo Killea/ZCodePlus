@@ -216,8 +216,26 @@ promptTimeoutMs        → 同取消路径，error event 归类 timeout
 formatter（无模型调用）把 transcript 序列化+截断为一段 text 前缀随首个
 prompt 发送：逐条 role 打标、assistant/user 文本截断到上限、tool 消息只留
 一行执行摘要。这覆盖"中途切模型/恢复后 load 失败/compact 后"三类边角；
-正常续聊每轮只发最新 user 消息。`embeddedContext` 为 resource part 的
-协议用途。
+正常续聊发"最后一条 assistant 之后的全部未见消息"（steer/附件/
+reminder 等多条都送达，非只发最后一条 user）。`embeddedContext` 为
+resource part 的协议用途。
+
+#### 历史同步校验（syncedHash）
+
+bridge 为每个主会话 sessionKey 记录"Devin 已见历史前缀"指纹
+（prompt 成功完成后写入）。续聊时若 ZCode 历史前缀 hash 与记录不一致
+（编辑/回滚/fork/换模型后切回），先 `invalidateSession` 再走 isNew
+全量路径——否则增量续聊会让 Devin 在错误历史上继续。
+
+#### Sidecar 一次性 session
+
+sidecar 的 sessionKey 稳定（`{sessionId}#{operation}`）但**每次调用
+后在 finally 中 invalidate**：复用会让每次 compact 的完整转录在同一
+ACP session 里累积膨胀并互相污染。sidecar 流中 `[devin tool]`/`[plan]`
+标记不写入文本输出（标题/摘要里出现工具标记即坏数据）。
+已知边界：memory agent 依赖 `toolCalls` 写记忆，Devin 不会产生
+toolCalls——该链路对 devin-acp 当前不闭环，产品方向待定（交给 Devin
+还是固定回退 HTTP 模型）。
 
 #### Sidecar 调用隔离（compact/标题/记忆等）
 
@@ -247,6 +265,16 @@ session，"请总结这段对话"这类指令会成为 Devin 的真实上下文�
   发 `session/cancel`：防 Devin 侧任务继续跑、updates 无界堆积。
 - `session/set_config_option`(mode) 在 `session/new` 后 await：避免首个
   prompt 先于 mode 生效。
+- prompt 失败（超时/中止/传输错误）会把 ACP session 标脏并触发重建：
+  Devin 侧状态未知，不能按"已同步"续聊。
+- `request_permission` 优先 `allow_once`：`allow_always` 会把规则永久
+  写进 Devin 配置，绕过用户选的 ask/plan 模式。
+- session cwd = runtime `workingDirectory`（非 `process.cwd()`）；
+  `authenticate` 浏览器 PKCE 用 10min 超时；stdin 'error'(EPIPE) 有
+  监听兜底（否则未处理 error 事件会让整个 agent 进程崩溃）。
+- contextForward 分段排除 fenced code 内的 `# ` 行（防 Memory 段被
+  `# 注释` 截断）；Windows `.cmd/.bat` 经 cmd.exe 运行（shell:false
+  下新版 Node EINVAL）。
 
 ### Context meter（用量感知）
 
