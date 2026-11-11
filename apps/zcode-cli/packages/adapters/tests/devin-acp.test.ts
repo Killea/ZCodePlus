@@ -8,6 +8,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import type { ModelInputMessage } from "@zcode/contracts";
+import { runWithModelInvocationContext } from "@zcode/contracts";
 import {
   extractForwardableContext,
   flattenTranscriptForNewSession,
@@ -313,6 +314,45 @@ describe("DevinModelExecutor context usage", () => {
     const i2 = seq.lastIndexOf("text_start");
     expect(i2).toBeGreaterThan(seq.indexOf("reasoning_end"));
     expect(i1).toBeGreaterThan(seq.indexOf("text_delta"));
+  });
+
+  it("sidecar（compact）调用走独立 session 且发送完整输入", async () => {
+    const ensure = vi
+      .spyOn(DevinAcpBridge.prototype, "ensureSession")
+      .mockResolvedValue({ acpSessionId: "s-side", isNew: true });
+    let sentParts: { type: string; text?: string }[] = [];
+    vi.spyOn(DevinAcpBridge.prototype, "runPrompt").mockImplementation(
+      async (input: { parts: { type: string; text?: string }[] }) => {
+        sentParts = input.parts;
+        return { stopReason: "end_turn" };
+      },
+    );
+    const executor = new DevinModelExecutor({ promptTimeoutMs: 1000, cwd: "/tmp" });
+    const compactMessages = [
+      user("做 A 任务"),
+      assistant("已完成一半"),
+      user("请总结以上对话"),
+    ];
+    await runWithModelInvocationContext(
+      {
+        modelCall: { operation: "context_compaction" },
+        traceContext: { sessionId: "s-main" } as never,
+      },
+      async () => {
+        for await (const _ of executor.streamText({
+          messages: compactMessages,
+          options: {},
+        } as never)) {
+          void _;
+        }
+      },
+    );
+    // sidecar session key 与主 session 分离，主会话历史不被摘要指令污染。
+    expect(ensure).toHaveBeenCalledWith("s-main#context_compaction");
+    // 完整输入全部发送：转录 + 摘要指令都在（不是只发最后一条）。
+    const sentText = sentParts.map((p) => p.text ?? "").join("\n");
+    expect(sentText).toContain("做 A 任务");
+    expect(sentText).toContain("请总结以上对话");
   });
 
   it("sin usage_update finish.usage queda vacío (meter oculto, nada fabricado)", async () => {

@@ -219,6 +219,20 @@ prompt 发送：逐条 role 打标、assistant/user 文本截断到上限、tool
 正常续聊每轮只发最新 user 消息。`embeddedContext` 为 resource part 的
 协议用途。
 
+#### Sidecar 调用隔离（compact/标题/记忆等）
+
+`sessionKey` 按调用语义分键：`modelCall.operation` 为 `agent_step` 或未设
+（主对话回合）→ `traceContext.sessionId`；**其余 operation**
+（`context_compaction`、`session_title`、memory extract 等）→
+`{sessionId}#{operation}`，走独立 ACP session。
+
+原因：sidecar 调用是自包含任务而非会话续聊。若与主会话共用一个 ACP
+session，"请总结这段对话"这类指令会成为 Devin 的真实上下文且转录本身
+不会送达（续聊路径只发最后一条 user 消息）——实测导致压缩后 Devin
+回复跑偏（"A 还没做，是否要做"）。sidecar 的 messages 即任务主体，
+由同一确定性 serializer 全量序列化（上限放宽到 400K 字符）单条 text
+part 发送，不做 contextForward 注入。
+
 ### Context meter（用量感知）
 
 Devin reporta su contexto real por `session/update{sessionUpdate:"usage_update",

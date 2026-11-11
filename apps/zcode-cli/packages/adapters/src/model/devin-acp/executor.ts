@@ -99,10 +99,18 @@ export class DevinModelExecutor implements ModelExecutor {
 
   async *streamText(request: ModelExecutionRequest): AsyncGenerator<ModelEvent> {
     yield { type: "start" };
-    const sessionKey =
-      getCurrentModelInvocationContext()?.traceContext?.sessionId ?? DEFAULT_SESSION_KEY;
+    const invocation = getCurrentModelInvocationContext();
+    const operation = invocation?.modelCall?.operation;
+    const sessionId = invocation?.traceContext?.sessionId ?? DEFAULT_SESSION_KEY;
+    // compact/标题/记忆提取等 sidecar 调用是自包含任务，不是会话续聊：
+    // 若打进主 ACP session，"总结对话"这类指令会成为 Devin 的真实上下文并污染
+    // 后续回复（表现为压缩后"指令丢失"）。sidecar 一律按 operation 分键走独立 session。
+    const isMainTurn = operation === undefined || operation === "agent_step";
+    const sessionKey = isMainTurn ? sessionId : `${sessionId}#${operation}`;
     const handle = await this.bridge.ensureSession(sessionKey);
-    const parts = this.buildPromptParts(request.messages, handle.isNew);
+    const parts = isMainTurn
+      ? this.buildPromptParts(request.messages, handle.isNew)
+      : this.buildSidecarParts(request.messages);
     if (parts.length === 0) {
       yield { type: "finish", finishReason: "stop", usage: {} };
       return;
@@ -232,6 +240,22 @@ export class DevinModelExecutor implements ModelExecutor {
       text: modelMessageContentToText(messages[lastUserIndex].content),
     });
     return parts;
+  }
+
+  /**
+   * sidecar 任务（compact/title/…）是自包含调用：payload 在 messages 里，
+   * 不做 contextForward 注入、不靠"最新 user 消息"捷径——逐条序列化全部内容。
+   */
+  private buildSidecarParts(
+    messages: ModelExecutionRequest["messages"],
+  ): DevinAcpPromptPart[] {
+    const text = flattenTranscriptForNewSession(messages, {
+      // sidecar 的 messages 即任务主体（如 compact 的转录+指令），不是会话历史：
+      // 上限放宽避免摘要输入被砍到失真。
+      maxChars: 400_000,
+      header: "以下是本次调用的完整输入内容：",
+    });
+    return text ? [{ type: "text", text }] : [];
   }
 }
 

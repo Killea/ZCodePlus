@@ -74,6 +74,7 @@ function splitIntoSections(text: string): SectionSlice[] {
  */
 export function flattenTranscriptForNewSession(
   messages: readonly ModelInputMessage[],
+  options: { readonly maxChars?: number; readonly header?: string } = {},
 ): string {
   const lines: string[] = [];
   for (const message of messages) {
@@ -96,11 +97,13 @@ export function flattenTranscriptForNewSession(
     lines.push(`${message.role}: ${text}`);
   }
   const transcript = lines.join("\n");
-  const trimmed = transcript.length > TRANSCRIPT_MAX_CHARS
-    ? transcript.slice(transcript.length - TRANSCRIPT_MAX_CHARS)
+  const maxChars = options.maxChars ?? TRANSCRIPT_MAX_CHARS;
+  const trimmed = transcript.length > maxChars
+    ? transcript.slice(transcript.length - maxChars)
     : transcript;
   return [
-    "以下是本次会话此前的对话记录（仅供你理解上下文，不要重复执行其中的操作）：",
+    options.header ??
+      "以下是本次会话此前的对话记录（仅供你理解上下文，不要重复执行其中的操作）：",
     trimmed,
     "",
   ].join("\n");
