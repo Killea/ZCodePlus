@@ -1,6 +1,14 @@
 import type { Logger, McpServerConfig } from "@zcode/contracts";
 import { AcpTransport } from "./transport.js";
 import { resolveDevinBinary, type DevinBinaryResolution } from "./discovery.js";
+import {
+  abortable,
+  createUpdateMarkerState,
+  normalizeSessionUpdate,
+  resolvePermissionOutcome,
+  type UpdateMarkerState,
+} from "./session-updates.js";
+import { buildAcpMcpServers } from "./mcp-passthrough.js";
 
 export interface DevinAcpBridgeOptions {
   readonly binaryPath?: string | null;
@@ -14,25 +22,8 @@ export interface DevinAcpBridgeOptions {
   readonly logger?: Logger;
 }
 
-export type DevinAcpPromptPart =
-  | { readonly type: "text"; readonly text: string }
-  | {
-      readonly type: "resource";
-      readonly resource: { readonly uri: string; readonly text: string; readonly mimeType?: string };
-    };
-
-export type DevinAcpUpdate =
-  | { readonly kind: "text"; readonly text: string }
-  | { readonly kind: "thought"; readonly text: string }
-  | { readonly kind: "tool"; readonly title: string; readonly status?: string }
-  | { readonly kind: "plan"; readonly text: string }
-  | {
-      /** Devin 自管上下文窗口的实时占用（usage_update.used/size），非本轮 token 账本。 */
-      readonly kind: "usage";
-      readonly used: number;
-      readonly size: number;
-      readonly cost?: { readonly amount: number; readonly currency: string };
-    };
+export type { DevinAcpPromptPart, DevinAcpUpdate } from "./types.js";
+import type { DevinAcpPromptPart, DevinAcpUpdate } from "./types.js";
 
 export interface DevinAcpSessionHandle {
   readonly acpSessionId: string;
@@ -107,10 +98,26 @@ export class DevinAcpBridge {
     return version === undefined ? {} : { version };
   }
 
-  async ensureSession(sessionKey: string): Promise<DevinAcpSessionHandle> {
-    await this.ensureStarted();
+  async ensureSession(
+    sessionKey: string,
+    signal?: AbortSignal,
+  ): Promise<DevinAcpSessionHandle> {
+    // 取消也要覆盖启动/认证等待阶段：浏览器 auth 有 10min 超时，
+    // 不接入 signal 用户点停止后会一直挂起。race 只解除本调用的等待，
+    // 不取消共享的 start（其他调用方可能还在等同一个握手）。
+    await abortable(this.ensureStarted(), signal);
     const existing = this.sessions.get(sessionKey);
-    if (existing) return { acpSessionId: existing.acpSessionId, isNew: false };
+    // 命中必须带回 syncedHash——漏掉它会让续聊方永远判定历史分叉，
+    // 每轮都 invalidate+重建 session（真 bug，不是性能问题）。
+    if (existing) {
+      return {
+        acpSessionId: existing.acpSessionId,
+        isNew: false,
+        ...(existing.syncedHash === undefined
+          ? {}
+          : { syncedHash: existing.syncedHash }),
+      };
+    }
 
     // 同 key 并发（如 sidecar 与主回合并行时同 operation 的重试）会重复
     // session/new：后者覆盖 map，前者 session 在 Devin 侧泄漏成幽灵。在途去重，
@@ -118,12 +125,12 @@ export class DevinAcpBridge {
     let creating = this.creating.get(sessionKey);
     const isCreator = creating === undefined;
     if (!creating) {
-      creating = this.createSession().finally(() => {
+      creating = this.createSession(signal).finally(() => {
         this.creating.delete(sessionKey);
       });
       this.creating.set(sessionKey, creating);
     }
-    const record = await creating;
+    const record = await abortable(creating, signal);
     // await 期间进程可能已重启：旧进程上创建的 sessionId 在新进程里无效，
     // 落进 map 会变成永不自愈的 session-not-found。
     if (!this.transport?.isRunning) {
@@ -250,14 +257,16 @@ export class DevinAcpBridge {
     transport.onNotification((method, params) => this.onNotification(method, params));
     transport.onRequest((method, params) => this.onReverseRequest(method, params));
     transport.onExitOnce(() => {
+      this.logger?.warn("[devin-acp] process exited; sessions dropped");
       // 旧进程晚到的 exit 不能清掉新 transport 上已经创建的 session。
       if (this.transport !== transport) return;
       this.sessions.clear();
       this.markerStates.clear();
       this.transport = undefined;
-      this.logger?.warn("[devin-acp] process exited; sessions dropped");
     });
-    this.transport = transport;
+    // transport 必须在 initialize+authenticate 完成后才发布到 this.transport：
+    // 提前赋值会让并发调用把"进程存活"误认为"握手完成"，绕过 starting 的
+    // 等待直接使用未认证连接（session/new 必然失败）。
     try {
       await transport.request("initialize", {
         protocolVersion: ACP_PROTOCOL_VERSION,
@@ -272,9 +281,9 @@ export class DevinAcpBridge {
       await this.authenticate(transport);
     } catch (error) {
       await transport.close().catch(() => undefined);
-      this.transport = undefined;
       throw error;
     }
+    this.transport = transport;
     this.logger?.info(
       `[devin-acp] started pid=${String(transport.pid)} binary=${this.resolution.path}`,
     );
@@ -299,15 +308,21 @@ export class DevinAcpBridge {
   // 未实现（spec 先行项）：session/load 恢复旧会话（当前一律 session/new，
   // 恢复能力靠 ZCode 侧历史前缀）；minVersion 门槛（discovery 探测到版本
   // 但未做最低版本校验）。两者暂不影响正确性，后续按 spec 补。
-  private async createSession(): Promise<SessionRecord> {
+  private async createSession(signal?: AbortSignal): Promise<SessionRecord> {
     const transport = this.requireTransport();
     const result = await transport.request<{ sessionId?: string }>(
       "session/new",
       {
         cwd: this.options.cwd,
-        mcpServers: this.buildMcpServers(),
+        mcpServers: buildAcpMcpServers(
+          this.options.listMcpServers?.() ?? {},
+          this.logger,
+        ),
       },
-      { timeoutMs: SESSION_NEW_TIMEOUT_MS },
+      {
+        timeoutMs: SESSION_NEW_TIMEOUT_MS,
+        ...(signal ? { signal } : {}),
+      },
     );
     if (!result?.sessionId) throw new Error("Devin ACP session/new 未返回 sessionId");
     const record: SessionRecord = { acpSessionId: result.sessionId };
@@ -322,46 +337,14 @@ export class DevinAcpBridge {
           { timeoutMs: SESSION_NEW_TIMEOUT_MS },
         );
       } catch (error) {
-        this.logger?.warn(`[devin-acp] set mode=${mode} failed: ${String(error)}`);
+        // mode 是权限语义：用户选了 plan 却静默沿用默认模式=执行权限被放大。
+        // 设置失败必须阻断，不能按未知模式跑下去。
+        throw new Error(
+          `Devin ACP 设置权限模式失败 (mode=${mode})：${String(error)}`,
+        );
       }
     }
     return record;
-  }
-
-  private buildMcpServers(): unknown[] {
-    const servers = this.options.listMcpServers?.() ?? {};
-    const mapped: unknown[] = [];
-    for (const [name, config] of Object.entries(servers)) {
-      if (config.enabled === false) continue;
-      // zcode_official 鉴权依赖宿主逐请求注入凭证，Devin 独立 spawn 后凭证不存在；
-      // 跳过并告警，避免静默把不可用的 server 传给 Devin。
-      if ("auth" in config && config.auth || "official" in config && config.official) {
-        this.logger?.warn(`[devin-acp] skipping mcp server with host-managed auth: ${name}`);
-        continue;
-      }
-      if (config.type === "stdio") {
-        mapped.push({
-          name,
-          command: config.command,
-          args: config.args ?? [],
-          env: Object.entries(config.env ?? {}).map(([envName, value]) => ({
-            name: envName,
-            value,
-          })),
-        });
-      } else {
-        mapped.push({
-          name,
-          type: config.type,
-          url: config.url,
-          headers: Object.entries(config.headers ?? {}).map(([headerName, value]) => ({
-            name: headerName,
-            value,
-          })),
-        });
-      }
-    }
-    return mapped;
   }
 
   private onNotification(method: string, params: unknown): void {
@@ -399,131 +382,6 @@ export class DevinAcpBridge {
     }
     return this.transport;
   }
-}
-
-/**
- * 工具/plan 标记的去重状态（每 ACP session 一份）。
- * toolCallId -> 已发出的标题；plan -> 已发出的格式化文本。
- */
-export interface UpdateMarkerState {
-  readonly emitted: Map<string, string>;
-}
-
-export function createUpdateMarkerState(): UpdateMarkerState {
-  return { emitted: new Map() };
-}
-
-const PLAN_MARKER_KEY = "__plan__";
-
-export function normalizeSessionUpdate(
-  update: unknown,
-  markerState?: UpdateMarkerState,
-): DevinAcpUpdate | undefined {
-  if (typeof update !== "object" || update === null) return undefined;
-  const record = update as Record<string, unknown>;
-  const kind = record.sessionUpdate;
-  if (kind === "agent_message_chunk") {
-    const text = contentText(record.content);
-    return text === undefined ? undefined : { kind: "text", text };
-  }
-  if (kind === "agent_thought_chunk") {
-    const text = contentText(record.content);
-    return text === undefined ? undefined : { kind: "thought", text };
-  }
-  if (kind === "tool_call" || kind === "tool_call_update") {
-    // 纯状态心跳没有信息量（"[devin tool] tool (in_progress)" 刷屏来源），丢弃；
-    // 同一 toolCallId+title 只报第一条，收敛到每个工具一行。
-    const title =
-      typeof record.title === "string" && record.title.trim()
-        ? record.title
-        : undefined;
-    if (!title) return undefined;
-    const toolCallId =
-      typeof record.toolCallId === "string" && record.toolCallId
-        ? record.toolCallId
-        : title;
-    if (markerState?.emitted.get(toolCallId) === title) return undefined;
-    markerState?.emitted.set(toolCallId, title);
-    // in_progress/pending 状态会留在最终文本里产生"永远进行中"的假象；
-    // 只有终态/错误类状态值得展示。
-    const rawStatus = typeof record.status === "string" ? record.status : undefined;
-    const status =
-      rawStatus && rawStatus !== "in_progress" && rawStatus !== "pending"
-        ? rawStatus
-        : undefined;
-    return { kind: "tool", title, ...(status === undefined ? {} : { status }) };
-  }
-  if (kind === "plan") {
-    const text = formatPlan(record.entries);
-    // plan 更新按内容全量重发；内容没变就丢，避免同一计划反复刷屏。
-    if (!text.trim()) return undefined;
-    if (markerState?.emitted.get(PLAN_MARKER_KEY) === text) return undefined;
-    markerState?.emitted.set(PLAN_MARKER_KEY, text);
-    return { kind: "plan", text };
-  }
-  if (kind === "usage_update") {
-    const used = nonNegativeFiniteNumber(record.used);
-    const size = nonNegativeFiniteNumber(record.size);
-    // used/size 缺任一都不是可展示的用量，整条丢弃（meter 保持隐藏而不是渲染假 0%）。
-    if (used === undefined || size === undefined || size <= 0) return undefined;
-    const cost = normalizeAcpCost(record.cost);
-    return { kind: "usage", used, size, ...(cost ? { cost } : {}) };
-  }
-  return undefined;
-}
-
-function nonNegativeFiniteNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : undefined;
-}
-
-function normalizeAcpCost(
-  value: unknown,
-): { amount: number; currency: string } | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
-  const record = value as { amount?: unknown; currency?: unknown };
-  if (typeof record.amount !== "number" || !Number.isFinite(record.amount)) {
-    return undefined;
-  }
-  if (typeof record.currency !== "string" || !record.currency) return undefined;
-  return { amount: record.amount, currency: record.currency };
-}
-
-function contentText(content: unknown): string | undefined {
-  if (typeof content !== "object" || content === null) return undefined;
-  const block = content as { type?: string; text?: string };
-  return block.type === "text" && typeof block.text === "string" ? block.text : undefined;
-}
-
-function formatPlan(entries: unknown): string {
-  if (!Array.isArray(entries)) return "";
-  const lines = entries.map((entry) => {
-    const item = entry as { content?: string; status?: string; priority?: string };
-    const status = item.status ? `[${item.status}] ` : "";
-    return `${status}${item.content ?? ""}`;
-  });
-  return `\n[plan]\n${lines.join("\n")}\n`;
-}
-
-/**
- * request_permission 自动应答：权限策略由 Devin CLI 自身 mode 控制（用户决策），
- * 这里只兜底保证 ACP 反向请求不悬挂。优先选 allow 类选项，否则 cancel。
- */
-function resolvePermissionOutcome(params: unknown): unknown {
-  const request = params as {
-    options?: Array<{ optionId?: string; kind?: string }>;
-  };
-  const options = request.options ?? [];
-  // 优先 allow_once：allow_always 会把规则永久写进 Devin 配置，等于绕过
-  // 用户选的 ask/plan 模式；没有 once 选项时再退到其他 allow 类。
-  const allow =
-    options.find((option) => option.kind === "allow_once") ??
-    options.find((option) => option.kind?.startsWith("allow"));
-  if (allow?.optionId) {
-    return { outcome: { outcome: "selected", optionId: allow.optionId } };
-  }
-  return { outcome: { outcome: "cancelled" } };
 }
 
 export const DEVIN_CONTEXT_RESOURCE_URI = CONTEXT_RESOURCE_URI;

@@ -14,6 +14,13 @@ import {
   type DevinAcpUpdate,
 } from "./bridge.js";
 import {
+  findLastUserMessageIndex,
+  hashMessagesForSync,
+  mapStopReason,
+  unseenStartIndex,
+  UpdateQueue,
+} from "./stream-helpers.js";
+import {
   extractForwardableContext,
   flattenTranscriptForNewSession,
   serializeTranscriptMessage,
@@ -78,7 +85,11 @@ export class DevinModelExecutor implements ModelExecutor {
       // 都会多留一个常驻 devin acp 子进程陪跑到 agent 退出。
       while (pool.size > BRIDGE_POOL_MAX) {
         // 跳过还有在途 prompt 的 bridge：dispose 会杀掉正在跑的任务。
-        const evictable = [...pool.entries()].find(([, b]) => b.inFlight === 0);
+        // 排除自身：四个都忙时唯一 inFlight===0 的是新实例，不能把
+        // 自己逐出池（会变成无人管理、又占配额的孤儿进程）。
+        const evictable = [...pool.entries()].find(
+          ([k, b]) => k !== key && b.inFlight === 0,
+        );
         if (!evictable) break;
         pool.delete(evictable[0]);
         void evictable[1].dispose();
@@ -124,8 +135,20 @@ export class DevinModelExecutor implements ModelExecutor {
     // 若打进主 ACP session，"总结对话"这类指令会成为 Devin 的真实上下文并污染
     // 后续回复（表现为压缩后"指令丢失"）。sidecar 一律按 operation 分键走独立 session。
     const isMainTurn = operation === undefined || operation === "agent_step";
-    const sessionKey = isMainTurn ? sessionId : `${sessionId}#${operation}`;
-    let handle = await this.bridge.ensureSession(sessionKey);
+    // sidecar key 每次调用唯一：同 session 同 operation 的并发调用若共享 key，
+    // 第二个任务会继承第一个的自包含转录（违背"一次性独立任务"语义）。
+    const sessionKey = isMainTurn
+      ? sessionId
+      : `${sessionId}#${operation}#${randomUUID()}`;
+    // AbortController 必须在 ensureSession 之前建好：取消要覆盖
+    // initialize/authenticate/session/new 阶段，不只是 prompt 阶段。
+    const cancel = new AbortController();
+    const upstream = request.abortSignal;
+    if (upstream) {
+      if (upstream.aborted) cancel.abort();
+      else upstream.addEventListener("abort", () => cancel.abort(), { once: true });
+    }
+    let handle = await this.bridge.ensureSession(sessionKey, cancel.signal);
     if (isMainTurn && !handle.isNew) {
       // ZCode 侧历史可能被编辑/回滚/fork/换模型——用"Devin 已见前缀 hash"
       // 校验续聊前提；不一致时废弃 ACP session 重建，否则增量续聊会让
@@ -170,16 +193,12 @@ export class DevinModelExecutor implements ModelExecutor {
       }
     };
 
-    // 用自有 AbortController 合并外部 signal：generator 被丢弃时 abort() 既让
-    // 在途请求走 session/cancel，也让排队中的 prompt 根本不再发出——不能直接
-    // cancel session（那会误伤同 session 上别人正在跑的 prompt）。
-    const cancel = new AbortController();
-    const upstream = request.abortSignal;
-    if (upstream) {
-      if (upstream.aborted) cancel.abort();
-      else upstream.addEventListener("abort", () => cancel.abort(), { once: true });
-    }
     let promptSettled = false;
+    // Devin 已见历史 = request.messages + 本轮 Devin 自己的回复（ZCode 会把
+    // 回复持久化为 assistant 消息，下轮前缀 hash 必须覆盖它，否则每轮都
+    // 误判分叉重建 session）。只累计 text_delta（含工具标记），reasoning
+    // 不进持久化 content。
+    let finalText = "";
     try {
       const promptDone = this.bridge.runPrompt({
         acpSessionId: handle.acpSessionId,
@@ -190,11 +209,15 @@ export class DevinModelExecutor implements ModelExecutor {
       promptDone.then(
         (result) => {
           promptSettled = true;
-          // prompt 成功送达并完成：记录 Devin 已见历史前缀，供下轮续聊校验。
+          // prompt 成功送达并完成：记录 Devin 已见历史前缀（含本轮回复），
+          // 供下轮续聊校验。
           if (isMainTurn) {
             this.bridge.setSyncedHash(
               sessionKey,
-              hashMessagesForSync(request.messages),
+              hashMessagesForSync([
+                ...request.messages,
+                { role: "assistant", content: finalText },
+              ]),
             );
           }
           updates.complete(result.stopReason);
@@ -240,11 +263,15 @@ export class DevinModelExecutor implements ModelExecutor {
           yield { type: "text_start", id: openTextId };
         }
         if (update.kind === "text") {
+          finalText += update.text;
           yield { type: "text_delta", id: openTextId, text: update.text };
         } else if (update.kind === "tool") {
           const status = update.status ? ` (${update.status})` : "";
-          yield { type: "text_delta", id: openTextId, text: `\n[devin tool] ${update.title}${status}\n` };
+          const marker = `\n[devin tool] ${update.title}${status}\n`;
+          finalText += marker;
+          yield { type: "text_delta", id: openTextId, text: marker };
         } else if (update.kind === "plan" && update.text) {
+          finalText += update.text;
           yield { type: "text_delta", id: openTextId, text: update.text };
         }
       }
@@ -306,6 +333,10 @@ export class DevinModelExecutor implements ModelExecutor {
     }
 
     for (const message of messages.slice(unseenStart)) {
+      // system 永不进增量尾部：ZCode 系统上下文只经 contextForward 白名单
+      // 通道走（isNew 时作为 resource）。否则首轮（无 assistant → unseenStart=0）
+      // 会把 system 指令原样发出，绕过 none/memory-only 过滤。
+      if (message.role === "system") continue;
       const text =
         message.role === "user"
           ? modelMessageContentToText(message.content)
@@ -332,116 +363,5 @@ export class DevinModelExecutor implements ModelExecutor {
       includeSystem: true,
     });
     return text ? [{ type: "text", text }] : [];
-  }
-}
-
-/** Devin 未见增量的起点：最后一条 assistant 消息之后（历史以 assistant 结尾）。 */
-function unseenStartIndex(
-  messages: ModelExecutionRequest["messages"],
-): number {
-  const lastUserIndex = findLastUserMessageIndex(messages);
-  const end = lastUserIndex < 0 ? messages.length : lastUserIndex;
-  for (let index = end - 1; index >= 0; index--) {
-    if (messages[index].role === "assistant") return index + 1;
-  }
-  return 0;
-}
-
-/** "Devin 已见历史前缀"的稳定指纹：前缀分叉（编辑/回滚/换模型）时触发重建。 */
-function hashMessagesForSync(
-  messages: ModelExecutionRequest["messages"],
-): string {
-  const hash = createHash("sha256");
-  for (const message of messages) {
-    hash
-      .update(message.role)
-      .update("\0")
-      .update(modelMessageContentToText(message.content))
-      .update("\0");
-  }
-  return hash.digest("hex");
-}
-
-function findLastUserMessageIndex(
-  messages: ModelExecutionRequest["messages"],
-): number {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    if (messages[index].role === "user") return index;
-  }
-  return -1;
-}
-
-function mapStopReason(stopReason: string): string {
-  switch (stopReason) {
-    case "end_turn":
-      return "stop";
-    case "max_tokens":
-    case "max_turn_requests":
-      return "length";
-    case "refusal":
-      return "content-filter";
-    case "cancelled":
-      return "cancelled";
-    default:
-      return "stop";
-  }
-}
-
-/**
- * runPrompt 的回调式 update → async generator 拉取队列。
- * 完成时带上 stopReason；失败时让 next() 抛出原始错误。
- */
-class UpdateQueue {
-  private readonly queue: DevinAcpUpdate[] = [];
-  private waiter?: (result: IteratorResult<DevinAcpUpdate>) => void;
-  private finished = false;
-  private stopReason = "end_turn";
-  private error?: unknown;
-
-  push(update: DevinAcpUpdate): void {
-    if (this.waiter) {
-      const waiter = this.waiter;
-      this.waiter = undefined;
-      waiter({ value: update, done: false });
-      return;
-    }
-    this.queue.push(update);
-  }
-
-  complete(stopReason: string): void {
-    this.finished = true;
-    this.stopReason = stopReason;
-    this.flushWaiter();
-  }
-
-  fail(error: unknown): void {
-    this.finished = true;
-    this.error = error;
-    this.flushWaiter();
-  }
-
-  async next(): Promise<
-    | { done: true; value?: undefined; stopReason: string }
-    | { done: false; value: DevinAcpUpdate }
-  > {
-    if (this.queue.length > 0) {
-      return { done: false, value: this.queue.shift()! };
-    }
-    if (this.error) throw this.error;
-    if (this.finished) return { done: true, stopReason: this.stopReason };
-    const item = await new Promise<IteratorResult<DevinAcpUpdate>>((resolve) => {
-      this.waiter = resolve;
-    });
-    if (item.done) {
-      if (this.error) throw this.error;
-      return { done: true, stopReason: this.stopReason };
-    }
-    return { done: false, value: item.value };
-  }
-
-  private flushWaiter(): void {
-    const waiter = this.waiter;
-    this.waiter = undefined;
-    waiter?.({ value: undefined as never, done: true });
   }
 }

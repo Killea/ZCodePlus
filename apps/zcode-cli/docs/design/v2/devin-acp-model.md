@@ -275,6 +275,20 @@ session，"请总结这段对话"这类指令会成为 Devin 的真实上下文�
 - contextForward 分段排除 fenced code 内的 `# ` 行（防 Memory 段被
   `# 注释` 截断）；Windows `.cmd/.bat` 经 cmd.exe 运行（shell:false
   下新版 Node EINVAL）。
+- syncedHash 覆盖"messages + 本轮 assistant 回复"——只记 messages
+  会让下轮前缀（含回复）永远不匹配，每轮都重建 session；缓存命中也
+  必须返回该字段。
+- 增量尾部跳过 system 角色：首轮 unseenStart=0 时 system 消息会混进
+  tail，绕过 contextForward 白名单。
+- `this.transport` 在 initialize+authenticate 完成后才发布：提前赋值
+  会让并发调用绕过 starting 等待使用未认证连接。
+- 取消信号贯穿 ensureSession/session/new 阶段（abortable race），不只
+  是 prompt；mode `set_config_option` 失败直接阻断（权限语义不能静默
+  降级）；权限自动应答只选 `allow_once`（无 once → cancelled，产品
+  边界见 resolvePermissionOutcome 注释）。
+- sidecar sessionKey 含随机后缀：同 operation 并发调用不共享 ACP
+  session；LRU 驱逐排除自身与在途 bridge；dispatchLine 校验帧必须是
+  对象（"null" 会 TypeError 逃逸）。
 
 ### Context meter（用量感知）
 

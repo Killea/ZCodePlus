@@ -204,6 +204,14 @@ export class AcpTransport {
       );
       return;
     }
+    // JSON 合法但非对象（"null"、"42"）：读 .method 会 TypeError 逃出
+    // 'data' 事件处理器成为未捕获异常，必须提前丢弃。
+    if (typeof message !== "object" || message === null) {
+      this.logger?.warn?.(
+        `[devin-acp] dropping non-object frame: ${line.slice(0, PARSE_ERROR_LOG_LIMIT)}`,
+      );
+      return;
+    }
     if (message.method !== undefined) {
       if (message.id !== undefined && message.id !== null) {
         void this.respondToRequest(message.id, message.method, message.params);

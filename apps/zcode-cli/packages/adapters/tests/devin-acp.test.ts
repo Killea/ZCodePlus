@@ -14,11 +14,11 @@ import {
   flattenTranscriptForNewSession,
 } from "../src/model/devin-acp/context-filter.js";
 import { AcpTransport } from "../src/model/devin-acp/transport.js";
+import { DevinAcpBridge } from "../src/model/devin-acp/bridge.js";
 import {
   createUpdateMarkerState,
-  DevinAcpBridge,
   normalizeSessionUpdate,
-} from "../src/model/devin-acp/bridge.js";
+} from "../src/model/devin-acp/session-updates.js";
 import { DevinModelExecutor } from "../src/model/devin-acp/executor.js";
 
 const system = (text: string): ModelInputMessage => ({ role: "system", content: text });
@@ -361,8 +361,12 @@ describe("DevinModelExecutor context usage", () => {
         }
       },
     );
-    // sidecar session key 与主 session 分离，主会话历史不被摘要指令污染。
-    expect(ensure).toHaveBeenCalledWith("s-main#context_compaction");
+    // sidecar session key 与主 session 分离且每次调用唯一（含随机后缀）。
+    // spyOn 复用已有 mock，calls 含前面测试的调用——要在全部调用里找匹配。
+    const keys = ensure.mock.calls.map((call) => call[0] as string);
+    expect(
+      keys.some((key) => /^s-main#context_compaction#.+/.test(key)),
+    ).toBe(true);
     // 完整输入全部发送：转录 + 摘要指令都在（不是只发最后一条）。
     const sentText = sentParts.map((p) => p.text ?? "").join("\n");
     expect(sentText).toContain("做 A 任务");
