@@ -43,6 +43,13 @@ const INITIALIZE_TIMEOUT_MS = 30_000;
 /** 浏览器 PKCE 登录需要用户操作，30s 握手超时远远不够。 */
 const AUTH_TIMEOUT_MS = 600_000;
 const SESSION_NEW_TIMEOUT_MS = 60_000;
+/**
+ * authenticate 内部会向 Windsurf API 做 deployment lookup（devin 硬编码 ~10s）。
+ * 到 GCP 的链路间歇性高延迟/丢包时单次调用容易超时，但相邻重试常能成功；
+ * 重试一个已失败的请求无副作用（浏览器流程会在下一次请求时重新发起）。
+ */
+const AUTH_MAX_ATTEMPTS = 3;
+const AUTH_RETRY_DELAY_MS = 1_500;
 const CONTEXT_RESOURCE_URI = "zcode://context";
 
 /**
@@ -295,14 +302,28 @@ export class DevinAcpBridge {
     const params = apiKey
       ? { methodId: "devin-browser", meta: { api_key: apiKey }, _meta: { api_key: apiKey } }
       : { methodId: "devin-browser" };
-    try {
-      await transport.request("authenticate", params, { timeoutMs: AUTH_TIMEOUT_MS });
-    } catch (error) {
-      throw new Error(
-        "Devin ACP 认证失败：请在 Provider 设置中检查 Devin 登录状态或 API Key。" +
-          `（${error instanceof Error ? error.message : String(error)}）`,
-      );
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= AUTH_MAX_ATTEMPTS; attempt++) {
+      try {
+        await transport.request("authenticate", params, { timeoutMs: AUTH_TIMEOUT_MS });
+        return;
+      } catch (error) {
+        lastError = error;
+        this.logger?.warn(
+          `[devin-acp] authenticate attempt ${attempt}/${AUTH_MAX_ATTEMPTS} failed: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+        if (attempt < AUTH_MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, AUTH_RETRY_DELAY_MS));
+        }
+      }
     }
+    throw new Error(
+      "Devin ACP 认证失败：Devin 无法连接 Windsurf API 校验登录状态" +
+        "（多为网络不稳定/超时，而非凭证错误）。请检查网络或代理后重试；" +
+        "持续失败可在终端运行 `devin auth login` 完成登录后再试。" +
+        `（${lastError instanceof Error ? lastError.message : String(lastError)}）`,
+    );
   }
 
   // 未实现（spec 先行项）：session/load 恢复旧会话（当前一律 session/new，

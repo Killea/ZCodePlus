@@ -395,6 +395,9 @@ authenticate(methodId:"devin-browser", meta:{api_key?})
   connectivity test 同路径复用。
 - `apiKey` 存于 provider access config（与现有 api-key 字段同等级保护：
   不进日志/示例/提交）。
+- authenticate 失败重试 ≤3 次（间隔 1.5s）：Devin 内部的 deployment-lookup
+  有 ~10s 硬超时，跨 GCP 链路间歇性高延迟时单次调用会假失败；最终错误
+  提示网络原因并指引 `devin auth login`。
 
 ## 状态所有者与生命周期
 
