@@ -2519,6 +2519,9 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
                 reloadSessionDisabled={workspaceSessionActionDisabled}
                 reloadSessionPending={reloadSessionPending}
                 onCreateTask={handleCreateTaskInChat}
+                // onSelectTask 是可选 prop，缺省时右上角圆形 session 指示器静默不渲染；
+                // 上游 merge 曾把此处 prop 覆盖掉，必须显式保留。
+                onSelectTask={handleSelectTaskInChat}
                 onOpenWorkspace={onOpenWorkspace}
                 allowOpenWorkspace={allowOpenWorkspace}
               />
@@ -2932,6 +2935,8 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
                             reloadSessionDisabled={workspaceSessionActionDisabled}
                             reloadSessionPending={reloadSessionPending}
                             onCreateTask={handleCreateTaskInChat}
+                            // onSelectTask 可选缺省时右上角 session 指示器静默不渲染（同上处注释）。
+                            onSelectTask={handleSelectTaskInChat}
                             onOpenWorkspace={onOpenWorkspace}
                             allowOpenWorkspace={allowOpenWorkspace}
                           />
