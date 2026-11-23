@@ -4,7 +4,7 @@ const ANTHROPIC_MESSAGES_API_TYPE = "anthropic-messages";
 
 export function resolveToolSearchCapability(
   apiType: string,
-  access: { type: string; mode?: string },
+  access: { type: string; mode?: string | null },
 ): ToolSearchCapability {
   const protocolSupported = apiType === ANTHROPIC_MESSAGES_API_TYPE;
   const codingPlan =
@@ -34,7 +34,7 @@ export function toolSearchHeaders(headers: Record<string, string> | undefined, e
 /** 模型请求能力只由协议与接入方式决定；core 投影据此选择请求形态。 */
 export function resolveModelRequestCapabilities(
   apiType: string,
-  access: { type: string; mode?: string },
+  access: { type: string; mode?: string | null },
 ): NonNullable<Model["requestCapabilities"]> {
   return {
     toolSearch: resolveToolSearchCapability(apiType, access),

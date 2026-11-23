@@ -49,7 +49,7 @@ export async function runSessionShareCommand(
 ): Promise<number> {
   try {
     const bootstrap = await loadBootstrapModule();
-    const stores = bootstrap.openSessionTransferStores({
+    const stores = await bootstrap.openSessionTransferStores({
       env: process.env,
       workingDirectory,
     });

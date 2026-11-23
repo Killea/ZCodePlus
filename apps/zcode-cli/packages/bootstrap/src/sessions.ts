@@ -6,7 +6,8 @@ import type { ListZCodeSessionsOptions, ResolveLatestSessionOptions } from "./ap
 import { getSessionDbPath, isClosableSessionStore } from "./app/session-store.js";
 
 export interface SessionTransferStores {
-  sessionStore: ReturnType<typeof openStartupSqliteSessionStore>;
+  // openStartupSqliteSessionStore 是 async（建库/migration 走 IO），这里存解析后的实例。
+  sessionStore: Awaited<ReturnType<typeof openStartupSqliteSessionStore>>;
   artifactStore: ReturnType<typeof createNodeToolArtifactStore>;
   close(): void;
 }
@@ -15,12 +16,12 @@ export interface SessionTransferStores {
  * 内部 session 共享命令的存储入口：与普通 CLI 使用同一 session DB / artifact root，
  * 但只由 __session-share 命令进程持有，不进入 Desktop main 的常驻状态。
  */
-export function openSessionTransferStores(options?: {
+export async function openSessionTransferStores(options?: {
   env?: NodeJS.ProcessEnv;
   workingDirectory?: string;
-}): SessionTransferStores {
+}): Promise<SessionTransferStores> {
   const configResult = createConfig({ env: options?.env });
-  const sessionStore = openStartupSqliteSessionStore({
+  const sessionStore = await openStartupSqliteSessionStore({
     dbPath: getSessionDbPath(configResult, options?.workingDirectory),
   });
   const storageRoot = resolvePath(configResult.config.storage.dir);

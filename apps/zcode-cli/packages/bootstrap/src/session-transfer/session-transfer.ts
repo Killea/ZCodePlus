@@ -90,8 +90,9 @@ export async function readSessionTransferSnapshot(params: {
   if (session.workspaceID?.startsWith("remote:")) {
     throw new Error("Remote workspace sessions cannot be shared");
   }
-  if (session.time.archived !== undefined) {
-    throw new Error("Archived session cannot be shared");
+  // 上游移除 time.archived（归档归 Host 组织态，CLI 无归档列）；改为拒绝软删除会话。
+  if (session.time.deleted !== undefined) {
+    throw new Error("Deleted session cannot be shared");
   }
   if (session.revert) {
     throw new Error("Session with active revert cannot be shared");
