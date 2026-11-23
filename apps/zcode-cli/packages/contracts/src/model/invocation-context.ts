@@ -63,6 +63,8 @@ export function isModelRequestSessionFeature(value: unknown): value is ModelRequ
 export interface ModelInvocationContext {
   metadata?: Record<string, unknown>;
   modelCall?: ModelApiCallObservation;
+  /** runtime 标识已投影的压缩摘要，供有状态 agent 冷起回放时保留全文。 */
+  compactSummaryMessageIndex?: number;
   modelRequestSessionType?: ModelRequestSessionType;
   /**
    * 本会话已用能力标签；runtime 层在每次调用时读取 owner 的当前集合。Adapter 写入受控归因

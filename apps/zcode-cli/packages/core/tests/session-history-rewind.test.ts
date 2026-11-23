@@ -358,6 +358,11 @@ describe("session history rewind hydration", () => {
       { role: "system", content: "system prompt" },
       { role: "user", content: "Summary after compact" },
     ]);
+    expect(history.toRuntimeEntries()).toContainEqual(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ compactBoundary: { boundaryId: "compact-part-rewind" } }),
+      }),
+    );
   });
 
   it("applies a new branch cut before compact scoping so compact-covered edits replace the summary", async () => {

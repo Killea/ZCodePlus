@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { modelMessageContentToText } from "@zcode/contracts";
+import { modelMessageContentBlockToText, modelMessageContentToText } from "@zcode/contracts";
 import type { ModelExecutionRequest } from "../model.js";
 import type { DevinAcpUpdate } from "./bridge.js";
 
@@ -23,10 +23,14 @@ export function hashMessagesForSync(
 ): string {
   const hash = createHash("sha256");
   for (const message of messages) {
+    // runtime 按块保留交错的推理与正文；同步指纹按流式正文拼接，块边界不应制造换行。
+    const text = message.role === "assistant" && Array.isArray(message.content)
+      ? message.content.map(modelMessageContentBlockToText).join("")
+      : modelMessageContentToText(message.content);
     hash
       .update(message.role)
       .update("\0")
-      .update(modelMessageContentToText(message.content))
+      .update(text)
       .update("\0");
   }
   return hash.digest("hex");

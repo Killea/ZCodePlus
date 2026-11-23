@@ -171,6 +171,8 @@ export async function executeManualCompact(
         events,
         startedAt,
         status: coreError.type === CoreErrorType.TurnCancelled ? "cancelled" : "error",
+        cancelledByUser:
+          coreError.type === CoreErrorType.TurnCancelled && abortSignal?.aborted === true,
         traceContext: turnTraceContext,
         turnId,
       });
@@ -206,7 +208,33 @@ export async function autoCompactIfNeeded(
     model: context.model,
   });
   const { messages: activeMessages, sourceEntries } = activeProjection;
-  const tokenOverride = buildProviderUsageTokenOverride(activeMessages, sourceEntries);
+  // ACP 自己持有窗口。冷起或历史分叉时，旧模型的计费记录和 ZCode 全量转录都无法代表新会话。
+  const readSessionContext = context.model.requestCapabilities?.readSessionContext;
+  let tokenOverride: AutoCompactTokenOverride | undefined;
+  if (readSessionContext) {
+    const snapshot = readSessionContext(this.sessionId, activeMessages);
+    if (!snapshot) {
+      this.logger?.debug("Auto compact skipped without a matching session context", {
+        ...traceContextToLogContext(turnTraceContext),
+        event: "compact.auto.skipped",
+        reason: "session_context_unavailable",
+      });
+      return "skipped";
+    }
+    const incrementalTokenCount = estimateMessageTokens(
+      snapshot.pendingText.map((content) => ({ role: "user", content })),
+    );
+    config.contextWindow = snapshot.size;
+    tokenOverride = {
+      source: "provider_usage",
+      baseTokenCount: snapshot.used,
+      contextUsageTokenCount: snapshot.used,
+      incrementalTokenCount,
+      tokenCount: snapshot.used + incrementalTokenCount,
+    };
+  } else {
+    tokenOverride = buildProviderUsageTokenOverride(activeMessages, sourceEntries);
+  }
   const decision = shouldAutoCompact({
     messages: activeMessages,
     config,

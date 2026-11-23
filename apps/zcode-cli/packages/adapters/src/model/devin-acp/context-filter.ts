@@ -95,26 +95,36 @@ export function flattenTranscriptForNewSession(
     readonly maxChars?: number;
     readonly header?: string;
     readonly includeSystem?: boolean;
+    readonly compactSummaryIndex?: number;
     readonly messageMaxChars?: number;
     readonly toolMaxChars?: number;
   } = {},
 ): string {
+  const summaryIndex = options.compactSummaryIndex ?? -1;
+  const summary = messages[summaryIndex];
+  // 普通回放曾把真实压缩摘要裁到 8K，随后又被总预算裁一次。先为有来源标记的摘要预留全文。
+  const summaryLine =
+    summary?.role === "user" ? `user: ${modelMessageContentToText(summary.content)}` : undefined;
+  let remaining = (options.maxChars ?? TRANSCRIPT_MAX_CHARS) - (summaryLine?.length ?? 0);
   const lines: string[] = [];
-  for (const message of messages) {
-    if (message.role === "system" && !options.includeSystem) continue;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (index === summaryIndex && summaryLine !== undefined) {
+      lines.push(summaryLine);
+      continue;
+    }
+    const message = messages[index];
+    if (remaining <= 0 || (message.role === "system" && !options.includeSystem)) continue;
     const line = serializeTranscriptMessage(message, options);
-    if (line !== undefined) lines.push(line);
+    if (!line) continue;
+    if (lines.length > 0 || summaryLine !== undefined) remaining--;
+    if (remaining > 0) lines.push(line.slice(-remaining));
+    remaining -= line.length;
   }
   if (lines.length === 0) return "";
-  const transcript = lines.join("\n");
-  const maxChars = options.maxChars ?? TRANSCRIPT_MAX_CHARS;
-  const trimmed = transcript.length > maxChars
-    ? transcript.slice(transcript.length - maxChars)
-    : transcript;
   return [
     options.header ??
       "以下是本次会话此前的对话记录（仅供你理解上下文，不要重复执行其中的操作）：",
-    trimmed,
+    lines.reverse().join("\n"),
     "",
   ].join("\n");
 }

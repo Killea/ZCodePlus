@@ -1137,6 +1137,8 @@ export async function executeTurnCommand(
           events,
           startedAt: turnStartedAtMs,
           status: coreError.type === CoreErrorType.TurnCancelled ? "cancelled" : "error",
+          cancelledByUser:
+            coreError.type === CoreErrorType.TurnCancelled && turnAbortSignal.aborted,
           traceContext: turnTraceContext,
           turnId,
           userMessageId,

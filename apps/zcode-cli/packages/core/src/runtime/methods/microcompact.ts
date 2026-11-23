@@ -34,7 +34,12 @@ export async function microcompactIfNeeded(
     turnRequestState: TurnRequestState;
   },
 ): Promise<void> {
-  if (this.config.compact?.enabled === false) return;
+  // 本地工具历史的估算与裁剪只适用于逐轮发送转录的模型；修改 ACP 的历史前缀会误触发重建。
+  if (
+    this.config.compact?.enabled === false ||
+    context.model.requestCapabilities?.readSessionContext
+  )
+    return;
   throwIfTurnAborted(abortSignal);
 
   const autoConfig: AutoCompactPolicyConfig = {

@@ -113,7 +113,13 @@ export async function runModelTextRequest(
         : {}),
     },
   );
+  const compactSummaryMessageIndex = model.requestCapabilities?.readSessionContext
+    ? projectedOptions.originEntries?.findLastIndex((entries) =>
+        entries.some((entry) => entry.kind !== "attachment" && entry.metadata?.compactBoundary),
+      )
+    : undefined;
   const modelInvocationContext = {
+    compactSummaryMessageIndex,
     metadata: traceContextToLogContext(projectedOptions.traceContext),
     // 会话类型、重试预算与准入端口由 createRuntimeModel 绑在句柄上
     // turn step 与工具内部的模型调用同一来源。

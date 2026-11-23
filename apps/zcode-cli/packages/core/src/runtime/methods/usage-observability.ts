@@ -27,6 +27,7 @@ type ModelUsageQuerySource =
   | string;
 
 interface RecordModelUsageInput {
+  cancelledByUser?: boolean;
   assistantMessageId?: MessageId;
   attemptIndex?: number;
   error?: unknown;
@@ -43,6 +44,7 @@ interface RecordModelUsageInput {
 }
 
 interface RecordTurnUsageInput {
+  cancelledByUser?: boolean;
   completedAt: number;
   error?: unknown;
   events: readonly SessionEvent[];
@@ -110,7 +112,7 @@ export async function recordModelUsageFact(
       providerTotalTokens: usage?.totalTokens,
       retryCount,
       retryable: errorInfo.retryable ?? retryCount > 0,
-      cancelledByUser: input.status === "cancelled",
+      cancelledByUser: input.cancelledByUser ?? input.status === "cancelled",
       contextExceeded,
       errorType: errorInfo.type,
       errorCode: errorInfo.code,
@@ -184,7 +186,7 @@ export async function recordTurnUsageFact(
       cacheReadInputTokens: usage?.cacheReadTokens,
       computedTotalTokens: usage?.totalTokens,
       retryable: errorInfo.retryable,
-      cancelledByUser: input.status === "cancelled",
+      cancelledByUser: input.cancelledByUser ?? input.status === "cancelled",
       contextExceeded,
       errorType: errorInfo.type,
       errorCode: errorInfo.code,

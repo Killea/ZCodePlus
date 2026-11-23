@@ -67,6 +67,9 @@ export function createDevinAcpModel(
     providerId: options.providerId as ModelProviderId,
     modelId: options.modelId as ModelId,
     ...(options.displayName === undefined ? {} : { displayName: options.displayName }),
+    requestCapabilities: {
+      readSessionContext: (id, messages) => executor.readSessionContext(id, messages),
+    },
     properties: options.modelConfig.properties,
     optionSpecs: options.modelConfig.optionSpecs,
     ...(options.options === undefined ? {} : { options: options.options }),

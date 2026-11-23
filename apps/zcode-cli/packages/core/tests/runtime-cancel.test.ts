@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CoreErrorType,
   SessionEventType,
@@ -57,6 +57,65 @@ describe("AgentRuntime turn cancellation", () => {
     const completeEvent = events[events.length - 1];
     expect((completeEvent.payload as { resultType?: string }).resultType).toBe("cancelled");
   });
+
+  it.each([
+    { modelStreaming: "on", text: "partial" },
+    { modelStreaming: "off", text: "partial" },
+    { modelStreaming: "on", text: "" },
+  ] as const)(
+    "preserves a provider-cancelled reply ($modelStreaming, '$text')",
+    async ({ modelStreaming, text }) => {
+      const sessionId = createSessionId("remote-cancel");
+      const eventStore = createTestSessionEventStore();
+      const store = {
+        ...createRecordingMessageStore(),
+        recordModelUsage: vi.fn(),
+        upsertTurnUsage: vi.fn(),
+        upsertToolUsage: vi.fn(),
+      };
+      const runtime = createTestAgentRuntime(
+        sessionId,
+        { modelStreaming },
+        {
+          eventStore,
+          sessionStore: store as unknown as SessionStorePort,
+          modelFactory: createTestModelFactory({
+            generateText: async () => ({ text, finishReason: "cancelled", usage: {} }),
+            async *streamText() {
+              yield { type: "text_start", id: "t" };
+              yield { type: "text_delta", id: "t", text };
+              yield { type: "text_end", id: "t" };
+              yield { type: "finish", finishReason: "cancelled", usage: {} };
+            },
+          }),
+        },
+      );
+      await expect(runtime.executeTurn("start")).rejects.toMatchObject({
+        type: CoreErrorType.TurnCancelled,
+      });
+      const events = await eventStore.getEvents(sessionId);
+      expect(events.at(-1)).toMatchObject({
+        type: SessionEventType.TurnComplete,
+        payload: { resultType: "cancelled" },
+      });
+      if (text)
+        expect(store.savedParts).toContainEqual(expect.objectContaining({ type: "text", text }));
+      expect(store.recordModelUsage).toHaveBeenCalledTimes(1);
+      expect(store.recordModelUsage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "cancelled",
+          finishReason: "cancelled",
+          cancelledByUser: false,
+        }),
+      );
+      expect(store.upsertTurnUsage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "cancelled",
+          cancelledByUser: false,
+        }),
+      );
+    },
+  );
 
   describe("interrupt marker", () => {
     // 默认测试模型不合并相邻 user 内容，所以标记和前一条 prompt 都不补换行。

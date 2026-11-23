@@ -120,6 +120,7 @@ export function isSuspiciousEmptyModelResult(
   return (
     responseLength === 0 &&
     toolCallCount === 0 &&
+    finishReason !== "cancelled" &&
     isNonStopFinish(finishReason) &&
     isZeroUsage(usage)
   );

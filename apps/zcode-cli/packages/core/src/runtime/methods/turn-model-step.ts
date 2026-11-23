@@ -251,7 +251,7 @@ async function runModelBackedTurnStepImpl(
     }
   };
 
-  let result: RuntimeModelTextResult;
+  let result: RuntimeModelTextResult | undefined;
   try {
     const baselineMaxOutputTokens = resolveNormalRequestMaxOutputTokens({
       modelMaxOutputTokens: executionMaxOutputTokens,
@@ -286,9 +286,18 @@ async function runModelBackedTurnStepImpl(
       toolSearchEnabled: options.toolSearch?.mode === "native",
       traceContext: modelTraceContext,
     });
+    if (result.finishReason === "cancelled") {
+      // ACP 可以独立终止 prompt，本地 signal 此时仍活跃；保留生成模式和流模式已收到的部分回复。
+      latestStreamSnapshot = { ...result, reasoning: result.reasoning ?? [] };
+      throw createCoreError(CoreErrorType.TurnCancelled, "The model cancelled the request.");
+    }
     throwIfTurnAborted(state.turnAbortSignal);
   } catch (error) {
     let finalError = error;
+    const providerCancelled = result?.finishReason === "cancelled";
+    const cancelled =
+      providerCancelled ||
+      (state.turnAbortSignal.aborted && isTurnCancellationError(error, state.turnAbortSignal));
     await recordMainTurnModelUsage(this, state, {
       assistantMessageId,
       error: finalError,
@@ -296,7 +305,9 @@ async function runModelBackedTurnStepImpl(
       modelTraceContext,
       networkEventStartIndex,
       startedAt: modelStartedAt,
-      status: state.turnAbortSignal.aborted ? "cancelled" : "error",
+      result,
+      cancelledByUser: cancelled && state.turnAbortSignal.aborted,
+      status: cancelled ? "cancelled" : "error",
     });
     const failedRequestId = latestFailedModelRequestId ?? latestModelRequestId;
     // 执行 Selection 的声明式退回必须先于同模型 stream recovery：明确归因到加速 provider/network
@@ -306,7 +317,7 @@ async function runModelBackedTurnStepImpl(
       error: finalError,
       executionProviderId: String(executionModelSelection.providerId),
       selectionFallback: state.selectionFallback,
-      turnAborted: state.turnAbortSignal.aborted,
+      turnAborted: providerCancelled || state.turnAbortSignal.aborted,
     });
     const toolCallCountBeforeSelectionFallback = state.toolCallCount;
     const selectionFallbackResult = selectionFallbackMatch
@@ -332,6 +343,7 @@ async function runModelBackedTurnStepImpl(
     // Bug 根因：退回目标解析失败后若继续进入通用恢复，会重新请求同一个已失败的 execution provider。
     // 命中声明就已消费本轮恢复决策；无处可退必须保留原错误并直接失败。
     if (
+      !providerCancelled &&
       !selectionFallbackMatch &&
       (await streamingToolCoordinator.recoverFromModelFailure(
         error,
@@ -452,13 +464,10 @@ async function runModelBackedTurnStepImpl(
     // 无 fallback target 时工具已在上方 settlement；再次 abandon 会发布与终态矛盾的 ledger 事件。
     if (!selectionFallbackResult?.settledAcceptedTools) {
       await streamingToolCoordinator.abandon(
-        state.turnAbortSignal.aborted ? "cancelled" : "model_failed",
+        cancelled ? "cancelled" : "model_failed",
       );
     }
-    if (
-      state.turnAbortSignal.aborted &&
-      isTurnCancellationError(finalError, state.turnAbortSignal)
-    ) {
+    if (cancelled) {
       await persistCancelledStreamSnapshot(this, {
         assistantCreatedAt,
         assistantMessageId,
@@ -529,6 +538,7 @@ async function runModelBackedTurnStepImpl(
       assistantCreatedAt,
       {
         completed: Date.now(),
+        ...(providerCancelled ? { finish: "cancelled" } : {}),
         error: {
           name: finalError instanceof Error ? finalError.name : "UnknownError",
           data: {

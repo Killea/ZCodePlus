@@ -13,6 +13,7 @@ import { recordModelUsageFact } from "./usage-observability.js";
 
 interface RecordMainTurnModelUsageInput {
   assistantMessageId: MessageId;
+  cancelledByUser?: boolean;
   error?: unknown;
   model: Model;
   modelTraceContext: TraceContext;
@@ -37,6 +38,7 @@ export async function recordMainTurnModelUsage(
   await recordModelUsageFact(runtime, {
     assistantMessageId: input.assistantMessageId,
     error: input.error,
+    cancelledByUser: input.cancelledByUser,
     events: state.events,
     // 运行中切模会立即更新 Session Selection；usage 若在 await 后重新读取它，
     // 就会把旧请求的 token 归到新模型。这里只消费 model step 开始时的不可变快照。

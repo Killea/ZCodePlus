@@ -32,7 +32,10 @@ export interface DevinAcpSessionHandle {
   readonly syncedHash?: string;
 }
 
+type ContextUsage = Pick<Extract<DevinAcpUpdate, { kind: "usage" }>, "used" | "size">;
+
 interface SessionRecord {
+  usage?: ContextUsage;
   acpSessionId: string;
   syncedHash?: string;
 }
@@ -129,6 +132,7 @@ export class DevinAcpBridge {
     // 同 key 并发（如 sidecar 与主回合并行时同 operation 的重试）会重复
     // session/new：后者覆盖 map，前者 session 在 Devin 侧泄漏成幽灵。在途去重，
     // 只有创建发起者拿到 isNew=true（等待者复用结果，不再重发历史前缀）。
+    const transport = this.requireTransport();
     let creating = this.creating.get(sessionKey);
     const isCreator = creating === undefined;
     if (!creating) {
@@ -140,7 +144,7 @@ export class DevinAcpBridge {
     const record = await abortable(creating, signal);
     // await 期间进程可能已重启：旧进程上创建的 sessionId 在新进程里无效，
     // 落进 map 会变成永不自愈的 session-not-found。
-    if (!this.transport?.isRunning) {
+    if (this.transport !== transport || !transport.isRunning) {
       throw new Error("Devin ACP process exited during session/new");
     }
     this.sessions.set(sessionKey, record);
@@ -153,22 +157,31 @@ export class DevinAcpBridge {
     };
   }
 
-  /** 废弃 sessionKey 对应的 ACP session（历史分叉/sidecar 一次性用完）。 */
-  async invalidateSession(sessionKey: string): Promise<void> {
-    this.sessions.delete(sessionKey);
+  /** 仅当前原生会话能提交或废弃快照，旧 prompt 晚到不能改写新会话。 */
+  invalidateSession(sessionKey: string, acpSessionId: string): void {
+    if (this.sessions.get(sessionKey)?.acpSessionId === acpSessionId) {
+      this.sessions.delete(sessionKey);
+      this.markerStates.delete(acpSessionId);
+    }
   }
 
-  /** 记录"Devin 已见历史前缀"指纹（prompt 成功完成后由调用方写入）。 */
-  setSyncedHash(sessionKey: string, hash: string): void {
+  commitPrompt(sessionKey: string, acpSessionId: string, hash: string, usage?: ContextUsage): void {
     const record = this.sessions.get(sessionKey);
-    if (record) record.syncedHash = hash;
+    if (!record || record.acpSessionId !== acpSessionId) return;
+    record.syncedHash = hash;
+    record.usage = usage;
+  }
+
+  readContextUsage(sessionKey: string, prefixHash: string): ContextUsage | undefined {
+    const record = this.sessions.get(sessionKey);
+    return record?.syncedHash === prefixHash ? record.usage : undefined;
   }
 
   /** prompt 失败（超时/中止/传输错误）后把 session 标脏：Devin 侧状态未知。 */
   private markSessionDirty(acpSessionId: string): void {
     for (const [key, record] of this.sessions) {
       if (record.acpSessionId === acpSessionId) {
-        this.sessions.delete(key);
+        this.invalidateSession(key, acpSessionId);
         return;
       }
     }

@@ -3,10 +3,12 @@ import { attachGenUiContext, normalizeGenUiInput } from "./message-history.js";
 import { ModelCallWrapperSchema } from "@zcode/contracts";
 import {
   hydrateToolSearchContent,
-  hydrateCompactDiscovery,
   hydrateToolSearchAnnouncement,
 } from "./tool-search-hydration.js";
-import { parseToolSearchHiddenNames } from "../tool/search/history.js";
+import {
+  compactDiscoveryMetadata,
+  parseToolSearchHiddenNames,
+} from "../tool/search/history.js";
 import { parseAgentListingDelta } from "./agent-listing-metadata.js";
 import { parseEnvironmentAnnouncement } from "../context/sections/env-info.js";
 import { parseInstructionAnnouncement } from "../context/sections/instruction-files.js";
@@ -17,12 +19,14 @@ import { runtimeInputMetadata } from "./runtime-input-presentation.js";
 
 import {
   STREAM_RECOVERY_DISCARDED_ERROR_NAME,
+  compactBoundaryPayloadSchema,
   hasOrderedAssistantBlocks,
   isBrowserTurnScreenshotPart,
   modelMessageContentToText,
   selectActiveConversationBranch,
 } from "@zcode/contracts";
 import type {
+  CompactionPart,
   Logger,
   MessagePart,
   MessageWithParts,
@@ -68,6 +72,14 @@ import { filePartToContentBlock, projectPersistedToolMediaContent } from "./file
 import { selectToolPartsForHistory } from "./tool-part-order.js";
 
 const INTERRUPTED_TOOL_RESULT = "[Tool execution was interrupted before resume]";
+
+function hydrateCompactDiscovery(part: CompactionPart) {
+  // 旧格式只有生效的 compaction part，沿用其持久 ID（去 part_ 前缀），冷起仍能保全这条摘要的正文。
+  if (part.compactBoundary === undefined)
+    return { boundaryId: part.id.replace(/^part_/, "") };
+  const parsed = compactBoundaryPayloadSchema.safeParse(part.compactBoundary);
+  return parsed.success ? compactDiscoveryMetadata(parsed.data) : undefined;
+}
 
 export interface SessionHistoryHydrationResult {
   appliedMessageCount: number;
@@ -160,7 +172,7 @@ export async function hydrateMessageHistoryFromSession(input: {
       const boundaryPart = parts.find(isActiveCompactionBoundaryPart);
       const compactBoundary =
         boundaryPart?.type === "compaction"
-          ? hydrateCompactDiscovery(boundaryPart.compactBoundary)
+          ? hydrateCompactDiscovery(boundaryPart)
           : undefined;
       if (compactBoundary && entries[0]) {
         entries[0] = {

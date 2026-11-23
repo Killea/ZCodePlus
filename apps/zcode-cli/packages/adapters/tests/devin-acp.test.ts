@@ -79,6 +79,18 @@ describe("flattenTranscriptForNewSession", () => {
     expect(transcript).toContain("此前的对话记录");
   });
 
+  it.each([15_417, 65_000])("冷起保留 %i 字符的真实摘要，按剩余空间回放普通历史", (size) => {
+    const summary = "摘要".repeat(Math.floor(size / 2)) + "结束标记";
+    const transcript = flattenTranscriptForNewSession(
+      [user("old".repeat(8_000)), user(summary), assistant("recent".repeat(2_000))],
+      { compactSummaryIndex: 1 },
+    );
+    expect(transcript).toContain(summary);
+    if (size > 60_000) expect(transcript).not.toContain("old");
+    const ordinary = flattenTranscriptForNewSession([user(summary)]);
+    expect(ordinary).not.toContain("结束标记");
+  });
+
   it("tool 消息只保留状态行", () => {
     const hugeOutput = "x".repeat(50_000);
     const transcript = flattenTranscriptForNewSession([
@@ -391,5 +403,131 @@ describe("DevinModelExecutor context usage", () => {
     }
     const finish = events.find((e) => e.type === "finish");
     expect(finish?.usage).toEqual({});
+  });
+});
+
+describe("Devin 主回合续聊", () => {
+  it("队列排空后保存实际回复，同会话分块续聊，编辑历史后冷起", async () => {
+    vi.restoreAllMocks();
+    const { spawn } = await import("node:child_process");
+    vi.mocked(spawn).mockReturnValue(
+      Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        stdin: new PassThrough(),
+      }) as never,
+    );
+    let sessionCount = 0;
+    vi.spyOn(AcpTransport.prototype, "request").mockImplementation(async (method) =>
+      method === "session/new" ? { sessionId: String(++sessionCount) } : {},
+    );
+    const prompt = vi
+      .spyOn(DevinAcpBridge.prototype, "runPrompt")
+      .mockImplementation(async (input) => {
+        input.onUpdate({ kind: "text", text: "A" });
+        input.onUpdate({ kind: "thought", text: "thinking" });
+        input.onUpdate({ kind: "text", text: "B" });
+        input.onUpdate({ kind: "usage", used: 117317, size: 262000 });
+        return { stopReason: "end_turn" };
+      });
+    const executor = new DevinModelExecutor({
+      cwd: process.cwd(),
+      binaryPath: process.execPath,
+      promptTimeoutMs: 1000,
+    });
+    const run = (messages: ModelInputMessage[]) =>
+      runWithModelInvocationContext(
+        {
+          traceContext: { sessionId: "conversation" } as never,
+          modelCall: { operation: "agent_step" },
+        },
+        () =>
+          executor.generateText({
+            messages,
+            options: { reasoningLevel: "default", maxOutputTokens: 100 },
+          }),
+      );
+    await run([user("first")]);
+    const history: ModelInputMessage[] = [
+      user("first"),
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "A" },
+          { type: "reasoning", text: "thinking" },
+          { type: "text", text: "B" },
+        ],
+      },
+      user("second"),
+    ];
+    expect(executor.readSessionContext("conversation", history)).toEqual({
+      used: 117317,
+      size: 262000,
+      pendingText: ["second"],
+    });
+    expect(executor.readSessionContext("other", history)).toBeUndefined();
+    await run(history);
+    expect(prompt.mock.calls[1]?.[0]).toMatchObject({
+      acpSessionId: "1",
+      parts: [{ type: "text", text: "second" }],
+    });
+    const edited = [user("edited"), assistant("AB"), user("second")];
+    expect(executor.readSessionContext("conversation", edited)).toBeUndefined();
+    await run(edited);
+    expect(prompt.mock.calls[2]?.[0].acpSessionId).toBe("2");
+
+    const next = [...edited, assistant("AB"), user("third")];
+    prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    await run(next);
+    const last = [...next, assistant(""), user("fourth")];
+    expect(executor.readSessionContext("conversation", last)).toBeUndefined();
+    prompt.mockImplementationOnce(async ({ onUpdate }) => {
+      onUpdate({ kind: "text", text: "partial" });
+      return { stopReason: "cancelled" };
+    });
+    expect(await run(last)).toMatchObject({ text: "partial", finishReason: "cancelled" });
+    await run([...last, assistant("partial"), user("resume")]);
+    expect(prompt.mock.calls.at(-1)?.[0].acpSessionId).toBe("3");
+
+    const afterResume = [
+      ...last, assistant("partial"), user("resume"), assistant("AB"), user("next"),
+    ];
+    await runWithModelInvocationContext(
+      {
+        traceContext: { sessionId: "conversation" } as never,
+        modelCall: { operation: "agent_step" },
+      },
+      async () => {
+        for await (const event of executor.streamText({
+          messages: afterResume,
+          options: { reasoningLevel: "default", maxOutputTokens: 100 },
+        })) {
+          if (event.type === "text_delta") break;
+        }
+      },
+    );
+    expect(executor.readSessionContext("conversation", afterResume)).toBeUndefined();
+    await run(afterResume);
+    expect(prompt.mock.calls.at(-1)?.[0].acpSessionId).toBe("4");
+
+    // 取消的 sidecar 即使产出了部分摘要也不能作为一次成功的 generateText 返回。
+    prompt.mockImplementationOnce(async ({ onUpdate }) => {
+      onUpdate({ kind: "text", text: "partial summary" });
+      return { stopReason: "cancelled" };
+    });
+    await expect(
+      runWithModelInvocationContext(
+        {
+          traceContext: { sessionId: "conversation" } as never,
+          modelCall: { operation: "context_compaction" },
+        },
+        () =>
+          executor.generateText({
+            messages: [user("summarize")],
+            options: { reasoningLevel: "default", maxOutputTokens: 100 },
+          }),
+      ),
+    ).rejects.toMatchObject({ code: "model_request_cancelled" });
+    vi.restoreAllMocks();
   });
 });

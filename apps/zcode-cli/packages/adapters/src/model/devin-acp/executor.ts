@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  ModelErrorCode,
+  ModelProtocolError,
   getCurrentModelInvocationContext,
   modelMessageContentToText,
   type ModelEvent,
@@ -105,6 +107,16 @@ export class DevinModelExecutor implements ModelExecutor {
     this.contextForward = options.contextForward ?? "memory-only";
   }
 
+  readSessionContext(sessionId: string, messages: ModelExecutionRequest["messages"]) {
+    const prefix = messages.slice(0, unseenStartIndex(messages));
+    const usage = this.bridge.readContextUsage(sessionId, hashMessagesForSync(prefix));
+    if (!usage) return undefined;
+    const pendingText = this.buildPromptParts(messages, false).flatMap((part) =>
+      part.type === "text" ? [part.text] : [],
+    );
+    return { used: usage.used, size: usage.size, pendingText };
+  }
+
   /** 连通性测试入口：执行真实的 spawn+initialize+authenticate，不发 prompt。 */
   async probe(): Promise<{ version?: string }> {
     return this.bridge.probe();
@@ -114,14 +126,16 @@ export class DevinModelExecutor implements ModelExecutor {
     let text = "";
     let finishReason = "stop";
     let usage: ModelResult["usage"] = {};
+    let providerMetadata: ModelResult["providerMetadata"];
     for await (const event of this.streamText(request)) {
       if (event.type === "text_delta") text += event.text;
       if (event.type === "finish") {
         finishReason = event.finishReason;
         usage = event.usage;
+        providerMetadata = event.providerMetadata;
       }
     }
-    return { text, finishReason, usage };
+    return { text, finishReason, usage, providerMetadata };
   }
 
   async *streamText(request: ModelExecutionRequest): AsyncGenerator<ModelEvent> {
@@ -143,12 +157,10 @@ export class DevinModelExecutor implements ModelExecutor {
     // AbortController 必须在 ensureSession 之前建好：取消要覆盖
     // initialize/authenticate/session/new 阶段，不只是 prompt 阶段。
     const cancel = new AbortController();
-    const upstream = request.abortSignal;
-    if (upstream) {
-      if (upstream.aborted) cancel.abort();
-      else upstream.addEventListener("abort", () => cancel.abort(), { once: true });
-    }
-    let handle = await this.bridge.ensureSession(sessionKey, cancel.signal);
+    const signal = request.abortSignal
+      ? AbortSignal.any([request.abortSignal, cancel.signal])
+      : cancel.signal;
+    let handle = await this.bridge.ensureSession(sessionKey, signal);
     if (isMainTurn && !handle.isNew) {
       // ZCode 侧历史可能被编辑/回滚/fork/换模型——用"Devin 已见前缀 hash"
       // 校验续聊前提；不一致时废弃 ACP session 重建，否则增量续聊会让
@@ -157,12 +169,16 @@ export class DevinModelExecutor implements ModelExecutor {
         request.messages.slice(0, unseenStartIndex(request.messages)),
       );
       if (handle.syncedHash !== prefixHash) {
-        await this.bridge.invalidateSession(sessionKey);
-        handle = await this.bridge.ensureSession(sessionKey);
+        this.bridge.invalidateSession(sessionKey, handle.acpSessionId);
+        handle = await this.bridge.ensureSession(sessionKey, signal);
       }
     }
     const parts = isMainTurn
-      ? this.buildPromptParts(request.messages, handle.isNew)
+      ? this.buildPromptParts(
+          request.messages,
+          handle.isNew,
+          invocation?.compactSummaryMessageIndex,
+        )
       : this.buildSidecarParts(request.messages);
     if (parts.length === 0) {
       yield { type: "finish", finishReason: "stop", usage: {} };
@@ -193,7 +209,7 @@ export class DevinModelExecutor implements ModelExecutor {
       }
     };
 
-    let promptSettled = false;
+    let consumedFinish = false;
     // Devin 已见历史 = request.messages + 本轮 Devin 自己的回复（ZCode 会把
     // 回复持久化为 assistant 消息，下轮前缀 hash 必须覆盖它，否则每轮都
     // 误判分叉重建 session）。只累计 text_delta（含工具标记），reasoning
@@ -203,29 +219,12 @@ export class DevinModelExecutor implements ModelExecutor {
       const promptDone = this.bridge.runPrompt({
         acpSessionId: handle.acpSessionId,
         parts,
-        signal: cancel.signal,
+        signal,
         onUpdate: (update) => updates.push(update),
       });
       promptDone.then(
-        (result) => {
-          promptSettled = true;
-          // prompt 成功送达并完成：记录 Devin 已见历史前缀（含本轮回复），
-          // 供下轮续聊校验。
-          if (isMainTurn) {
-            this.bridge.setSyncedHash(
-              sessionKey,
-              hashMessagesForSync([
-                ...request.messages,
-                { role: "assistant", content: finalText },
-              ]),
-            );
-          }
-          updates.complete(result.stopReason);
-        },
-        (error: unknown) => {
-          promptSettled = true;
-          updates.fail(error);
-        },
+        (result) => updates.complete(result.stopReason),
+        (error: unknown) => updates.fail(error),
       );
 
       let stopReason = "end_turn";
@@ -277,6 +276,24 @@ export class DevinModelExecutor implements ModelExecutor {
       }
       yield* closeReasoning();
       yield* closeText();
+      // prompt 响应可与最后一批更新同帧到达。队列排空后才有与持久化正文一致的完整指纹。
+      if (stopReason === "cancelled") {
+        this.bridge.invalidateSession(sessionKey, handle.acpSessionId);
+        if (!isMainTurn) {
+          throw new ModelProtocolError(
+            ModelErrorCode.ModelRequestCancelled,
+            "Devin ACP cancelled the prompt",
+          );
+        }
+      } else if (isMainTurn) {
+        this.bridge.commitPrompt(
+          sessionKey,
+          handle.acpSessionId,
+          hashMessagesForSync([...request.messages, { role: "assistant", content: finalText }]),
+          latestUsage,
+        );
+      }
+      consumedFinish = true;
       yield {
         type: "finish",
         finishReason: mapStopReason(stopReason),
@@ -295,10 +312,13 @@ export class DevinModelExecutor implements ModelExecutor {
     } finally {
       // 消费方提前 break/丢弃 generator（非 abortSignal 路径）时 abort：
       // 在途请求走 cancel；排队中的 prompt 因此不再发出。
-      if (!promptSettled) cancel.abort();
+      // 即便完成响应已到达，提前停止消费也使本地历史与原生会话可能不一致。
+      if (!consumedFinish) cancel.abort();
       // sidecar session 一次性使用：复用会让每次 compact/标题调用的完整
       // 转录在同一 ACP session 里累积膨胀并互相污染。
-      if (!isMainTurn) await this.bridge.invalidateSession(sessionKey);
+      if (!isMainTurn || !consumedFinish) {
+        this.bridge.invalidateSession(sessionKey, handle.acpSessionId);
+      }
     }
   }
 
@@ -313,6 +333,7 @@ export class DevinModelExecutor implements ModelExecutor {
   private buildPromptParts(
     messages: ModelExecutionRequest["messages"],
     isNewSession: boolean,
+    compactSummaryIndex?: number,
   ): DevinAcpPromptPart[] {
     if (findLastUserMessageIndex(messages) < 0) return [];
     const unseenStart = unseenStartIndex(messages);
@@ -328,7 +349,10 @@ export class DevinModelExecutor implements ModelExecutor {
       }
       const history = messages.slice(0, unseenStart);
       if (history.length > 0) {
-        parts.push({ type: "text", text: flattenTranscriptForNewSession(history) });
+        parts.push({
+          type: "text",
+          text: flattenTranscriptForNewSession(history, { compactSummaryIndex }),
+        });
       }
     }
 

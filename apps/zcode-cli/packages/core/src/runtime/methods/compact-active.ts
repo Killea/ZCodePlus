@@ -449,6 +449,15 @@ async function compactActiveConversationImpl(
           }),
         };
 
+        const usageRequest = {
+          attemptIndex: compactPromptTooLongAttempts,
+          events,
+          model: compactModel,
+          networkEventStartIndex,
+          querySource: "compact",
+          startedAt: modelStartedAt,
+          traceContext: modelTraceContext,
+        };
         try {
           result = await runCompactSummaryModelRequest({
             logger: this.logger,
@@ -456,20 +465,14 @@ async function compactActiveConversationImpl(
             request: compactModelRequest,
           });
         } catch (error) {
+          const cancelled = isTurnCancellationError(error, options.abortSignal);
           await recordModelUsageFact(this, {
-            attemptIndex: compactPromptTooLongAttempts,
+            ...usageRequest,
             error,
-            events,
-            model: compactModel,
-            networkEventStartIndex,
-            querySource: "compact",
-            startedAt: modelStartedAt,
-            status: isTurnCancellationError(error, options.abortSignal) ? "cancelled" : "error",
-            traceContext: modelTraceContext,
+            status: cancelled ? "cancelled" : "error",
+            cancelledByUser: cancelled && options.abortSignal?.aborted === true,
           });
-          if (isTurnCancellationError(error, options.abortSignal)) {
-            throw error;
-          }
+          if (cancelled) throw error;
           if (isModelMediaTooLargeError(error) && !stripMediaForSummary) {
             stripMediaForSummary = true;
             this.logger?.info(
@@ -496,16 +499,10 @@ async function compactActiveConversationImpl(
         }
 
         await recordModelUsageFact(this, {
-          attemptIndex: compactPromptTooLongAttempts,
-          events,
-          model: compactModel,
-          networkEventStartIndex,
-          querySource: "compact",
+          ...usageRequest,
           result,
-          startedAt: modelStartedAt,
           status: "completed",
           toolCallCount: this.extractToolCallsFromResult(result).length,
-          traceContext: modelTraceContext,
         });
         const contextError = createCompactContextExceededFinishError(result);
         if (contextError) {

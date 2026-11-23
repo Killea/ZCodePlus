@@ -3464,6 +3464,62 @@ describe("AgentRuntime manual compact", () => {
     expect([...readFileState.values()]).toEqual(readFileStateBefore);
   });
 
+  it.each([
+    { used: 117_317, expected: false },
+    { used: 223_000, expected: false },
+    { used: 227_999, expected: true },
+    { used: 260_000, expected: true },
+    { used: undefined, expected: false },
+  ])(
+    "uses the live managed context for proactive compaction ($used)",
+    async ({ used, expected }) => {
+      const sessionId = createSessionId("managed-context");
+      const summary = "A previous turn was compacted.";
+      let forwardedSummary: string | undefined;
+      const factory = createTestModelFactory(
+        withStreamTextFromGenerateText({
+          async generateText(request, { invocationContext }) {
+            if (invocationContext?.modelCall?.operation === "context_compaction") {
+              return { text: summary, finishReason: "stop", usage: {} };
+            }
+            const index = invocationContext?.compactSummaryMessageIndex;
+            if (index !== undefined && index >= 0) {
+              forwardedSummary = providerContentToText(request.messages[index].content);
+            }
+            return {
+              text: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 250_000, outputTokens: 100 },
+            };
+          },
+        }),
+      );
+      let warm = false;
+      const runtime = createTestAgentRuntime(
+        sessionId,
+        { compact: { contextWindow: 256_000 } },
+        {
+          eventStore: createTestSessionEventStore(),
+          modelFactory: (input) => ({
+            ...factory(input),
+            requestCapabilities: {
+              readSessionContext: () =>
+                warm && used !== undefined
+                  ? { used, size: 262_000, pendingText: ["continue"] }
+                  : undefined,
+            },
+          }),
+        },
+      );
+      await runtime.executeTurn("setup");
+      await runtime.executeTurn("build more history");
+      warm = true;
+      const result = await runtime.executeTurn("continue");
+      expect(result.events.some((e) => e.type === SessionEventType.CompactBoundary)).toBe(expected);
+      if (expected) expect(forwardedSummary).toContain(summary);
+    },
+  );
+
   it("auto compacts before a model request when the active context crosses the threshold", async () => {
     const sessionId = createSessionId("runtime-auto-compact");
     const eventStore = createTestSessionEventStore();
