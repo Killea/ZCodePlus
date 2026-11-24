@@ -148,6 +148,7 @@ deleteGlobalMemory({id}): Promise<void>
 - **picker 内快速增删改/复制**（2026-11-24）：不离开 composer 即可维护全局记忆，协议不变（复用现有 `IMemoryService` 方法，无新增 wire 字段；picker 契约不变——数据与回调均由宿主注入，picker 不接触服务）。
   - 入口：菜单顶部「新建记忆」`DropdownMenuItem` 行（Plus 图标，键盘可达）；条目 hover 时行尾出现操作条（编辑 ✎ / 复制 ⧉ / 删除 🗑 图标，`opacity` 随 `group-hover` 显隐，仅鼠标可达——嵌套交互元素放在 CheckboxItem 的 `<button>` 内，用 `role="button"` span 实现）。**事件必须拦断 pointerdown + pointerup + click**：Radix 菜单项用 pointerdown 跟踪、**pointerup 激活**（CheckboxItem 在 pointerup 上触发 `onCheckedChange`），只拦 click/pointerdown 不够，图标点击会冒泡到条目造成误勾选（浏览器验收「操作条点击不得误切换勾选」覆盖）。
   - 编辑框：新建/编辑/复制共用一个 Radix Dialog（name ≤80、description ≤200、content ≤20480，计数实时提示；新建/复制 name 必填，编辑 name 留空回退显示名——与设置页 `GlobalMemoryEditor` 同口径）。**打开弹层前先关闭 picker 菜单**：菜单 z-[60] 高于 Dialog 的 z-50，叠层时菜单会盖住弹层；保存/取消后菜单不自动重开，清单随下次菜单打开时既有拉取刷新（不在 mutation 后立即重复拉取）。
+  - **弹层尺寸**（2026-11-24 调整，防短窗口裁切）：基础 `DialogContent` 垂直居中（`top-1/2 -translate-y-1/2`）且高度随内容——短窗口下底部溢出视口、落到系统任务栏后面看不见。编辑框覆盖为显式尺寸 `h-[min(90vh,44rem)] w-[min(90vw,40rem)]`（加宽加高，视口 90% 封顶）：头/尾取自然高度，中间字段区 `flex-1 min-h-0`，正文 Textarea `flex-1 min-h-0`（替代 `min-h-40`/`resize-y`——高度已随弹层确定，字段不再拖拽）。删除确认框尺寸小不受影响。验收断言：短视口（高度 ≤560px）下弹层底边不出视口。
   - 复制 = 预填的新建：content 取源条目（`onReadMemoryContent` 缓存/懒读），name = 源自定义名 + 「（副本）」后缀；源未命名时——非 default 用 id，default 留空由用户填写。保存走 `createGlobalMemory`（slug 派生与冲突消解不变）。
   - 删除：AlertDialog 确认（标题/描述复用设置页键）；成功后宿主同步从 `globalMemorySelectedIds` 移除该 id（徽章计数即时正确），CLI 静默跳过语义不变。
   - 缓存失效：编辑/删除成功后 picker 删除该 id 的 hover 正文缓存（避免预览显示旧正文）；新建/复制不动缓存。宿主回调返回 false（服务失败）时弹层保持打开并显示错误文案，不关闭。
@@ -185,4 +186,4 @@ deleteGlobalMemory({id}): Promise<void>
   - 协议：旧 bool → `["default"]` 映射；`[]` 显式无注入；ids 去重保序；非法 id 跳过；schema `.max(4)`。
   - CLI：选中注入顺序、全部无效 id 不注入、turn 快照在 context-refresh 中稳定。
   - UI：picker 序列化、第 5 项 disabled、发送成功复位、设置页列表/新建/编辑/删除。
-  - UI：picker 快速增删改/复制——新建（空名拦截、保存后入列）、编辑（预填+保存后正文更新）、复制（预填正文+「（副本）」后缀）、删除（确认后移除+选中集清理）、打开弹层先关菜单。
+  - UI：picker 快速增删改/复制——新建（空名拦截、保存后入列）、编辑（预填+保存后正文更新）、复制（预填正文+「（副本）」后缀）、删除（确认后移除+选中集清理）、打开弹层先关菜单；编辑弹层 90% 视口封顶尺寸（短窗口不裁切）。

@@ -2,7 +2,8 @@
 // （docs/global-memory-multi.md「条目 hover 内容 tooltip」）。
 // 覆盖：完整正文展示（不截断）、侧放不叠菜单、纵向滚动、空内容占位、
 // 指针离开宽限期关闭、菜单关闭立即关闭、快速增删改/复制（新建/编辑/复制/
-// 删除/空名拦截）。运行：node --test memory-picker-content-tooltip.test.mjs
+// 删除/空名拦截）、编辑弹层尺寸（短视口 90vh 封顶、底边不出视口）。
+// 运行：node --test memory-picker-content-tooltip.test.mjs
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -371,6 +372,54 @@ test("新建对话框：空名称拦截保存（保存禁用、对话框保持�
     assert.ok(await nameInput.isVisible(), "空名称时对话框应保持打开");
     await nameInput.fill("Named memory");
     assert.ok(!(await saveButton.isDisabled()), "填写名称后保存应放行");
+  } finally {
+    assert.equal(errors.length, 0, `pageerror: ${errors.join(" | ")}`);
+    await page.close();
+  }
+});
+
+// 弹层尺寸（docs/global-memory-multi.md「弹层尺寸」）：基础 DialogContent 高度随内容、
+// 短窗口下底部溢出视口（被系统任务栏遮挡）。编辑框覆盖为 90% 视口封顶：
+// 短视口下顶/底边都在视口内，正文区弹性伸展，底部保存按钮可见。
+test("编辑弹层尺寸：短视口下 90% 视口封顶、完整可见（底部不被遮挡）", async () => {
+  const page = await browser.newPage({ viewport: { width: 1100, height: 520 } });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  try {
+    await page.goto(`${origin}fixture?`);
+    await openMenu(page);
+    await page.locator('[data-testid="v4-composer-memory-picker-new"]').click();
+    const dialog = page.locator('[data-slot="dialog-content"]');
+    await dialog.waitFor({ state: "visible" });
+    // 弹层带 zoom-in-95 入场动画（100ms），visible 在动画早期即返回——等动画结束再测量。
+    await page.waitForTimeout(200);
+    const box = await dialog.boundingBox();
+    assert.ok(box, "弹层应有几何盒");
+    // 90vh 封顶：520 * 0.9 = 468。顶/底边都在视口内（此前高度随内容会下溢）。
+    assert.ok(Math.abs(box.height - 468) <= 2, `高度应为 90vh≈468px，实际 ${box.height}`);
+    assert.ok(box.y >= 0, `顶边在视口内（y ${box.y}）`);
+    assert.ok(box.y + box.height <= 520, `底边在视口内（y+h ${box.y + box.height} ≤ 520）`);
+    // 宽度加宽：min(90vw,40rem) = min(990, 640) = 640px。
+    assert.ok(Math.abs(box.width - 640) <= 2, `宽度应为 640px（40rem），实际 ${box.width}`);
+    // 正文区弹性伸展：高于旧的固定 min-h-40（160px），随视口增长（短视口下实测 ~193px）。
+    const contentBox = await page
+      .locator('[data-testid="v4-composer-memory-picker-dialog-content"]')
+      .boundingBox();
+    assert.ok(contentBox, "正文区应有几何盒");
+    assert.ok(
+      contentBox.height > 160,
+      `正文区应弹性伸展（>160px 旧固定值），实际 ${contentBox.height}`,
+    );
+    assert.ok(contentBox.y + contentBox.height <= 520, "正文区底边在视口内");
+    // 底部保存按钮完整可见（用户反馈的「下边根本看不见」）。
+    const saveBox = await page
+      .locator('[data-testid="v4-composer-memory-picker-dialog-save"]')
+      .boundingBox();
+    assert.ok(saveBox, "保存按钮应有几何盒");
+    assert.ok(
+      saveBox.y + saveBox.height <= 520,
+      `保存按钮底边在视口内（${saveBox.y + saveBox.height} ≤ 520）`,
+    );
   } finally {
     assert.equal(errors.length, 0, `pageerror: ${errors.join(" | ")}`);
     await page.close();

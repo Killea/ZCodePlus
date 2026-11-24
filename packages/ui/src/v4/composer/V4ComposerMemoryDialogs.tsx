@@ -6,6 +6,9 @@
 //   高于 Dialog 的 z-50，叠层时菜单会盖住弹层。
 // - 校验与设置页 GlobalMemoryEditor 同口径：name ≤80、description ≤200、content ≤20480；
 //   新建/复制 name 必填，编辑 name 留空回退显示名。
+// - 尺寸：基础 DialogContent 垂直居中且高度随内容，短窗口下底部溢出视口（落到系统
+//   任务栏后面）。编辑框覆盖为显式尺寸 h-[min(90vh,44rem)] w-[min(90vw,40rem)]，
+//   头/尾自然高度、正文区 flex-1 伸展（docs/global-memory-multi.md「弹层尺寸」）。
 // - 宿主未提供对应回调时 picker 不渲染对应入口（降级场景）。
 import { useState, type MouseEvent } from "react";
 import { SaveIcon } from "lucide-react";
@@ -116,7 +119,12 @@ export function V4ComposerMemoryEditDialog({
         if (!nextOpen) onClose();
       }}
     >
-      <DialogContent className="max-w-lg">
+      {/*
+        显式尺寸覆盖基础 DialogContent 的「居中 + 高度随内容」：短窗口下内容撑高会
+        让底部溢出视口（被系统任务栏遮挡）。90% 视口封顶，加宽到 40rem，正文区伸展。
+        （flex 覆盖基础 grid；tailwind-merge 保留后写的 display。）
+      */}
+      <DialogContent className="flex h-[min(90vh,44rem)] w-[min(90vw,40rem)] flex-col">
         <DialogHeader>
           <DialogTitle data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-dialog-title`}>
             {title}
@@ -125,7 +133,8 @@ export function V4ComposerMemoryEditDialog({
             {intl.formatMessage({ id: "chat.toolbar.memory.dialogDescription" })}
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-2">
+        {/* 中间字段区弹性占满剩余高度；min-h-0 允许收缩，极端矮视口下兜底滚动。 */}
+        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
           <div className="grid gap-1">
             <Input
               value={name}
@@ -158,7 +167,8 @@ export function V4ComposerMemoryEditDialog({
             data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-dialog-description`}
             className={fieldClassName}
           />
-          <div className="grid gap-1">
+          <div className="flex min-h-0 flex-1 flex-col gap-1">
+            {/* 正文 Textarea 占满剩余高度（弹层已 90vh 封顶，去掉 min-h-40/resize-y 固定高度）。 */}
             <Textarea
               value={content}
               onChange={(event) => setContent(event.target.value)}
@@ -167,7 +177,7 @@ export function V4ComposerMemoryEditDialog({
               placeholder={intl.formatMessage({ id: "settings.memory.global.empty" })}
               aria-label={intl.formatMessage({ id: "settings.memory.global.editorLabel" })}
               data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-dialog-content`}
-              className={cn(fieldClassName, "min-h-40 resize-y text-ui-base/relaxed")}
+              className={cn(fieldClassName, "min-h-0 flex-1 text-ui-base/relaxed")}
             />
             <div className="flex items-center justify-between">
               <FieldCounter
