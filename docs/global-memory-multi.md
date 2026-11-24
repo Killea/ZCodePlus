@@ -11,13 +11,13 @@ last_updated: 2026-11-24
 
 ## 现状（单文件基线）
 
-| 层 | 现状 |
-| --- | --- |
-| 存储 | `~/.zcode/cli/memories/global/MEMORY.md` 单文件，`GLOBAL_MEMORY_CHARACTER_LIMIT = 20480` |
-| CLI 注入 | `buildGlobalMemorySection` 单 section；`turnGlobalMemoryIncluded` 逐轮 bool |
-| Composer | `V4ComposerGlobalMemorySwitch` 单选开关 → `includeGlobalMemory` |
-| 设置页 | `GlobalMemoryEditor` 单 textarea |
-| 服务 | `IMemoryService.readGlobalMemoryFile / writeGlobalMemoryFile`（`MEMORY.md` 专用） |
+| 层       | 现状                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------- |
+| 存储     | `~/.zcode/cli/memories/global/MEMORY.md` 单文件，`GLOBAL_MEMORY_CHARACTER_LIMIT = 20480` |
+| CLI 注入 | `buildGlobalMemorySection` 单 section；`turnGlobalMemoryIncluded` 逐轮 bool              |
+| Composer | `V4ComposerGlobalMemorySwitch` 单选开关 → `includeGlobalMemory`                          |
+| 设置页   | `GlobalMemoryEditor` 单 textarea                                                         |
+| 服务     | `IMemoryService.readGlobalMemoryFile / writeGlobalMemoryFile`（`MEMORY.md` 专用）        |
 
 ## 产品规则
 
@@ -25,6 +25,7 @@ last_updated: 2026-11-24
 2. **存量 `MEMORY.md` 永久映射 id `default`**——零迁移。`default` 是**保留 id**：服务层 `create` 拒绝该 id；扫描时忽略同目录 `default.md`（防止与 `MEMORY.md` 双映射同 id）。删除 `default` 即删除 `MEMORY.md`，允许。
 3. **slug 校验**：`^[a-z0-9][a-z0-9-]{0,39}$`（小写字母数字连字符，1–40 字符）。服务层与 CLI 注入侧各自强制校验——id 来自 wire/文件名，未通过校验的一律不拼路径（防目录穿越）。
 4. **文件结构 = frontmatter + body**：
+
    ```
    ---
    name: <显示名>
@@ -33,21 +34,23 @@ last_updated: 2026-11-24
 
    <body>
    ```
+
    frontmatter 只认 `name`/`description` 两个键；文件首行必须是 `---` 才尝试解析，缺省回退文件名/`default` 的本地化显示名。服务是唯一写路径，`write` 重组 canonical frontmatter，未知 frontmatter 键随写回规范化丢弃。
+
 5. **单文件 body ≤ 20480 字符**（含 `MEMORY.md` 既有语义，frontmatter 不计入；2026-11-24 自 2048 上调）；`name ≤ 80`、`description ≤ 200` 字符。
 6. **静态加密**：`.md` 文件整体落盘为 `enc:v1:` 前缀的 AES-256-GCM 密文（复用 `credentialCipherProvider` 线格式：`<iv>.<authTag>.<cipherText>` base64url；密钥 = `sha256(ZCODE_CREDENTIAL_SECRET || zcode-credential-fallback:{platform}:{homedir}:{username})`，与 credentials.json 同一口径）。服务层与 CLI 注入侧各自实现同格式 codec，读时无 `enc:v1:` 前缀按明文透明兼容；**明文文件在任一读写入口触发就地迁移**——先内存 roundtrip 验证密文可解，再 atomic 替换原文。解密失败：list/注入静默跳过（warn），单条 read 抛解密错误。文件名保持明文 slug（仅泄漏条目存在性，不泄漏内容）；工作区 `memory/` 不在本范围。**安全边界**：密钥可由同用户进程按公开公式推导，防的是文件内容被其他工具/备份直接读走，不是防同用户定向攻击；后续可升级 OS 钥匙串托管密钥。
 7. **上限**：记忆总条数不限——默认不注入任何全局记忆、用户逐条 opt-in 才发送，总量与 context 体积无关；仅保留单轮最多选 4 条注入。
-7. **注入 = 每轮 opt-in，不落库**：勾选集合仅 Composer 组件态，发送成功复位；协议携带 `includedGlobalMemoryIds?: string[]`（保留 `includeGlobalMemory?: boolean` 兼容）。
-8. **语义（ids 权威）**：
+8. **注入 = 每轮 opt-in，不落库**：勾选集合仅 Composer 组件态，发送成功复位；协议携带 `includedGlobalMemoryIds?: string[]`（保留 `includeGlobalMemory?: boolean` 兼容）。
+9. **语义（ids 权威）**：
    - ids 非空 → 注入所选（按 ids 顺序）；
    - ids = `[]` → 显式不注入（即便 bool 为 true）；
    - ids 缺失 + `includeGlobalMemory: true` → `["default"]`（旧客户端兼容）；
    - ids 与 bool 均缺失 → 不注入。
-9. **无效 id 静默跳过**：重复去重（保序）、已删除/非法 id 不报错、不阻断 turn；全部无效 → 不注入，不生成空段。
-10. **全局记忆默认常开，不提供关闭开关**（2026-10-26 起）：`AppSettings.globalMemoryEnabled` 总开关整体移除——设置页开关、`AppSettings` 协议字段、`ZCodeSessionRuntimePreferencesResult.globalMemoryEnabled` 字段、host→CLI 运行时门控全部删除；desktop 链路 CLI `runtimeConfig.memory.globalEnabled` 恒为 `true`，CLI 总是读取记忆目录并可用。唯一用户控制点是 composer 逐条 opt-in（空选择 = 本轮不注入）。旧持久化 settings 中的 `globalMemoryEnabled` 键在解析边界被忽略（未知字段剥离）；旧 intent/row 的 `includeGlobalMemory` 布尔兼容分支保留不变。TUI/CLI 独立链路（本就没有此开关）行为不变。
-11. **排序**：`default` 固定列表首位，其余按 `name` localeCompare + id 兜底——与 updatedAt 抖动解耦，列表确定。
-12. **创建**：UI 只填 name（+可选 description/content）；slug 由服务从 name 规范化派生，冲突自动追加 `-2`/`-3`…直至唯一。
-13. **空记忆**：body 为空的条目照常出现在列表与 picker；注入时按空块处理。
+10. **无效 id 静默跳过**：重复去重（保序）、已删除/非法 id 不报错、不阻断 turn；全部无效 → 不注入，不生成空段。
+11. **全局记忆默认常开，不提供关闭开关**（2026-10-26 起）：`AppSettings.globalMemoryEnabled` 总开关整体移除——设置页开关、`AppSettings` 协议字段、`ZCodeSessionRuntimePreferencesResult.globalMemoryEnabled` 字段、host→CLI 运行时门控全部删除；desktop 链路 CLI `runtimeConfig.memory.globalEnabled` 恒为 `true`，CLI 总是读取记忆目录并可用。唯一用户控制点是 composer 逐条 opt-in（空选择 = 本轮不注入）。旧持久化 settings 中的 `globalMemoryEnabled` 键在解析边界被忽略（未知字段剥离）；旧 intent/row 的 `includeGlobalMemory` 布尔兼容分支保留不变。TUI/CLI 独立链路（本就没有此开关）行为不变。
+12. **排序**：`default` 固定列表首位，其余按 `name` localeCompare + id 兜底——与 updatedAt 抖动解耦，列表确定。
+13. **创建**：UI 只填 name（+可选 description/content）；slug 由服务从 name 规范化派生，冲突自动追加 `-2`/`-3`…直至唯一。
+14. **空记忆**：body 为空的条目照常出现在列表与 picker；注入时按空块处理。
 
 ## Agent 端注入结构
 
@@ -142,6 +145,14 @@ deleteGlobalMemory({id}): Promise<void>
   - 定位（2026-11-24 调整：初版「贴条目下方」会盖住菜单列表其余条目，改为侧放不重叠）：**默认菜单本体右侧**（gap 8px，面板顶边对齐 hover 条目顶边并纵向 clamp 进视口）；右侧放不下时翻到菜单左侧；两侧都放不下（窄视口）时回退到菜单上方，水平与菜单左对齐；菜单矩形取不到（异常路径）才回退旧的贴条目下方逻辑。菜单矩形经 `event.currentTarget.closest('[data-slot="dropdown-menu-content"]')` 在 hover 时快照（wrapper 不转发 ref，不为此改共享组件）。
   - 关闭：指针移出条目与面板后 150ms 宽限期关闭（覆盖两者之间的间隙移动）；菜单关闭立即关闭；触屏（coarse pointer）不展示（无 hover 语义）。
   - 上限 disabled（第 5 条起）的条目同样可 hover 预览——信息展示与可勾选性解耦。
+- **picker 内快速增删改/复制**（2026-11-24）：不离开 composer 即可维护全局记忆，协议不变（复用现有 `IMemoryService` 方法，无新增 wire 字段；picker 契约不变——数据与回调均由宿主注入，picker 不接触服务）。
+  - 入口：菜单顶部「新建记忆」`DropdownMenuItem` 行（Plus 图标，键盘可达）；条目 hover 时行尾出现操作条（编辑 ✎ / 复制 ⧉ / 删除 🗑 图标，`opacity` 随 `group-hover` 显隐，仅鼠标可达——嵌套交互元素放在 CheckboxItem 的 `<button>` 内，用 `role="button"` span 实现）。**事件必须拦断 pointerdown + pointerup + click**：Radix 菜单项用 pointerdown 跟踪、**pointerup 激活**（CheckboxItem 在 pointerup 上触发 `onCheckedChange`），只拦 click/pointerdown 不够，图标点击会冒泡到条目造成误勾选（浏览器验收「操作条点击不得误切换勾选」覆盖）。
+  - 编辑框：新建/编辑/复制共用一个 Radix Dialog（name ≤80、description ≤200、content ≤20480，计数实时提示；新建/复制 name 必填，编辑 name 留空回退显示名——与设置页 `GlobalMemoryEditor` 同口径）。**打开弹层前先关闭 picker 菜单**：菜单 z-[60] 高于 Dialog 的 z-50，叠层时菜单会盖住弹层；保存/取消后菜单不自动重开，清单随下次菜单打开时既有拉取刷新（不在 mutation 后立即重复拉取）。
+  - 复制 = 预填的新建：content 取源条目（`onReadMemoryContent` 缓存/懒读），name = 源自定义名 + 「（副本）」后缀；源未命名时——非 default 用 id，default 留空由用户填写。保存走 `createGlobalMemory`（slug 派生与冲突消解不变）。
+  - 删除：AlertDialog 确认（标题/描述复用设置页键）；成功后宿主同步从 `globalMemorySelectedIds` 移除该 id（徽章计数即时正确），CLI 静默跳过语义不变。
+  - 缓存失效：编辑/删除成功后 picker 删除该 id 的 hover 正文缓存（避免预览显示旧正文）；新建/复制不动缓存。宿主回调返回 false（服务失败）时弹层保持打开并显示错误文案，不关闭。
+  - 宿主接线（`ConversationComposer`）：`onCreateMemory` / `onUpdateMemory` / `onDeleteMemory` 三个回调分别对接 `createGlobalMemory` / `writeGlobalMemory` / `deleteGlobalMemory`，失败捕获后返回 false。
+  - 宿主未提供对应回调时（降级场景）：缺失能力的入口不渲染（无新建回调则无顶部行与复制图标）。
 - `ConversationComposer` 状态 `globalMemorySelectedIds: ReadonlySet<string>`（替代 `globalMemoryOptIn`）；发送 payload `includedGlobalMemoryIds: [...ids]`（空集不写字段），随 `...submission` 扩散到全部 sendText 站点；**发送成功复位为空集**（沿用 optIn 复位点）。
 - `ComposerSubmissionConfig.includedGlobalMemoryIds?: string[]`——发送方冻结，与 includeGlobalMemory 同生命周期。
 - 勾选的记忆在发送前被删（另一窗口/CLI）→ 照常发送，CLI 静默跳过。
@@ -174,3 +185,4 @@ deleteGlobalMemory({id}): Promise<void>
   - 协议：旧 bool → `["default"]` 映射；`[]` 显式无注入；ids 去重保序；非法 id 跳过；schema `.max(4)`。
   - CLI：选中注入顺序、全部无效 id 不注入、turn 快照在 context-refresh 中稳定。
   - UI：picker 序列化、第 5 项 disabled、发送成功复位、设置页列表/新建/编辑/删除。
+  - UI：picker 快速增删改/复制——新建（空名拦截、保存后入列）、编辑（预填+保存后正文更新）、复制（预填正文+「（副本）」后缀）、删除（确认后移除+选中集清理）、打开弹层先关菜单。

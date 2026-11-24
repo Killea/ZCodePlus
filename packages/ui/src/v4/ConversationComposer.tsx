@@ -845,6 +845,67 @@ function ConversationComposerImpl({
     },
     [services],
   );
+  // picker 快速增删改写路径（docs/global-memory-multi.md「picker 内快速增删改/复制」）：
+  // 成功返回 true（弹层关闭），失败捕获后返回 false（弹层保持打开报错）。
+  // 清单不在此处刷新——菜单下次打开时既有拉取即拿到最新状态。
+  const handleCreateGlobalMemory = useCallback(
+    async (input: { name: string; description: string; content: string }): Promise<boolean> => {
+      const memoryService = services?.memoryService;
+      if (!memoryService) return false;
+      try {
+        await memoryService.createGlobalMemory({
+          name: input.name,
+          description: input.description || undefined,
+          content: input.content,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [services],
+  );
+  const handleUpdateGlobalMemory = useCallback(
+    async (
+      memoryId: string,
+      input: { name: string; description: string; content: string },
+    ): Promise<boolean> => {
+      const memoryService = services?.memoryService;
+      if (!memoryService) return false;
+      try {
+        await memoryService.writeGlobalMemory({
+          id: memoryId,
+          name: input.name,
+          description: input.description,
+          content: input.content,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [services],
+  );
+  const handleDeleteGlobalMemory = useCallback(
+    async (memoryId: string): Promise<boolean> => {
+      const memoryService = services?.memoryService;
+      if (!memoryService) return false;
+      try {
+        await memoryService.deleteGlobalMemory({ id: memoryId });
+      } catch {
+        return false;
+      }
+      // 已勾选的条目被删：勾选集同步清理（徽章计数即时正确；CLI 静默跳过语义不变）。
+      setGlobalMemorySelectedIds((current) => {
+        if (!current.has(memoryId)) return current;
+        const next = new Set(current);
+        next.delete(memoryId);
+        return next;
+      });
+      return true;
+    },
+    [services],
+  );
   // Picker 菜单开合只用于驱动插件目录懒加载：菜单打开或有勾选（发送 resolve 需要
   // 最新 catalog）时才查询；关闭且无勾选回到静默。
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
@@ -3087,6 +3148,9 @@ function ConversationComposerImpl({
           onToggle={handleToggleGlobalMemory}
           onMenuOpenChange={handleMemoryMenuOpenChange}
           onReadMemoryContent={handleReadMemoryContent}
+          onCreateMemory={handleCreateGlobalMemory}
+          onUpdateMemory={handleUpdateGlobalMemory}
+          onDeleteMemory={handleDeleteGlobalMemory}
           disabled={disabled}
         />
         {/* 最近 3 条用户 prompt 的 peek 图标：hover 即可回看当前 session 在做什么。 */}
@@ -3128,9 +3192,12 @@ function ConversationComposerImpl({
       globalMemoryListState,
       globalMemorySelectedIds,
       handleConfigPickerOpenChange,
+      handleCreateGlobalMemory,
+      handleDeleteGlobalMemory,
       handleMemoryMenuOpenChange,
       handleReadMemoryContent,
       handleToggleGlobalMemory,
+      handleUpdateGlobalMemory,
       handleClearToolSelection,
       handleToggleToolSelection,
       isWebRemoteControl,

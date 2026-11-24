@@ -10,9 +10,13 @@
 //   onReadMemoryContent(id) 懒加载（picker 生命周期内按 id 缓存）。浮层是
 //   position:fixed 的自定义面板（pointer-events:auto 支持滚轮滚动）——不用
 //   Radix Tooltip，modal DropdownMenu 会拦截其 hover 链路。
+// - 快速增删改/复制：顶部「新建记忆」行 + 条目 hover 操作条（编辑/复制/删除）。
+//   写路径由宿主注入（onCreateMemory/onUpdateMemory/onDeleteMemory，成功返回
+//   true）；打开弹层前先关菜单（菜单 z-[60] 高于 Dialog z-50，叠层会盖住弹层）；
+//   编辑/删除成功后失效该 id 的正文缓存。
 import { createPortal } from "react-dom";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { BrainIcon } from "lucide-react";
+import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { BrainIcon, CopyIcon, PencilIcon, PlusIcon, TrashIcon } from "lucide-react";
 import {
   GLOBAL_MEMORY_DEFAULT_ID,
   GLOBAL_MEMORY_SELECTION_LIMIT,
@@ -23,6 +27,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu.js";
@@ -31,6 +36,11 @@ import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { TID_V4_COMPOSER_INPUT, TID_V4_COMPOSER_MEMORY_PICKER } from "@zcode/shared/test-ids";
 import { isCoarseTouchDevice } from "@/lib/pickerFocus.js";
+import {
+  V4ComposerMemoryDeleteDialog,
+  V4ComposerMemoryEditDialog,
+  type V4ComposerMemoryDraftInput,
+} from "@/v4/composer/V4ComposerMemoryDialogs.js";
 
 export interface V4ComposerMemoryPickerProps {
   /** 当前权威源下的全局记忆清单（宿主在菜单打开时拉取）。 */
@@ -46,8 +56,21 @@ export interface V4ComposerMemoryPickerProps {
    * 空内容占位，不报错）。不传时浮层恒显示空占位（fixture/降级场景）。
    */
   onReadMemoryContent?: (memoryId: string) => Promise<string | null>;
+  /** 新建全局记忆（宿主对接 createGlobalMemory）；成功返回 true，失败 false（弹层保持打开报错）。 */
+  onCreateMemory?: (input: V4ComposerMemoryDraftInput) => Promise<boolean>;
+  /** 写回单条记忆（宿主对接 writeGlobalMemory）；成功 true / 失败 false。 */
+  onUpdateMemory?: (memoryId: string, input: V4ComposerMemoryDraftInput) => Promise<boolean>;
+  /** 删除单条记忆（宿主对接 deleteGlobalMemory，并清理勾选集）；成功 true / 失败 false。 */
+  onDeleteMemory?: (memoryId: string) => Promise<boolean>;
   disabled?: boolean;
 }
+
+/** 快速增删改弹层会话：编辑/删除携带目标 id；复制预填后走新建路径。 */
+type MemoryDialogKind =
+  | { kind: "create" }
+  | { kind: "edit"; id: string }
+  | { kind: "duplicate"; sourceId: string }
+  | { kind: "delete"; id: string };
 
 /** 浮层几何约束：宽 ≤384px、高 ≤320px（内容区 280 可滚），定位估算用同一上限。 */
 const DETAIL_MAX_WIDTH = 384;
@@ -66,6 +89,9 @@ function V4ComposerMemoryPickerImpl({
   onToggle,
   onMenuOpenChange,
   onReadMemoryContent,
+  onCreateMemory,
+  onUpdateMemory,
+  onDeleteMemory,
   disabled,
 }: V4ComposerMemoryPickerProps) {
   const { intl } = useZCodeIntl();
@@ -84,6 +110,15 @@ function V4ComposerMemoryPickerImpl({
   const hoverIdRef = useRef<string | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const detailPanelRef = useRef<HTMLDivElement | null>(null);
+  // ── 快速增删改/复制弹层（V4ComposerMemoryDialogs）──
+  // 弹层由条件挂载 + key（dialogSession）驱动会话重置；draft 在打开前一次性预填。
+  const [memoryDialog, setMemoryDialog] = useState<MemoryDialogKind | null>(null);
+  const [dialogDraft, setDialogDraft] = useState<V4ComposerMemoryDraftInput>({
+    name: "",
+    description: "",
+    content: "",
+  });
+  const [dialogSession, setDialogSession] = useState(0);
 
   const cancelDetailClose = useCallback(() => {
     if (closeTimerRef.current !== null) {
@@ -186,7 +221,12 @@ function V4ComposerMemoryPickerImpl({
         id: memoryId,
         item: { left: rect.left, top: rect.top, bottom: rect.bottom },
         menu: menuRect
-          ? { left: menuRect.left, top: menuRect.top, right: menuRect.right, bottom: menuRect.bottom }
+          ? {
+              left: menuRect.left,
+              top: menuRect.top,
+              right: menuRect.right,
+              bottom: menuRect.bottom,
+            }
           : null,
       });
       loadHoverContent(memoryId);
@@ -212,6 +252,109 @@ function V4ComposerMemoryPickerImpl({
     },
     [onMenuOpenChange],
   );
+
+  // ── 弹层状态机：打开前先关菜单（菜单 z-[60] 高于 Dialog z-50，叠层会盖住弹层）。
+  const closeMenuForDialog = useCallback(
+    (next: MemoryDialogKind) => {
+      cancelDetailClose();
+      setHover(null);
+      setHoverContent(null);
+      setHoverLoading(false);
+      setDialogSession((session) => session + 1);
+      setMemoryDialog(next);
+      setOpen(false);
+    },
+    [cancelDetailClose],
+  );
+
+  const handleOpenCreate = useCallback(() => {
+    setDialogDraft({ name: "", description: "", content: "" });
+    closeMenuForDialog({ kind: "create" });
+  }, [closeMenuForDialog]);
+
+  /** 编辑/复制共用的预填流程：正文取缓存或懒读，名称按源条目规则派生。 */
+  const openEditOrDuplicate = useCallback(
+    async (sourceId: string, kind: "edit" | "duplicate") => {
+      const entry = memories.find((m) => m.id === sourceId);
+      if (!entry) return;
+      const cached = contentCache.current.get(sourceId);
+      const content =
+        cached !== undefined
+          ? cached
+          : onReadMemoryContent
+            ? ((await onReadMemoryContent(sourceId)) ?? "")
+            : "";
+      if (cached === undefined && onReadMemoryContent) {
+        contentCache.current.set(sourceId, content);
+      }
+      const unnamed = entry.name === entry.id;
+      // 复制：自定义名加「（副本）」后缀；未命名时非 default 用 id，default 留空让用户填写。
+      const baseName = unnamed
+        ? entry.id === GLOBAL_MEMORY_DEFAULT_ID
+          ? ""
+          : entry.id
+        : entry.name;
+      if (kind === "edit") {
+        setDialogDraft({
+          name: unnamed ? "" : entry.name,
+          description: entry.description ?? "",
+          content,
+        });
+        closeMenuForDialog({ kind: "edit", id: sourceId });
+      } else {
+        const suffix = intl.formatMessage({ id: "chat.toolbar.memory.duplicateSuffix" });
+        setDialogDraft({
+          name: baseName ? `${baseName}${suffix}` : "",
+          description: entry.description ?? "",
+          content,
+        });
+        closeMenuForDialog({ kind: "duplicate", sourceId });
+      }
+    },
+    [memories, onReadMemoryContent, closeMenuForDialog, intl],
+  );
+
+  const handleOpenDelete = useCallback(
+    (memoryId: string) => {
+      closeMenuForDialog({ kind: "delete", id: memoryId });
+    },
+    [closeMenuForDialog],
+  );
+
+  const handleDialogSave = useCallback(
+    async (input: V4ComposerMemoryDraftInput): Promise<boolean> => {
+      const dialog = memoryDialog;
+      if (!dialog || dialog.kind === "delete") return false;
+      let ok = false;
+      if (dialog.kind === "create" && onCreateMemory) {
+        ok = await onCreateMemory(input);
+      } else if (dialog.kind === "duplicate" && onCreateMemory) {
+        ok = await onCreateMemory(input);
+      } else if (dialog.kind === "edit" && onUpdateMemory) {
+        ok = await onUpdateMemory(dialog.id, input);
+      }
+      // 编辑成功后失效正文缓存，避免 hover 预览显示旧正文。
+      if (ok && dialog.kind === "edit") {
+        contentCache.current.delete(dialog.id);
+      }
+      return ok;
+    },
+    [memoryDialog, onCreateMemory, onUpdateMemory],
+  );
+
+  const handleDeleteConfirm = useCallback(async (): Promise<boolean> => {
+    const dialog = memoryDialog;
+    if (!dialog || dialog.kind !== "delete" || !onDeleteMemory) return false;
+    const ok = await onDeleteMemory(dialog.id);
+    if (ok) {
+      contentCache.current.delete(dialog.id);
+    }
+    return ok;
+  }, [memoryDialog, onDeleteMemory]);
+
+  const handleDialogClose = useCallback(() => {
+    setMemoryDialog(null);
+  }, []);
 
   const displayName = useCallback(
     // 与设置页列表同口径：default 有自定义 name 时显示自定义名，
@@ -243,8 +386,7 @@ function V4ComposerMemoryPickerImpl({
     if (hovered.menu) {
       const fitsRight =
         hovered.menu.right + DETAIL_GAP + panelWidth <= viewportWidth - DETAIL_VIEWPORT_PADDING;
-      const fitsLeft =
-        hovered.menu.left - DETAIL_GAP - panelWidth >= DETAIL_VIEWPORT_PADDING;
+      const fitsLeft = hovered.menu.left - DETAIL_GAP - panelWidth >= DETAIL_VIEWPORT_PADDING;
       if (fitsRight || fitsLeft) {
         // 侧放：水平贴在菜单外侧，纵向顶边对齐 hover 条目（下方 clamp 收进视口）。
         left = fitsRight
@@ -255,10 +397,7 @@ function V4ComposerMemoryPickerImpl({
         // 窄视口两侧都放不下：回退到菜单上方，水平与菜单左对齐。
         left = Math.max(
           DETAIL_VIEWPORT_PADDING,
-          Math.min(
-            hovered.menu.left,
-            viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth,
-          ),
+          Math.min(hovered.menu.left, viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth),
         );
         top = hovered.menu.top - DETAIL_GAP - DETAIL_EST_HEIGHT;
       }
@@ -324,101 +463,204 @@ function V4ComposerMemoryPickerImpl({
     { max: String(GLOBAL_MEMORY_SELECTION_LIMIT) },
   );
 
+  // 删除确认框的条目显示名；条目在打开确认框前被删（另一窗口/CLI）时回退 id。
+  const deleteEntry =
+    memoryDialog?.kind === "delete" ? memories.find((m) => m.id === memoryDialog.id) : undefined;
+
   return (
-    <DropdownMenu open={open} onOpenChange={handleMenuOpenChange}>
-      <ControlHintTooltip
-        title={intl.formatMessage({ id: "chat.toolbar.memory.label" })}
-        description={intl.formatMessage({ id: "chat.toolbar.memory.tooltip" })}
-        open={open ? false : undefined}
-      >
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            disabled={disabled}
-            aria-label={intl.formatMessage({ id: "chat.toolbar.memory.label" })}
-            data-testid={TID_V4_COMPOSER_MEMORY_PICKER}
-            data-composer-collapse-priority="3"
-            className={cn(
-              "group/memory h-7 w-auto gap-1 whitespace-nowrap rounded-lg px-2",
-              selectedIds.size > 0
-                ? "bg-accent text-primary hover:bg-accent hover:text-primary"
-                : "text-foreground-subtle hover:text-foreground-subtle",
-            )}
-          >
-            <BrainIcon className="size-4" />
-            <span className="hidden @xl/composer:inline group-data-[composer-compact=true]/memory:hidden">
-              {triggerLabel}
-            </span>
-          </Button>
-        </DropdownMenuTrigger>
-      </ControlHintTooltip>
-      <DropdownMenuContent
-        side="top"
-        sideOffset={4}
-        data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-content`}
-        className="w-72"
-        onCloseAutoFocus={(event) => {
-          event.preventDefault();
-          if (!isCoarseTouchDevice())
-            document
-              .querySelector<HTMLElement>(`[data-testid="${TID_V4_COMPOSER_INPUT}"]`)
-              ?.focus();
-        }}
-      >
-        <div className="max-h-[320px] overflow-y-auto">
-          <DropdownMenuLabel className="text-ui-xs text-foreground-subtlest">
-            {intl.formatMessage({ id: "chat.toolbar.memory.section" })}
-          </DropdownMenuLabel>
-          {loading ? (
-            <div className="px-2 py-1.5 text-ui-sm text-foreground-subtlest">
-              {intl.formatMessage({ id: "common.loading" })}
-            </div>
-          ) : error ? (
-            <div className="px-2 py-1.5 text-ui-sm text-destructive">
-              {intl.formatMessage({ id: "chat.toolbar.memory.error" })}
-            </div>
-          ) : memories.length === 0 ? (
-            <div className="px-2 py-1.5 text-ui-sm text-foreground-subtlest">
-              {intl.formatMessage({ id: "chat.toolbar.memory.empty" })}
-            </div>
-          ) : (
-            memories.map((entry) => {
-              const checked = selectedIds.has(entry.id);
-              const limitReached = !checked && selectedIds.size >= GLOBAL_MEMORY_SELECTION_LIMIT;
-              return (
-                <DropdownMenuCheckboxItem
-                  key={entry.id}
-                  checked={checked}
-                  disabled={limitReached}
-                  // 保持菜单开启以支持连续多选；勾选语义走 onCheckedChange。
-                  onSelect={(event) => event.preventDefault()}
-                  onCheckedChange={() => onToggle(entry.id)}
-                  data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-item-${entry.id}`}
-                  className="min-h-10 items-center gap-2 py-1.5"
-                  onMouseEnter={(event) => handleItemMouseEnter(entry.id, event.currentTarget)}
-                  onMouseLeave={scheduleDetailClose}
-                >
-                  <BrainIcon className="size-4 shrink-0 text-foreground-subtle" />
-                  <span className="min-w-0 flex-1">
-                    <span className="flex min-w-0 items-baseline gap-2">
-                      <span className="shrink-0 whitespace-nowrap text-ui-base font-medium text-foreground">
-                        {displayName(entry)}
-                      </span>
-                      <span className="min-w-0 truncate text-ui-xs text-foreground-subtlest">
-                        {limitReached ? limitReason : entry.description}
+    <>
+      <DropdownMenu open={open} onOpenChange={handleMenuOpenChange}>
+        <ControlHintTooltip
+          title={intl.formatMessage({ id: "chat.toolbar.memory.label" })}
+          description={intl.formatMessage({ id: "chat.toolbar.memory.tooltip" })}
+          open={open ? false : undefined}
+        >
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={disabled}
+              aria-label={intl.formatMessage({ id: "chat.toolbar.memory.label" })}
+              data-testid={TID_V4_COMPOSER_MEMORY_PICKER}
+              data-composer-collapse-priority="3"
+              className={cn(
+                "group/memory h-7 w-auto gap-1 whitespace-nowrap rounded-lg px-2",
+                selectedIds.size > 0
+                  ? "bg-accent text-primary hover:bg-accent hover:text-primary"
+                  : "text-foreground-subtle hover:text-foreground-subtle",
+              )}
+            >
+              <BrainIcon className="size-4" />
+              <span className="hidden @xl/composer:inline group-data-[composer-compact=true]/memory:hidden">
+                {triggerLabel}
+              </span>
+            </Button>
+          </DropdownMenuTrigger>
+        </ControlHintTooltip>
+        <DropdownMenuContent
+          side="top"
+          sideOffset={4}
+          data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-content`}
+          className="w-72"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (!isCoarseTouchDevice())
+              document
+                .querySelector<HTMLElement>(`[data-testid="${TID_V4_COMPOSER_INPUT}"]`)
+                ?.focus();
+          }}
+        >
+          <div className="max-h-[320px] overflow-y-auto">
+            <DropdownMenuLabel className="text-ui-xs text-foreground-subtlest">
+              {intl.formatMessage({ id: "chat.toolbar.memory.section" })}
+            </DropdownMenuLabel>
+            {/* 快速新建：点选即开编辑框（onSelect 默认关菜单，与 closeMenuForDialog 幂等）。 */}
+            {onCreateMemory ? (
+              <DropdownMenuItem
+                onSelect={handleOpenCreate}
+                data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-new`}
+                className="min-h-9 py-1.5"
+              >
+                <PlusIcon className="size-4 shrink-0 text-foreground-subtle" />
+                {intl.formatMessage({ id: "chat.toolbar.memory.new" })}
+              </DropdownMenuItem>
+            ) : null}
+            {loading ? (
+              <div className="px-2 py-1.5 text-ui-sm text-foreground-subtlest">
+                {intl.formatMessage({ id: "common.loading" })}
+              </div>
+            ) : error ? (
+              <div className="px-2 py-1.5 text-ui-sm text-destructive">
+                {intl.formatMessage({ id: "chat.toolbar.memory.error" })}
+              </div>
+            ) : memories.length === 0 ? (
+              <div className="px-2 py-1.5 text-ui-sm text-foreground-subtlest">
+                {intl.formatMessage({ id: "chat.toolbar.memory.empty" })}
+              </div>
+            ) : (
+              memories.map((entry) => {
+                const checked = selectedIds.has(entry.id);
+                const limitReached = !checked && selectedIds.size >= GLOBAL_MEMORY_SELECTION_LIMIT;
+                // 条目 hover 操作条：编辑/复制/删除。CheckboxItem 渲染为 <button>，
+                // 嵌套 <button> 非法——用 role="button" span，stopPropagation 隔离
+                // 勾选（onCheckedChange）与菜单关闭语义；仅鼠标可达（tabIndex -1）。
+                const hasActions = Boolean(onUpdateMemory || onCreateMemory || onDeleteMemory);
+                const renderAction = (
+                  suffix: string,
+                  icon: ReactNode,
+                  label: string,
+                  run: () => void,
+                ) => (
+                  <span
+                    role="button"
+                    tabIndex={-1}
+                    aria-label={label}
+                    data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-item-${entry.id}-action-${suffix}`}
+                    className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-foreground-subtle hover:bg-accent hover:text-foreground"
+                    // Radix 菜单项用 pointerdown 跟踪、pointerup 激活（CheckboxItem
+                    // 在 pointerup 上触发 onCheckedChange）——pointerdown/pointerup
+                    // 都要拦断，否则图标点击会冒泡到条目造成误勾选。
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onPointerUp={(event) => event.stopPropagation()}
+                    onPointerCancel={(event) => event.stopPropagation()}
+                    onMouseDown={(event) => {
+                      event.stopPropagation();
+                      event.preventDefault();
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      event.preventDefault();
+                      run();
+                    }}
+                  >
+                    {icon}
+                  </span>
+                );
+                return (
+                  <DropdownMenuCheckboxItem
+                    key={entry.id}
+                    checked={checked}
+                    disabled={limitReached}
+                    // 保持菜单开启以支持连续多选；勾选语义走 onCheckedChange。
+                    onSelect={(event) => event.preventDefault()}
+                    onCheckedChange={() => onToggle(entry.id)}
+                    data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-item-${entry.id}`}
+                    className="group/memory-item min-h-10 items-center gap-2 py-1.5"
+                    onMouseEnter={(event) => handleItemMouseEnter(entry.id, event.currentTarget)}
+                    onMouseLeave={scheduleDetailClose}
+                  >
+                    <BrainIcon className="size-4 shrink-0 text-foreground-subtle" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex min-w-0 items-baseline gap-2">
+                        <span className="shrink-0 whitespace-nowrap text-ui-base font-medium text-foreground">
+                          {displayName(entry)}
+                        </span>
+                        <span className="min-w-0 truncate text-ui-xs text-foreground-subtlest">
+                          {limitReached ? limitReason : entry.description}
+                        </span>
                       </span>
                     </span>
-                  </span>
-                </DropdownMenuCheckboxItem>
-              );
-            })
-          )}
-        </div>
-      </DropdownMenuContent>
-      {hover ? renderDetailPanel(hover) : null}
-    </DropdownMenu>
+                    {hasActions ? (
+                      <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/memory-item:opacity-100">
+                        {onUpdateMemory
+                          ? renderAction(
+                              "edit",
+                              <PencilIcon className="size-3.5" />,
+                              intl.formatMessage({ id: "chat.toolbar.memory.edit" }),
+                              () => void openEditOrDuplicate(entry.id, "edit"),
+                            )
+                          : null}
+                        {onCreateMemory
+                          ? renderAction(
+                              "duplicate",
+                              <CopyIcon className="size-3.5" />,
+                              intl.formatMessage({ id: "chat.toolbar.memory.duplicate" }),
+                              () => void openEditOrDuplicate(entry.id, "duplicate"),
+                            )
+                          : null}
+                        {onDeleteMemory
+                          ? renderAction(
+                              "delete",
+                              <TrashIcon className="size-3.5" />,
+                              intl.formatMessage({ id: "chat.toolbar.memory.delete" }),
+                              () => handleOpenDelete(entry.id),
+                            )
+                          : null}
+                      </span>
+                    ) : null}
+                  </DropdownMenuCheckboxItem>
+                );
+              })
+            )}
+          </div>
+        </DropdownMenuContent>
+        {hover ? renderDetailPanel(hover) : null}
+      </DropdownMenu>
+      {/* 快速增删改弹层：条件挂载（key 驱动会话重置），与菜单互斥（打开前菜单已关）。 */}
+      {memoryDialog && memoryDialog.kind !== "delete" ? (
+        <V4ComposerMemoryEditDialog
+          key={`memory-dialog-${dialogSession}`}
+          title={
+            memoryDialog.kind === "edit"
+              ? intl.formatMessage({ id: "chat.toolbar.memory.dialogTitleEdit" })
+              : intl.formatMessage({ id: "chat.toolbar.memory.dialogTitleCreate" })
+          }
+          initial={dialogDraft}
+          requireName={memoryDialog.kind !== "edit"}
+          onSave={handleDialogSave}
+          onClose={handleDialogClose}
+        />
+      ) : null}
+      {memoryDialog?.kind === "delete" ? (
+        <V4ComposerMemoryDeleteDialog
+          key={`memory-dialog-${dialogSession}`}
+          name={deleteEntry ? displayName(deleteEntry) : memoryDialog.id}
+          onConfirm={handleDeleteConfirm}
+          onClose={handleDialogClose}
+        />
+      ) : null}
+    </>
   );
 }
 

@@ -2583,6 +2583,11 @@ exceptions:
     paths:
       - packages/ui/src/v4/composer/composerMenuVariant.ts
     reason: fork 皮肤开关（dev_hank）：composer 模型菜单在 merged/legacy 两种渲染间切换的唯一常量，只被 V4ComposerToolbar 读取；上游合并菜单实现原样保留在树内。不新增状态 owner、协议或模块边界。
+  - id: composer-memory-picker-dialogs
+    rule: unmanaged-new-file
+    paths:
+      - packages/ui/src/v4/composer/V4ComposerMemoryDialogs.tsx
+    reason: 记忆 picker 快速增删改/复制的编辑/删除确认弹层（docs/global-memory-multi.md「picker 内快速增删改/复制」），与既有的 V4ComposerMemoryPicker.tsx 同目录同契约——数据与写路径全由宿主回调注入（onSave/onConfirm），本文件不接触 IMemoryService、不持有全局状态、不新增协议或模块边界。Adopt packages/ui/src/v4/composer 为 managed 模块需单独 boundary refactor，不在本次范围。
   - id: message-markdown-cjk-bare-url-unmanaged-new-file
     rule: unmanaged-new-file
     paths:
