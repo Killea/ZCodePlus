@@ -2130,13 +2130,6 @@ exceptions:
     rule: unmanaged-new-file
     paths:
       - packages/ui/src/ControlShortcutBadge.tsx
-      - packages/ui/src/chat-input-toolbar/ComposerEffortHeading.tsx
-      - packages/ui/src/chat-input-toolbar/ComposerModelMenu.tsx
-      - packages/ui/src/chat-input-toolbar/ComposerProviderMenu.tsx
-      - packages/ui/src/chat-input-toolbar/ComposerTriggerTransition.tsx
-      - packages/ui/src/hooks/useComposerConnectionSwitch.ts
-      - packages/ui/src/lib/composerPlanGroups.ts
-      - packages/ui/src/lib/providerFamilyConnectionTransition.ts
       - packages/ui/src/prompt-editor/useComposerToolbarFit.ts
     reason: Composer model, provider and toolbar files reached staging without the MR architecture gate running; adopting the packages/ui composer toolbar needs a separate module boundary refactor.
   - id: provider-endpoint-routing-unmanaged-edit

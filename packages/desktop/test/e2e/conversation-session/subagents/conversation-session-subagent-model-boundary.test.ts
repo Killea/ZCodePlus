@@ -27,7 +27,6 @@ import {
   seedReplayProvider,
 } from "#e2e/helpers/model-provider-restart";
 import { sel } from "#e2e/helpers/selectors";
-import { openComposerProviderList } from "#e2e/helpers/upstream-provider";
 
 const START_PROVIDER_ID = "e2e-start-subagent-boundary";
 const START_MODEL_ID = "start-subagent-boundary-model";
@@ -188,7 +187,7 @@ async function selectV4ModelOnly(provider: string, model: string): Promise<void>
   const item = $(sel(testId(TID_CHAT_MODEL_SELECT_ITEM, value)));
   const group = $(sel(testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${provider}`)));
   if (!(await item.isExisting())) {
-    await openComposerProviderList();
+    // 经典二级菜单：模型项只在该 Provider 子菜单展开后挂载。
     await group.waitForDisplayed({ timeout: 30000 });
     await group.click();
   }

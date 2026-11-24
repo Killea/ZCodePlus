@@ -1135,8 +1135,7 @@ describe("设置页 UI polish E2E", () => {
     }
     await clickTestIdByDom(TID_SETTINGS_BACK_BUTTON);
     await clickTestIdByWebDriver(TID_CHAT_MODEL_SELECT_TRIGGER);
-    // 合并模型菜单先打开 Provider 分组，再进入具体模型列表。
-    await $('[data-testid="composer-provider-trigger"]').click();
+    // 经典二级菜单：点开 Provider 分组展开该 Provider 的模型列表。
     await $(
       sel(testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${REASONING_EDITOR_PROVIDER_ID}`)),
     ).click();

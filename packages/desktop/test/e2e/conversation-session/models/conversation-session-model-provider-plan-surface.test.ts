@@ -306,34 +306,11 @@ async function selectAutomationModel(modelValue: string): Promise<void> {
       timeoutMsg: "Automation 表单没有模型选择器",
     });
   }
-  // Composer 合并控件先显示当前供应商的模型；再打开供应商层才能切到另一计划。
-  const providerTrigger = $('[data-testid="composer-provider-trigger"]');
-  if (
-    (await providerTrigger.isExisting()) &&
-    (await providerTrigger.getAttribute("aria-expanded")) !== "true"
-  ) {
-    await providerTrigger.click();
-  }
   const itemTestId = testId(TID_CHAT_MODEL_SELECT_ITEM, modelValue);
-  // Automation 使用 Registry 分组；Composer 的团队分组另含账号范围。
-  // 两个入口都只定位同一 Provider，最终仍严格校验完整 model value。
+  // Automation 使用 Registry 分组；两个入口都只定位同一 Provider，最终仍严格校验完整 model value。
   const groupTestIds = [
     testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${decoded.providerId}`),
   ];
-  if (decoded.providerId === PLAN_PROVIDER_ID) {
-    groupTestIds.push(
-      testId(
-        TID_CHAT_MODEL_SELECT_GROUP,
-        JSON.stringify([
-          "bigmodel",
-          "team-coding-plan",
-          "product-team-a",
-          "org-team-a",
-          "proj-team-a",
-        ]),
-      ),
-    );
-  }
   let visibleGroup: string | undefined;
   try {
     await browser.waitUntil(
@@ -387,7 +364,7 @@ async function selectAutomationModel(modelValue: string): Promise<void> {
       modelValue,
     { timeout: 15000, timeoutMsg: `Automation 模型没有切换到 ${modelValue}` },
   );
-  // Composer 选模型后保留弹层以继续选档位；下一次独立选择前显式结束这一交互。
+  // 经典菜单选中即关闭；保留 Escape 兜底覆盖菜单仍挂着的异常路径。
   await browser.keys("Escape");
   await browser.waitUntil(async () => (await trigger.getAttribute("aria-expanded")) !== "true", {
     timeout: 15000,

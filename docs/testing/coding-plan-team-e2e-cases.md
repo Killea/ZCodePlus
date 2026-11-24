@@ -129,6 +129,8 @@ CTP-16 启动夹具保存旧商品 ID，订阅和 pricing 返回当前商品 ID�
 
 2026-09-18 商品 ID 变化回归：原生 macOS Electron 回放 CTP-16 三种状态全部通过（3/3），包含失败后重试恢复。证据目录：`packages/desktop/.e2e-artifacts/desktop-e2e-20260918-042734-046/`。导航及可见性相关单测 243/243 通过；未回放真实手机 `/remote`，未使用 Docker。
 
+> 2026-11-24 合并菜单回退说明：Composer 模型入口已恢复为经典二级菜单（Provider 分组 → 模型列表）加独立思考控件，Composer 不再承担个人/团队连接切换。以下 CTP-20（Composer 供应商子菜单）、CTP-21–23、CTP-24–33 及「Composer 连接回归补充」「连接边界回归」两节中依赖 Composer 供应商子菜单/连接切换的用例已从测试套件移除，条目与回放证据保留作历史记录。连接切换回归改由设置页路径与 `seedBigModelConnectionSelection` 覆盖。
+
 - CTP-20：Composer 供应商子菜单直接展示 BigModel Individual 与 BigModel 实际团队标签，无额外连接方式行；个人→团队→个人切换验证完整持久化身份、主行标签、模型与勾选。API 供应商保持原有入口。选择非默认思考档位后双向切换须保持该档位，并采样整个切换的 DOM，禁止档位中间清空或 Effort 消失。
 
 - CTP-20 同时注入可用团队与明确无有效授权的团队，验证后者不出现在供应商列表；DOM 时序须捕捉主行 loading/aria-busy 的出现与结束，且原思考档位和控件始终保持。

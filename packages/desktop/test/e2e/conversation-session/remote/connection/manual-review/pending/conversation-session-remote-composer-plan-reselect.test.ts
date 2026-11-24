@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { BUILTIN_MODEL_PROVIDER_IDS } from "@zcode/shared";
+import { BUILTIN_MODEL_PROVIDER_IDS, encodeCustomModelValue } from "@zcode/shared";
 import {
   TID_CHAT_MODEL_SELECT_TRIGGER,
   TID_MODEL_PROVIDER_CONNECTION_MODE_ITEM,
@@ -8,6 +8,8 @@ import {
   TID_MODEL_PROVIDER_NAV_ITEM,
   TID_SETTINGS_BACK_BUTTON,
   TID_SETTINGS_PAGE,
+  TID_CHAT_MODEL_SELECT_GROUP,
+  TID_CHAT_MODEL_SELECT_ITEM,
   TID_SETTINGS_SECTION_NAV,
   TID_TASK_SETTINGS_BUTTON,
   TID_V4_MODEL_CONFIG,
@@ -167,34 +169,30 @@ async function seedSignedInIndividualPlan() {
   await waitForDefaultWorkspaceReady(60_000);
 }
 
-async function openComposerProviderList() {
+/** 经典二级菜单：打开模型弹层即 Provider 分组列表，分组内选择首个模型完成切换。 */
+async function switchComposerProvider(providerId: string, label: string): Promise<number> {
   const trigger = $(sel(TID_CHAT_MODEL_SELECT_TRIGGER));
   await trigger.waitForClickable({ timeout: 60_000 });
   if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-  const provider = $('[data-testid="composer-provider-trigger"]');
-  await provider.waitForClickable({ timeout: 60_000 });
-  await provider.click();
-}
-
-/** 点击供应商行，等到展示切到目标 Provider 且连接 loading 结束；返回点击到完成的耗时。 */
-async function switchComposerProvider(providerId: string, label: string): Promise<number> {
-  await openComposerProviderList();
-  const row = $(
-    `[data-composer-provider-list] [data-model-provider-key="registry-provider:${providerId}"]`,
+  const group = $(
+    sel(testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${providerId}`)),
   );
-  await row.waitForClickable({
+  await group.waitForClickable({
     timeout: 60_000,
     timeoutMsg: `${CASE_MARKER}: 供应商列表没有 ${label}`,
   });
+  await group.click();
+  const itemPrefix = `${TID_CHAT_MODEL_SELECT_ITEM}-${encodeCustomModelValue(providerId)}`;
+  const item = $(`[data-testid^="${itemPrefix}"]`);
+  await item.waitForClickable({
+    timeout: 60_000,
+    timeoutMsg: `${CASE_MARKER}: ${label} 分组没有可选模型`,
+  });
   const startedAt = Date.now();
-  await row.click();
+  await item.click();
   await browser.waitUntil(
     async () => (await $(sel(TID_V4_MODEL_CONFIG)).getAttribute("data-provider")) === providerId,
     { timeout: SYNC_TIMEOUT_MS, timeoutMsg: `${CASE_MARKER}: 没有切到 ${label}` },
-  );
-  await browser.waitUntil(
-    async () => !(await $('[data-testid="composer-provider-loading"]').isExisting()),
-    { timeout: SYNC_TIMEOUT_MS, timeoutMsg: `${CASE_MARKER}: 切到 ${label} 后 loading 未结束` },
   );
   const durationMs = Date.now() - startedAt;
   expect(await $('[role="alert"]').isExisting()).toBe(false);

@@ -1,4 +1,3 @@
-import { TID_CHAT_MODEL_SELECT_TRIGGER } from "@zcode/shared/test-ids";
 import {
   E2E_BIGMODEL_PLAN_PROVIDER_ID,
   E2E_PLAN_FIRST_MODEL,
@@ -13,7 +12,6 @@ import { skipOccupationOnboardingIfPresent } from "./occupation-onboarding.js";
 import {
   prepareV4ConversationE2E,
   sendV4Prompt,
-  switchV4Model,
   waitForV4Pane,
   waitForV4TimelineContaining,
 } from "./v4-conversation.js";
@@ -40,12 +38,6 @@ export interface HighspeedEntranceSnapshot {
 // builtinModelIds 都只剩 GLM-5.3 / GLM-5.3-Flash，继续 seed GLM-5.2 会被判为目录外模型，
 // toolbar 回落到首个模型，waitForSelectedModel 在抽卡前就失败。改用两者目录共有的 GLM-5.3。
 const HIGHSPEED_E2E_MODEL = E2E_PLAN_FIRST_MODEL;
-const HIGHSPEED_E2E_CONNECTION = {
-  kind: "team-coding-plan",
-  productId: "product-team-a",
-  organizationId: "org-team-a",
-  projectId: "proj-team-a",
-} as const;
 
 declare global {
   interface Window {
@@ -56,7 +48,7 @@ declare global {
 
 /**
  * Highspeed 抽卡 case 的共用准备：Coding Plan 凭据、Team scope、会话模型与 Host Mock 场景
- * （场景按 spec 文件注入，见 highspeed-mock-env.ts）。相关 case 走同一条准备链路，
+ * （场景按 spec 文件注入，见 highspeed-mock-env.ts）。三个 case 走同一条准备链路，
  * `hit-fast` case 因此同时是资格链路的正向对照，未抽中类 case 的否定断言不会空转通过。
  */
 export async function prepareHighspeedDrawWorkspace() {
@@ -72,7 +64,12 @@ export async function prepareHighspeedDrawWorkspace() {
   // Provider 重构后连接方式按 family 记录结构化 selection（不再是 `coding-plan:<id>` 字符串键），
   // 且 E2E_BIGMODEL_PLAN_PROVIDER_ID 就是 Team Coding Plan，Team scope 必须一并 seed，
   // 否则加速卡请求期解析不到账号访问上下文。
-  await seedBigModelConnectionSelection(HIGHSPEED_E2E_CONNECTION);
+  await seedBigModelConnectionSelection({
+    kind: "team-coding-plan",
+    productId: "product-team-a",
+    organizationId: "org-team-a",
+    projectId: "proj-team-a",
+  });
   // Bug 根因：Team Coding Plan 自 2026-09-10 起官方请求链路只接受 HTTPS Endpoint。旧实现把
   // Provider 改写成 HTTP Mock Endpoint，每轮都在 model creation 阶段失败，turn 失败、timeline
   // 为空。保留内建 HTTPS Endpoint，由 wdio 的 Coding Plan 数据面代理回放。
@@ -84,46 +81,6 @@ export async function prepareHighspeedDrawWorkspace() {
   });
 
   await restartIntoWorkspace();
-  // 原因：重启前已初始化的草稿选择不会被 Recent 种子覆盖；抽卡用例通过真实菜单选择
-  // 前置 Team 模型，避免在抽卡前误测草稿偏好恢复。冷启动偏好另有独立用例覆盖。
-  // 团队菜单按 connection 身份分行，不再使用 registry-provider:<id>，否则找不到真实团队行。
-  const connectionKey = JSON.stringify([
-    "bigmodel",
-    HIGHSPEED_E2E_CONNECTION.kind,
-    HIGHSPEED_E2E_CONNECTION.productId,
-    HIGHSPEED_E2E_CONNECTION.organizationId,
-    HIGHSPEED_E2E_CONNECTION.projectId,
-  ]);
-  const teamSelector = `[data-model-provider-key=${JSON.stringify(connectionKey)}]`;
-  // 修复原因：Windows CI 冷启动后 Team Plan 入口项目校验（coding-plan-availability）晚于菜单
-  // 打开才完成，团队行随之重挂或菜单被关闭：旧元素 click 报 "element wasn't found"，或 5s 内
-  // 不可点击。每轮重新查询团队行，菜单已关闭时按真实入口重新展开，直到点击成功。
-  await browser.waitUntil(
-    async () => {
-      const team = $(teamSelector);
-      if (await team.isClickable().catch(() => false)) {
-        return team.click().then(
-          () => true,
-          () => false,
-        );
-      }
-      const providerTrigger = $('[data-testid="composer-provider-trigger"]');
-      if (await providerTrigger.isClickable().catch(() => false)) {
-        if ((await providerTrigger.getAttribute("aria-expanded")) !== "true") {
-          await providerTrigger.click().catch(() => undefined);
-        }
-        return false;
-      }
-      const modelTrigger = $(`[data-testid="${TID_CHAT_MODEL_SELECT_TRIGGER}"]`);
-      if ((await modelTrigger.getAttribute("aria-expanded").catch(() => null)) !== "true") {
-        await modelTrigger.click().catch(() => undefined);
-      }
-      return false;
-    },
-    { timeout: 30_000, interval: 500, timeoutMsg: `模型菜单没有可点击的团队行: ${connectionKey}` },
-  );
-  await browser.keys("Escape");
-  await switchV4Model(E2E_BIGMODEL_PLAN_PROVIDER_ID, HIGHSPEED_E2E_MODEL, "high");
   await waitForSelectedModel(E2E_BIGMODEL_PLAN_PROVIDER_ID, HIGHSPEED_E2E_MODEL);
 }
 

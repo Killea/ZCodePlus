@@ -152,10 +152,7 @@ import {
   type GlobalMemoryEntryMeta,
   type ModelSelectionView,
 } from "@zcode/services";
-import type {
-  ModelSelectionState,
-  ModelSelectionRefreshResult,
-} from "@/hooks/useModelSelectionView.js";
+import type { ModelSelectionState } from "@/hooks/useModelSelectionView.js";
 import type { ZCodeUiError } from "@/lib/zcodeUiError.js";
 import {
   resolveComposerAutoFocus,
@@ -481,7 +478,6 @@ export interface ConversationComposerProps {
   modelSelectionState?: ModelSelectionState;
   /** Model Selection 首次读取失败后的显式重试入口。 */
   modelSelectionReload?: () => void;
-  modelSelectionRefresh?: () => Promise<ModelSelectionRefreshResult>;
   /** 草稿态使用预热 session 作附件 transaction 载体。 */
   attachmentSessionId?: string | null;
   attachmentPut: AttachmentPutFn;
@@ -623,7 +619,6 @@ function ConversationComposerImpl({
   modelSelectionView = null,
   modelSelectionState = MODEL_SELECTION_LOADING_STATE,
   modelSelectionReload,
-  modelSelectionRefresh,
   attachmentSessionId = null,
   attachmentPut,
   onRuntimeRestart,
@@ -1587,15 +1582,8 @@ function ConversationComposerImpl({
     !hasConversationSelectionReferences &&
     !hasPluginUiContexts &&
     !pendingShareContext;
-  const connectionPendingRef = useRef(false);
-  const [connectionPending, setConnectionPending] = useState(false);
-  const handleConnectionPendingChange = useCallback((pending: boolean) => {
-    connectionPendingRef.current = pending;
-    setConnectionPending(pending);
-  }, []);
   const canReload = recoveryAllowed && reloadText && remoteAvailable;
   const canSend =
-    !connectionPending &&
     !disabled &&
     !pending &&
     hasDraftToSubmit &&
@@ -1614,9 +1602,6 @@ function ConversationComposerImpl({
       existingTelemetrySeed?: ConversationPromptTelemetrySeed,
       requestedDelivery?: "startNow" | "queue" | "guide",
     ) => {
-      // 连接 pending 同步进入 ref，覆盖菜单点击后 React 尚未提交的一帧及快捷键提交。
-      // 只阻止新输入，不取消正在执行或已排队消息，也不清空草稿。
-      if (connectionPendingRef.current) return;
       // 发送时与点击停止一致：先等语音识别的最终结果写入编辑器，再读取草稿发送。
       // 等待期间重复发送会在下面的 pendingRef 检查处被拦下（后续读取到 pending 前没有 await）。
       // 没有进行中的语音输入时不等待，普通发送的同步路径不变。
@@ -2845,7 +2830,6 @@ function ConversationComposerImpl({
               modelSelectionView={modelSelectionView}
               modelSelectionState={modelSelectionState}
               modelSelectionReload={modelSelectionReload}
-              modelSelectionRefresh={modelSelectionRefresh}
               sessionId={sessionId ?? null}
               phase={composerPhase}
               provider={provider}
@@ -2856,7 +2840,6 @@ function ConversationComposerImpl({
               usage={composerUsage}
               disabled={disabled || runtimeBlocked}
               modelSelectionPending={modelSelectionPending}
-              onConnectionPendingChange={handleConnectionPendingChange}
               modelLocked={highspeedCard !== null}
               highspeedPresented={highspeedPresented}
               highspeedEntranceAnimated={highspeedEntranceAnimated}
@@ -2929,7 +2912,6 @@ function ConversationComposerImpl({
       composerUsage,
       disabled,
       modelSelectionPending,
-      handleConnectionPendingChange,
       runtimeBlocked,
       draftConfig,
       draftMode,
@@ -2944,7 +2926,6 @@ function ConversationComposerImpl({
       mode,
       handleSelectModelTrace,
       modelSelectionReload,
-      modelSelectionRefresh,
       modelSelectionState,
       modelSelectionView,
       onSelectThought,
@@ -3243,7 +3224,6 @@ function ConversationComposerImpl({
           submitting={pending}
           submitDisabled={
             pending ||
-            connectionPending ||
             (!canReload &&
               (runtimeBlocked || !routingAllowsSend || !attachmentsReady || !submissionReady))
           }

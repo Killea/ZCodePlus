@@ -1,4 +1,4 @@
-import { selectCombinedComposerThoughtLevel } from "./composer-model-picker.js";
+
 /* eslint-disable max-lines -- v4 conversation e2e helper 集中承载 pane/composer/queue/分屏等全部定位与断言原语，拆分会让 spec 的导入面漂移。 */
 // v4 竖切（protocol-v4）conversation e2e helper。
 // 与旧 conversation-session.ts 的区别：所有定位走 TID_V4_* 常量（testid contract v2，
@@ -1472,15 +1472,6 @@ export async function switchV4Model(provider: string, model: string, thought: st
               document.querySelector<HTMLElement>(`[data-testid="${groupTestId}"]`),
             )
             .find((candidate): candidate is HTMLElement => Boolean(candidate));
-          if (!group) {
-            const providerTrigger = document.querySelector<HTMLElement>(
-              '[data-testid="composer-provider-trigger"]',
-            );
-            providerTrigger?.focus();
-            providerTrigger?.dispatchEvent(
-              new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }),
-            );
-          }
           if (group) {
             group.focus();
             for (const eventName of ["pointerenter", "mouseenter", "mousemove"] as const) {
@@ -1512,12 +1503,6 @@ export async function switchV4Model(provider: string, model: string, thought: st
     timeout: 30000,
     timeoutMsg: `模型切换后 config.model 投影没有更新为 ${model}`,
   });
-
-  if (thought && (await selectCombinedComposerThoughtLevel(thought))) return;
-  if (!thought && (await modelTrigger.getAttribute("data-composer-combined-model")) === "true") {
-    await browser.keys("Escape");
-    return;
-  }
 
   // 无 reasoning metadata 的 custom provider 不渲染 thought selector。协议类 E2E
   // 传空值表示只切模型，不能把不存在的思考深度控件当作模型切换失败。

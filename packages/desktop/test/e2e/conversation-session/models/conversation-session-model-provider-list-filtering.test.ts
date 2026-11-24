@@ -16,7 +16,6 @@ import {
   UPSTREAM_PROVIDER_NAME,
   getUpstreamProviderModelValues,
   getSelectedUpstreamModelLabel,
-  openComposerProviderList,
   selectUpstreamProviderModelById,
 } from "#e2e/helpers/upstream-provider";
 import {
@@ -117,8 +116,7 @@ async function assertModelListFiltering() {
   await trigger.click();
 
   try {
-    // 合并菜单先展开 Provider 子菜单，选择后再检查该 Provider 的模型列表。
-    await openComposerProviderList();
+    // 经典二级菜单：主菜单即 Provider 分组列表；点开分组后检查该 Provider 的模型列表。
     const snapshot = () =>
       collectModelListFilterSnapshot({
         builtinConflictGroupTestId,
@@ -153,7 +151,6 @@ async function assertModelListFiltering() {
       timeoutMsg: "可见 Provider 的 companion model 未出现",
     });
     const visibleModelSnapshot = await snapshot();
-    await openComposerProviderList();
     await $(sel(builtinConflictGroupTestId)).click();
     await browser.waitUntil(async () => (await snapshot()).builtinConflictModelItemExists, {
       timeout: 15000,

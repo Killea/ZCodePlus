@@ -6365,10 +6365,6 @@ const ruRU: Record<string, string> = {
   "chat.statusPanel.runningStop": "Остановить",
   "chat.toolbar.connection.switchFailed":
     "Не удалось переключить подключение. Выберите снова, чтобы повторить.",
-  "chat.toolbar.combined.provider": "Провайдер",
-  "chat.toolbar.combined.models": "Модели",
-  "chat.toolbar.combined.effort": "Рассуждение",
-  "chat.toolbar.combined.selectModel": "Выбрать модель",
   "chat.toolbar.model.label": "Выбор модели",
   "chat.toolbar.draftConfigWriteFailed": "Не удалось обновить конфигурацию. Повторите попытку.",
   "chat.toolbar.model.description":

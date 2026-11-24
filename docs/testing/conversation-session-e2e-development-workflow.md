@@ -141,8 +141,8 @@ Provider 允许合并相邻 system 消息；incoming reminder 在 wire 中校验
 - Coding Plan 数据面代理按当前 worker 的 spec 启动，位于上游回放网络配置之后、HOME 播种之前。混合批次包含 ToolSearch 时，只让 ToolSearch worker 使用自己的 capture proxy，不能关闭其他 worker 的账号模型回放。
 - 需要受控流的账号用例保留真实 HTTPS Endpoint 与鉴权路径，由测试代理按精确 host/path 转发到本例 replay server。代理保留原请求地址证据，响应逐块转发；不以固定快速回复或固定延时模拟 running。
 
-- 团队 Provider 共用 Provider ID，模型菜单项按完整团队连接身份分组；专项 helper 由夹具传入连接 key，不能仍用 `registry-provider:<id>` 定位团队行。空白 Composer 不保存未提交改选；跨任务或重启验证未提交选择时，保留非空文字草稿。
-- 合并模型菜单的 Provider 列表是二级菜单。列表断言先打开 `composer-provider-trigger`，选择态读取 radio 的 `aria-checked`；选中 Provider 后回到模型列表再断言模型。不能把尚未展开的 Provider 列表当成候选缺失，也不能依赖旧分组的 `data-model-provider-selected`。
+- 模型菜单是经典二级 `ModelConfigSelect`：先开 `chat-model-select-trigger`，再点 `chat-model-select-group`（分组 key 为 `registry-provider:<id>`）展开该 Provider 的模型列表，最后点 `chat-model-select-item`。不能把尚未展开的分组列表当成候选缺失。空白 Composer 不保存未提交改选；跨任务或重启验证未提交选择时，保留非空文字草稿。
+- Composer 不承担个人/团队连接切换；团队选择经设置页或 `seedBigModelConnectionSelection` 播种 `providerFamilyConnectionSelections` 生效。思考档位由独立控件（`chat-thought-level-select-trigger`/`item`）选择，与模型菜单不共享弹层。
 
 - Plugin mention 图标改由 CSS 装饰变量渲染后，读取 `--mention-image` 的实际 URL；不再查找已移除的子 `img`。商店试用会创建独立草稿，后续固定 cwd 用例须重新准备夹具项目。
 
@@ -550,7 +550,7 @@ fault-stream、性能/时序敏感、会污染全局配置或依赖特殊网络/
 
 ### 正式用例当前界面与构建约束
 
-- I68 主输入框使用合并模型菜单及思考滑杆；Subagent 设置继续使用独立档位控件。两处均校验实际档位集合与请求参数。
+- I68 主输入框使用经典二级模型菜单及独立档位控件；Subagent 设置继续使用独立档位控件。两处均校验实际档位集合与请求参数。
 - CTP-02B 在头像菜单内验证 Team 标签；设置页批次在每条准备前关闭上一条遗留的设置层。
 - MP-UI-06 遵循 Todo141：默认显示 ID、上下文和最大输出，高级配置默认折叠，经点击展开后验证能力勾选框、推理编辑和保存。
 - I24 的模型控件使用共享 custom: 编解码；不把协议 provider/model 值当成界面值，也不通过手动选模绕过自动水合断言。

@@ -133,7 +133,7 @@ Session Selection 保存 Session 后续执行延续使用的 ModelSelection。�
 已有 App 会话的显式选模（含切 Provider 自动选模）立即通过 `switchModelConfig` 保存完整
 Selection，成功后飞书等同会话入口的新输入使用它。新建未绑定草稿仍延后到首发。配置更新不
 替换正在执行的 Active Model，不改写已接纳队列的 Submission；旧队列消费不得覆盖较新配置。
-详见[Composer 交互合同](../../../../composer-model-thinking.md#已有会话选模立即生效)。
+详见 `docs/conversation-session-case-catalog.md` 的模型选择交互条目（2026-11-24 合并入口规格已随菜单回退移除，选模语义不变）。
 
 ### CLI 默认与加速卡回退
 

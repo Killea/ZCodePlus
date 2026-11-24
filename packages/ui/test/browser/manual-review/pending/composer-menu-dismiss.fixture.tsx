@@ -28,7 +28,6 @@ const groups = [
 
 function Composer() {
   const [model, setModel] = useState("one");
-  const [effort, setEffort] = useState("high");
   const { reportComposerDockHeight } = useConversationPanePresentation();
   useEffect(() => reportComposerDockHeight(56), [reportComposerDockHeight]);
   return (
@@ -45,18 +44,6 @@ function Composer() {
         lockReasonMessage="Unavailable"
         isItemLocked={(value) => value === "locked"}
         onValueChange={setModel}
-        composerOptions={{
-          providerLabel: "Provider",
-          modelsLabel: "Models",
-          effortLabel: "Effort",
-          selectModelLabel: "Select model",
-          levels: [
-            { value: "low", label: "Low" },
-            { value: "high", label: "High" },
-          ],
-          value: effort,
-          onValueChange: setEffort,
-        }}
       />
       <output data-testid="selection" hidden>
         {model}

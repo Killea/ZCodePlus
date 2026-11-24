@@ -6386,10 +6386,6 @@ const jaJP: Record<string, string> = {
   "chat.statusPanel.runningStop": "停止",
   "chat.toolbar.connection.switchFailed":
     "接続を切り替えられませんでした。もう一度選択して再試行してください。",
-  "chat.toolbar.combined.provider": "プロバイダー",
-  "chat.toolbar.combined.models": "モデル",
-  "chat.toolbar.combined.effort": "強度",
-  "chat.toolbar.combined.selectModel": "モデルを選択",
   "chat.toolbar.model.label": "モデルを選択",
   "chat.toolbar.draftConfigWriteFailed": "構成の更新に失敗しました。もう一度お試しください。",
   "chat.toolbar.model.description":

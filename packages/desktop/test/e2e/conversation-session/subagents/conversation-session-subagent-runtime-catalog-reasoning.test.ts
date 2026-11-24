@@ -21,7 +21,6 @@ import {
   TID_V4_MODEL_CONFIG,
   testId,
 } from "@zcode/shared/test-ids";
-import { selectCombinedComposerThoughtLevel } from "#e2e/helpers/composer-model-picker";
 import {
   DEFAULT_WORKSPACE,
   clearAppData,
@@ -427,12 +426,19 @@ async function assertThoughtOptionsAndSelectInScope(
   thoughtLevel: string,
 ) {
   if (scope === "body") {
-    // 主输入框已合并模型和思考入口；Subagent 设置仍使用独立下拉框。
-    await $(sel(TID_CHAT_MODEL_SELECT_TRIGGER)).click();
-    const slider = $('[data-testid="composer-thought-slider"]');
-    await slider.waitForDisplayed({ timeout: 15000 });
-    expect(JSON.parse((await slider.getAttribute("data-levels")) ?? "[]")).toEqual(levels);
-    expect(await selectCombinedComposerThoughtLevel(thoughtLevel)).toBe(true);
+    // 主输入框使用独立的思考档位下拉控件；Subagent 设置路径一致。
+    const bodyTrigger = $(sel(TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER));
+    await bodyTrigger.waitForClickable({ timeout: 15000 });
+    await bodyTrigger.click();
+    for (const level of levels) {
+      await $(sel(testId(TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM, level))).waitForDisplayed({
+        timeout: 15000,
+        timeoutMsg: `reasoning effort 菜单没有出现 ${level}`,
+      });
+    }
+    const bodyItem = $(sel(testId(TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM, thoughtLevel)));
+    await bodyItem.waitForClickable({ timeout: 15000 });
+    await bodyItem.click();
     await expect($(sel(TID_V4_MODEL_CONFIG))).toHaveAttribute("data-thought", thoughtLevel);
     return;
   }

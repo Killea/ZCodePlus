@@ -88,16 +88,8 @@ describe("模型 Provider 重启恢复 E2E", () => {
     // 未提交改选只随非空文字草稿保存，空白 Composer 重启会读取原 Recent。
     await setInputValueByTestIdDom(TID_V4_COMPOSER_INPUT, "E2E_MODEL_PROVIDER_RESTART_R02 draft");
     await waitForV4ComposerSelectionReady();
-    // 合并菜单只展示当前 Provider 的模型；通过 Provider 子菜单切换后再选择目标模型。
     await selectRegistryProviderModelById(E2E_PLAN_NON_DEFAULT_MODEL, {
       providerId: E2E_BIGMODEL_PLAN_PROVIDER_ID,
-      providerGroupKey: JSON.stringify([
-        "bigmodel",
-        "team-coding-plan",
-        "product-team-a",
-        "org-team-a",
-        "proj-team-a",
-      ]),
       includePlainModelFallback: false,
     });
     await selectUpstreamThoughtLevelValue("max");

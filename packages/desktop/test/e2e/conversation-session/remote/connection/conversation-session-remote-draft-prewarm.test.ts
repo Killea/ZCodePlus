@@ -7,6 +7,8 @@ import {
   TID_CHAT_MODEL_SELECT_TRIGGER,
   TID_CHAT_MODEL_SELECT_GROUP,
   TID_CHAT_MODEL_SELECT_ITEM,
+  TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER,
+  TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM,
   TID_V4_MODEL_CONFIG,
   testId,
   TID_V4_COMPOSER_INPUT,
@@ -292,7 +294,6 @@ describe(`${CASE}: 远端草稿先确定项目归属再预热`, () => {
       const trigger = page!.getByTestId(TID_CHAT_MODEL_SELECT_TRIGGER).first();
       if (!values.includes((await trigger.getAttribute("data-model-current-value")) ?? "")) {
         await trigger.click();
-        await page!.getByTestId("composer-provider-trigger").click();
         await page!
           .getByTestId(testId(TID_CHAT_MODEL_SELECT_GROUP, `registry-provider:${provider!.id}`))
           .click();
@@ -322,19 +323,12 @@ describe(`${CASE}: 远端草稿先确定项目归属再预热`, () => {
           ),
         values,
       );
-      if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-      const toggle = page!.getByTestId("composer-thought-switch");
-      const slider = page!.getByTestId("composer-thought-slider");
-      if (await toggle.isVisible()) {
-        expect(await toggle.getAttribute("data-off-value")).toBe("disabled");
-        if ((await toggle.getAttribute("aria-checked")) !== "false") await toggle.click();
-      } else if (await slider.isVisible()) {
-        const levels = JSON.parse((await slider.getAttribute("data-levels")) ?? "[]") as string[];
-        const index = levels.indexOf("disabled");
-        expect(index).toBeGreaterThanOrEqual(0);
-        await slider.press("Home");
-        for (let i = 0; i < index; i++) await slider.press("ArrowRight");
-      }
+      // 经典工具条：思考档位是独立的 Select 控件，不再挂在模型弹层里。
+      const thoughtTrigger = page!.getByTestId(TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER).first();
+      await thoughtTrigger.click();
+      await page!
+        .getByTestId(testId(TID_CHAT_THOUGHT_LEVEL_SELECT_ITEM, "disabled"))
+        .click();
       await page!.keyboard.press("Escape");
       expect(await page!.getByTestId(TID_V4_MODEL_CONFIG).getAttribute("data-thought")).toBe(
         "disabled",

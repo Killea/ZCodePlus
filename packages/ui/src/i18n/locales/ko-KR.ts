@@ -6236,10 +6236,6 @@ const koKR: Record<string, string> = {
   "chat.statusPanel.runningStop": "중지",
   "chat.toolbar.connection.switchFailed":
     "연결을 전환할 수 없습니다. 다시 시도하려면 다시 선택하세요.",
-  "chat.toolbar.combined.provider": "공급자",
-  "chat.toolbar.combined.models": "모델",
-  "chat.toolbar.combined.effort": "강도",
-  "chat.toolbar.combined.selectModel": "모델 선택",
   "chat.toolbar.model.label": "모델 선택",
   "chat.toolbar.draftConfigWriteFailed": "구성을 업데이트하지 못했습니다. 다시 시도하세요.",
   "chat.toolbar.model.description":

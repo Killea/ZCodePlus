@@ -67,10 +67,7 @@ async function readModelMenu(): Promise<MenuSnapshot> {
   }, TID_CHAT_MODEL_SELECT_TRIGGER);
   if (base.triggerDisabled) return { items: [], ...base };
   await trigger.click();
-  // 合并菜单默认只投影当前供应商；先打开供应商列表，才能观察完整候选归属。
-  const providers = $('[data-testid="composer-provider-trigger"]');
-  if ((await providers.isExisting()) && (await providers.getAttribute("aria-expanded")) !== "true")
-    await providers.click();
+  // 经典二级菜单打开即展示全部 Provider 分组。
   let items: string[] = [];
   await browser.waitUntil(
     async () => {

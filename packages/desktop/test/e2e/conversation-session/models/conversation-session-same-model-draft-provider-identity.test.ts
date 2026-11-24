@@ -20,7 +20,6 @@ import type { E2ENetworkCaptureRecord } from "#e2e/helpers/network-capture-proxy
 import { sel } from "#e2e/helpers/selectors";
 import {
   getSelectedUpstreamModelLabel,
-  openComposerProviderList,
   getUpstreamProviderModelValues,
   selectUpstreamProviderModelById,
   UPSTREAM_MODEL,
@@ -318,7 +317,6 @@ async function assertModelMenuSelectedProvider(
   await trigger.click();
 
   try {
-    await openComposerProviderList();
     await browser.waitUntil(
       async () => {
         const rootSnapshot = await collectModelMenuSelectionSnapshot({
@@ -336,7 +334,19 @@ async function assertModelMenuSelectedProvider(
         timeoutMsg: `模型列表没有把 alternate provider 下的 ${scenario.label} 标为选中`,
       },
     );
-    // 桌面子菜单不会因只读检查获得键盘焦点；Escape 会关掉整层，直接读取仍挂载的模型项。
+    // 经典二级菜单的模型项只在子菜单展开后挂载；点开目标 Provider 分组再读取选中态。
+    await $(sel(providerGroupTestId)).click();
+    await browser.waitUntil(
+      async () =>
+        (
+          await collectModelMenuSelectionSnapshot({
+            modelItemTestIds,
+            previousProviderGroupTestId,
+            providerGroupTestId,
+          })
+        ).targetItemsInDom.length > 0,
+      { timeout: 15000, timeoutMsg: "Provider 子菜单没有挂载目标模型项" },
+    );
     expect(
       (
         await collectModelMenuSelectionSnapshot({
@@ -401,9 +411,10 @@ async function collectModelMenuSelectionSnapshot({
         bodyText: document.body?.innerText?.slice(0, 1800) ?? "",
         previousProviderGroupExists: Boolean(previousProviderGroup),
         previousProviderGroupSelected:
-          previousProviderGroup?.getAttribute("aria-checked") === "true",
+          previousProviderGroup?.getAttribute("data-model-provider-selected") === "true",
         providerGroupExists: Boolean(providerGroup),
-        providerGroupSelected: providerGroup?.getAttribute("aria-checked") === "true",
+        providerGroupSelected:
+          providerGroup?.getAttribute("data-model-provider-selected") === "true",
         targetItemSelected: targetItemsInDom.some(
           (item) => item.selected === "true" || item.checked === "true",
         ),

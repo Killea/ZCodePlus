@@ -162,32 +162,31 @@ for (const surface of ["electron", "mobile"])
           "plugin remains interactive after dismissal",
         );
         await open();
+        // 经典二级菜单：hover Provider 分组展开飞出项，选中即关闭。
+        await page.getByRole("menuitem", { name: "Provider A", exact: true }).hover();
         await page.getByRole("menuitemradio", { name: "Model Two", exact: true }).click();
-        assert.equal(await trigger.getAttribute("aria-expanded"), "true");
+        assert.equal(await trigger.getAttribute("aria-expanded"), "false");
         assert.equal(await page.getByTestId("selection").textContent(), "two");
-        await page.getByRole("menuitemradio", { name: "Model Two", exact: true }).focus();
-        await page.keyboard.press("Enter");
-        assert.equal(await trigger.getAttribute("aria-expanded"), "true");
         trace.push({
           afterSelection: await page.getByTestId("selection").textContent(),
           expanded: await trigger.getAttribute("aria-expanded"),
         });
         const clicksAfterSelection = await guestClicks();
+        await open();
         if (surface === "mobile") await page.touchscreen.tap(80, 80);
         else await page.mouse.click(80, 80);
         await closed();
         assert.equal(await guestClicks(), clicksAfterSelection);
         await open();
+        // 锁定项阻止默认 select，菜单保持打开。
+        await page.getByRole("menuitem", { name: "Provider A", exact: true }).hover();
         await page.getByRole("menuitem", { name: "Locked Model" }).click();
         assert.equal(await trigger.getAttribute("aria-expanded"), "true");
-        await page.getByTestId("composer-provider-trigger").click();
-        await page.getByRole("menuitemradio", { name: "Provider B", exact: true }).click();
+        // 二级飞出菜单：Provider B → Model Three。
+        await page.getByRole("menuitem", { name: "Provider B", exact: true }).hover();
+        await page.getByRole("menuitemradio", { name: "Model Three", exact: true }).click();
         assert.equal(await page.getByTestId("selection").textContent(), "three");
-        assert.equal(await trigger.getAttribute("aria-expanded"), "true");
-        await page.getByRole("slider").focus();
-        await page.keyboard.press("Home");
-        assert.equal(await page.getByRole("slider").getAttribute("aria-valuetext"), "Low");
-        assert.equal(await trigger.getAttribute("aria-expanded"), "true");
+        assert.equal(await trigger.getAttribute("aria-expanded"), "false");
         await page.screenshot({ path: join(artifacts, `${surface}-${theme}.png`) });
         await page.keyboard.press("Escape");
         await closed();

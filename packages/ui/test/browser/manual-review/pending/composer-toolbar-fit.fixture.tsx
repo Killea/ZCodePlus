@@ -49,7 +49,6 @@ function Fixture() {
               <DropdownMenuTrigger asChild>
                 <Button
                   data-testid="fit-model"
-                  data-composer-combined-model
                   data-composer-collapse-priority="3"
                   className="group/control group-data-[composer-model-icon=true]/toolbar:w-7 group-data-[composer-model-icon=true]/toolbar:px-0"
                 >

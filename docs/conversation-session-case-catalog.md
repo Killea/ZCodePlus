@@ -2310,10 +2310,10 @@ scope。普通 Plugin 引用的发送与 runtime 语义继续由 PLG 组覆盖�
 
 | ID    | 前置状态                                                            | 用户/系统事件                                            | 规则命中                            | 期望结果                                                                                                                  | Review   |
 | ----- | ------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------- |
-| CPE01 | desktop local 的 V4 composer；模式与合并模型／思考 trigger 均可操作 | 依次执行模式→合并菜单、合并菜单→模式切换                 | composerConfigPickerSingleOpenOwner | 每次点击第二个 trigger 后只有后者保持展开；旧 picker 关闭；迟到的旧 close 不得关闭新 picker；选型和 config 投影语义不改变 | accepted |
+| CPE01 | desktop local 的 V4 composer；模式与模型／思考 trigger 均可操作 | 依次执行模式→模型菜单、模型菜单→模式切换                 | composerConfigPickerSingleOpenOwner | 每次点击第二个 trigger 后只有后者保持展开；旧 picker 关闭；迟到的旧 close 不得关闭新 picker；选型和 config 投影语义不改变 | accepted |
 | CPE02 | desktop local 的 completed task；模型 picker 已展开                 | 新建 draft，复用同一个 `ConversationComposer` React 实例 | composerConfigPickerScopeReset      | task scope 离开时 picker owner 清空；draft 可交互后没有 menu/listbox 自动弹出；模型和 draft config 语义不改变             | accepted |
 
-CPE01 沿用 2026-07-31 的共享 owner 边界，按合并入口规格更新为模式与模型／思考的双向切换；
+CPE01 沿用 2026-07-31 的共享 owner 边界，验证模式与模型／思考 picker 的双向切换（2026-11-24 模型入口已回退为经典二级菜单＋独立档位控件，排他语义不变）；
 主题、语言、draft/completed、desktop/Web/mobile 不做笛卡尔积。三端复用同一
 `ConversationComposer` 状态边界；响应式只改变 trigger 展示。picker 状态是 renderer-local
 presentation state，不进入 session projection、workspace identity、queue、owner/lease 或
@@ -4748,12 +4748,12 @@ PA158-07/08/11 的失败路径：项目归属查询失败仍发送两种模式�
 
 ## CMP：Composer 压缩与 provider 身份
 
-沿用 [合并模型入口的五档压缩契约](composer-model-thinking.md)。providerName 缺失时菜单显示 providerId；按钮仅显示模型名。
+沿用工具栏五档压缩契约（2026-11-24 起为经典二级菜单＋独立档位控件，合并入口规格已随回退移除）。providerName 缺失时菜单显示 providerId；按钮仅显示模型名。
 
 | ID    | 前置状态                                                                             | 动作                   | 断言                                                                                                                         | 决策     |
 | ----- | ------------------------------------------------------------------------------------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------- |
-| CMP01 | 中文桌面空草稿，Plan 与 Computer Use 入口启用，已选有名称 provider 和多档 think 模型 | 真实窗口逐步缩窄再放宽 | 逐一观测 0–5 档：Computer / mode / Plan 收起，合并入口档位文字变绿条，模型名变图标且保留绿条；放宽恢复；单行、不截断、不重叠 | accepted |
-| CMP02 | 隔离 Personal Config 的 bigmodel-api 不含 providerName                               | 从菜单选中 GLM-5.3     | 选中投影正确，菜单显示 bigmodel-api，合并按钮只显示 GLM-5.3；不恢复已移除的 Provider 前缀                                    | accepted |
+| CMP01 | 中文桌面空草稿，Plan 与 Computer Use 入口启用，已选有名称 provider 和多档 think 模型 | 真实窗口逐步缩窄再放宽 | 逐一观测 0–5 档：Computer / mode / Plan 收起，think 文字收起后独立档位控件保留绿条并收成图标，模型名最后变图标；放宽恢复；单行、不截断、不重叠（2026-11-24 自合并菜单回退） | accepted |
+| CMP02 | 隔离 Personal Config 的 bigmodel-api 不含 providerName                               | 从菜单选中 GLM-5.3     | 选中投影正确，菜单显示 bigmodel-api，trigger 只显示 GLM-5.3；不恢复已移除的 Provider 前缀                                    | accepted |
 
 本组不发送模型请求；手机远控、原生 Windows、深浅主题和 reduced-motion 的组合不由这两条桌面 E2E 冒充覆盖。
 
@@ -5456,7 +5456,7 @@ lane 最近结果的记录与按 sourceServerId 查询、无 lane 返回「无 l
 
 ## 远端 Composer 切回已生效套餐连接（RPR-01，2026-11-05，pending）
 
-规格见 [Composer 模型与思考档位](composer-model-thinking.md)「重选已生效的套餐连接」，工单 ZCT-2118278184274395136。远端为本机 Docker 远端 runner 提供的 Linux 容器。本机与远端共用同一个账号套餐 mock：SSH 反向隧道在容器内监听与宿主相同的端口，容器 `/etc/environment` 补 `BIGMODEL_API_BASE_URL`（它不在 Desktop 转发给远端的运行时变量里）。远端断言读 `/home/dev/.zcode/v2/setting.json`，同步次数读本机 Main 日志中 `trigger=account-settings` 的 Provisioning 结果。
+原合并菜单规格已随 2026-11-24 回退移除；现行为：经典二级菜单中重新选择当前连接 Provider 的首个可用模型即完成重选。工单 ZCT-2118278184274395136。远端为本机 Docker 远端 runner 提供的 Linux 容器。本机与远端共用同一个账号套餐 mock：SSH 反向隧道在容器内监听与宿主相同的端口，容器 `/etc/environment` 补 `BIGMODEL_API_BASE_URL`（它不在 Desktop 转发给远端的运行时变量里）。远端断言读 `/home/dev/.zcode/v2/setting.json`，同步次数读本机 Main 日志中 `trigger=account-settings` 的 Provisioning 结果。
 
 | ID     | 场景与断言                                                                                                                                                                                                                                                                                                                                                                        | 自动化                                                                                                           |
 | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -5870,9 +5870,9 @@ B 必须正常结束 pending 并可发送；释放 A 的旧 RPC 后，不覆盖 
 
 同名模型跨 provider 时，目录读取挂起期间不得发送或新增入队，草稿保持；放行后新消息使用目标 provider。覆盖桌面宽/窄视口的按钮与 Enter，沿用 toolbar E2E；已入队快照隔离沿用 queue E2E。用例未实跑前不记为通过。
 
-思考档位 Session 同步（accepted）：已有会话仅用滑块或 Ctrl+T 改档位，不发送桌面消息，核对持久 Session Selection；手机配对链路同样在发送前确认。真实飞书输入另验证请求档位，运行轮及队列快照不变。
+思考档位 Session 同步（accepted）：已有会话仅用档位控件或 Ctrl+T 改档位，不发送桌面消息，核对持久 Session Selection；手机配对链路同样在发送前确认。真实飞书输入另验证请求档位，运行轮及队列快照不变。
 
-配置 ACK 门禁（accepted）：挂起已有会话 A 的选模命令，桌面/手机合并模型菜单保持打开、配置控件禁用，Ctrl+M/T 不新增命令；选 Provider、模型、滑杆均不自动收起；桌面切到 B 可独立切档，返回 A 仍 pending。释放 A 时不得解除 B 的在途门禁；各自释放后持久 Selection 与草稿一致。
+配置 ACK 门禁（accepted）：挂起已有会话 A 的选模命令，桌面/手机模型菜单保持打开、配置控件禁用，Ctrl+M/T 不新增命令；选 Provider 分组、模型项、档位控件均不自动收起；桌面切到 B 可独立切档，返回 A 仍 pending。释放 A 时不得解除 B 的在途门禁；各自释放后持久 Selection 与草稿一致。（2026-11-24 自合并菜单回退，语义不变）
 
 Highspeed 同模型调档（HS-E2E-07，accepted）：有效卡锁定 Provider/Model 时，独立档位控件和 Ctrl+T 仍可提交档位；ACK 在途禁用入口和发送。桌面宽窄窗口与手机配对路径核对持久 Session Selection，下一次实际请求使用新档位；运行轮和已接纳队列保持冻结快照。
 

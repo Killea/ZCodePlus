@@ -133,16 +133,8 @@ describe("Builtin 下载失败时的套餐操作", () => {
       };
       expect(await readBigModelConnectionSelection()).toEqual(team);
       await clickTestIdByDom(TID_SETTINGS_BACK_BUTTON);
-      // 团队菜单行按完整连接身份区分，不能查找已移除的 registry-provider:team 行。
       await selectRegistryProviderModelById("GLM-5.3", {
         providerId: ids.bigmodelTeamCodingPlan,
-        providerGroupKey: JSON.stringify([
-          "bigmodel",
-          "team-coding-plan",
-          "product-team-a",
-          "org-team-a",
-          "proj-team-a",
-        ]),
         includePlainModelFallback: false,
       });
       await selectUpstreamThoughtLevelValue("high");

@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import {
   TID_V4_MODEL_CONFIG,
   TID_CHAT_MODEL_SELECT_TRIGGER,
+  TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER,
   TID_CHAT_MODEL_SELECT_ITEM,
   testId,
 } from "@zcode/shared/test-ids";
@@ -246,10 +247,14 @@ describe("Todo 70：模型选择残缺不阻止历史打开", () => {
       if (index >= 2) expect(config.model).toBe("");
       else {
         expect(config.model).toBe(UPSTREAM_MODEL);
-        // 模型与思考已合并为同一入口；缺档位显示横线，不能伪装成第一档“关闭”。
-        const modelTrigger = await $(`[data-testid="${TID_CHAT_MODEL_SELECT_TRIGGER}"]`);
-        expect(await modelTrigger.getAttribute("aria-label")).not.toMatch(/关闭|Disabled|Off/u);
-        expect(await modelTrigger.$("[data-composer-thought-label]").getText()).toBe("—");
+        // 不能只断言 data-thought：底层控件曾把空值伪装成第一档“关闭”。
+        const thoughtTrigger = await $(
+          `[data-testid="${TID_CHAT_THOUGHT_LEVEL_SELECT_TRIGGER}"]`,
+        );
+        expect(await thoughtTrigger.getAttribute("aria-label")).toMatch(
+          /选择思考档位|Select reasoning level/,
+        );
+        expect(await thoughtTrigger.getText()).toMatch(/选择思考档位|Select reasoning level/);
       }
       await browser.saveScreenshot(`.e2e-artifacts/todo70-unbound-${index}.png`);
       await selectModel();

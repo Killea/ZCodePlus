@@ -11,18 +11,13 @@ type ModelSelectionCatalog = Pick<ModelSelectionView, "revision" | "providers">;
 
 export type ModelSelectionState =
   | { status: "loading"; catalog?: ModelSelectionCatalog }
-  | { status: "ready"; view: ModelSelectionView; refreshError?: { revision: number; error: Error } }
+  | { status: "ready"; view: ModelSelectionView }
   | { status: "unavailable"; reason: "remote-waiting" | "missing-target" }
   | { status: "error"; error: Error };
-
-export type ModelSelectionRefreshResult =
-  | { kind: "ready"; view: ModelSelectionView }
-  | { kind: "superseded" };
 
 export interface ModelSelectionRead {
   state: ModelSelectionState;
   reload(): void;
-  refresh(): Promise<ModelSelectionRefreshResult>;
 }
 
 interface OwnedModelSelectionState {
@@ -99,7 +94,6 @@ export function useModelSelectionServiceView(
   const ownedRef = useRef(owned);
   ownedRef.current = owned;
   const generationRef = useRef(0);
-  const readRef = useRef<(() => Promise<ModelSelectionRefreshResult>) | null>(null);
   const ownerMatches =
     owned.service === normalizedService &&
     owned.enabled === enabled &&
@@ -158,35 +152,20 @@ export function useModelSelectionServiceView(
         state: { status: "ready", view: candidate },
       });
     };
-    const read = (): Promise<ModelSelectionRefreshResult> => {
+    const read = (): void => {
       cancelRetry();
       const request = ++requestId;
-      return normalizedService.getView(stableInput).then(
+      void normalizedService.getView(stableInput).then(
         (candidate) => {
-          if (generation !== generationRef.current || request !== requestId)
-            return { kind: "superseded" };
+          if (generation !== generationRef.current || request !== requestId) return;
           commit(candidate);
-          return { kind: "ready", view: candidate };
         },
         (cause: unknown) => {
-          // 原因：旧读取虽不能写展示 state，其 rejection 仍会被等待它的 Composer 当成当前失败。
-          // owner 明确返回已被取代回执；仅当前读取失败才发布失败并拒绝。
-          if (generation !== generationRef.current || request !== requestId)
-            return { kind: "superseded" };
+          if (generation !== generationRef.current || request !== requestId) return;
           const error = cause instanceof Error ? cause : new Error(String(cause));
           logger.warn("[model-selection] 目标 Host View 读取失败", { error });
-          // 原因：保留旧 ready 不能吞掉新 revision 的失败，否则连接切换会永久等待。
-          // 失败与当前 service/input 及事件 revision 绑定；保留旧目录，成功重读清除回执。
-          if (hasReadyView) {
-            setOwned((previous) =>
-              previous.state.status === "ready"
-                ? {
-                    ...previous,
-                    state: { ...previous.state, refreshError: { revision: latestRevision, error } },
-                  }
-                : previous,
-            );
-          } else {
+          // 读取失败不是选择失效。成功后的刷新失败保留原 View；首次失败可见且有界重读。
+          if (!hasReadyView) {
             setOwned({
               service: normalizedService,
               enabled,
@@ -197,46 +176,30 @@ export function useModelSelectionServiceView(
             const delay = INITIAL_READ_RETRY_DELAYS[retryCount];
             if (delay !== undefined && isTransientReadError(cause)) {
               retryCount += 1;
-              retryTimer = setTimeout(() => {
-                void read().catch(() => {});
-              }, delay);
+              retryTimer = setTimeout(read, delay);
             }
           }
-          throw error;
         },
       );
     };
-    // 原因：相同目录不会再发事件；显式重读与订阅读取共享请求序号，迟到旧失败不能覆盖重试。
-    readRef.current = read;
     const subscription = normalizedService.onDidChange((candidate) => {
       if (generation !== generationRef.current) return;
       if (stableInput === undefined) commit(candidate);
       else {
         // 公共事件没有某个调用者的原意图；只能用它触发当前输入重读，不能直接接管结果。
         latestRevision = Math.max(latestRevision, candidate.revision);
-        void read().catch(() => {});
+        read();
       }
     });
-    void read().catch(() => {});
+    read();
     return () => {
       generationRef.current += 1;
-      if (readRef.current === read) readRef.current = null;
       cancelRetry();
       subscription.dispose();
     };
   }, [enabled, normalizedService, reloadVersion, unavailableReason, inputKey, stableInput]);
 
-  return {
-    state: visibleState,
-    reload: useCallback(() => reload(), []),
-    refresh: useCallback(
-      () =>
-        readRef.current
-          ? readRef.current()
-          : Promise.reject(new Error("Model selection owner unavailable")),
-      [],
-    ),
-  };
+  return { state: visibleState, reload: useCallback(() => reload(), []) };
 }
 
 /** 模型候选只来自明确 Workspace Target；等待远端时不读取 Local/Base Host。 */
