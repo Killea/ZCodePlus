@@ -94,9 +94,13 @@ App 业务单测已退役，不新增或恢复 App 业务单测 test/spec 或 `c
   可追溯的 commit。执行前自查：`git status --porcelain` 为空，且
   `git fetch origin && git merge-base --is-ancestor HEAD origin/dev_hank` 成立。
 - 桌面快捷方式 `~/Desktop/ZCode Preview.desktop` 直接指向解包二进制：
-  `packages/desktop/dist/linux-unpacked/zcode-preview --no-sandbox`，不走 AppImage。
+  `packages/desktop/dist-next2/linux-unpacked/zcode-preview --no-sandbox`，不走 AppImage。
+  注意 electron-builder 的输出目录固定是 `dist/`（含 `dist/linux-unpacked`），
+  **不是**运行中的 `dist-next2/`；本地迭代更新安装需把
+  `dist/linux-unpacked/` rsync 到 `dist-next2/linux-unpacked/`
+  （`rsync -a --delete`，先确认快捷方式 Exec 指向的实际目录），或改快捷方式指向 `dist/`。
 - `linux-unpacked/resources/glm/zcode.cjs` 是指向
-  `apps/zcode-cli/packages/cli/dist/zcode.cjs` 的符号链接。
+  `apps/zcode-cli/packages/cli/dist/zcode.cjs` 的符号链接（dist-next2 同步后按绝对路径生效）。
   因此 CLI/runtime 改动只需 `pnpm --dir apps/zcode-cli build` 后重启 App，无需重新打包或安装。
 - `pnpm --dir packages/desktop build` 只产出 `out/`（prepare:runtime-assets + tsup/vite），
   不跑 electron-builder；完整打包入口是
@@ -106,8 +110,9 @@ App 业务单测已退役，不新增或恢复 App 业务单测 test/spec 或 `c
   AppImage/pacman 均为浪费。在 `build` 产出 `out/` 后直接调 electron-builder 覆盖 target：
   `cd packages/desktop && pnpm exec electron-builder --config electron-builder.config.js --linux deb --x64`
   注意这会跳过 `bundle.mjs` 的 asar 依赖校验与体积审计，仅限本机迭代；出正式包仍走 `bundle`。
-- 任何 electron-builder 执行都会重建 `linux-unpacked` 并把符号链接覆盖为真实文件——需重跑：
+- 任何 electron-builder 执行都会重建 `dist/linux-unpacked` 并把符号链接覆盖为真实文件——需重跑：
   `ln -sf "$PWD/apps/zcode-cli/packages/cli/dist/zcode.cjs" packages/desktop/dist/linux-unpacked/resources/glm/zcode.cjs`
+  （先修 `dist/` 的软链再 rsync 到 `dist-next2/`，软链会随同步保留）。
 - `packages/desktop/bundled-agents/<platform>/glm/zcode.cjs` 必须是真实文件，不要改成符号链接：
   `stage-agent-bundle.mjs` / `prepare:runtime-assets` 会用 `fs.copyFileSync` 写入该路径，
   指向同一源文件会触发 ERR_FS_CP_EINVAL。
