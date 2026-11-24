@@ -2,7 +2,7 @@
 title: 多条全局记忆（Multi Global Memory）— 协议、CLI、设置页与 Composer
 description: 全局记忆从单文件 MEMORY.md 扩展为一个目录多条 Markdown 记忆，支持逐条选择注入。默认仅记录设计，不改动代码。
 status: active
-last_updated: 2026-04-30
+last_updated: 2026-11-24
 ---
 
 # 多条全局记忆设计
@@ -13,7 +13,7 @@ last_updated: 2026-04-30
 
 | 层 | 现状 |
 | --- | --- |
-| 存储 | `~/.zcode/cli/memories/global/MEMORY.md` 单文件，`GLOBAL_MEMORY_CHARACTER_LIMIT = 2048` |
+| 存储 | `~/.zcode/cli/memories/global/MEMORY.md` 单文件，`GLOBAL_MEMORY_CHARACTER_LIMIT = 20480` |
 | CLI 注入 | `buildGlobalMemorySection` 单 section；`turnGlobalMemoryIncluded` 逐轮 bool |
 | Composer | `V4ComposerGlobalMemorySwitch` 单选开关 → `includeGlobalMemory` |
 | 设置页 | `GlobalMemoryEditor` 单 textarea |
@@ -34,7 +34,7 @@ last_updated: 2026-04-30
    <body>
    ```
    frontmatter 只认 `name`/`description` 两个键；文件首行必须是 `---` 才尝试解析，缺省回退文件名/`default` 的本地化显示名。服务是唯一写路径，`write` 重组 canonical frontmatter，未知 frontmatter 键随写回规范化丢弃。
-5. **单文件 body ≤ 2048 字符**（含 `MEMORY.md` 既有语义，frontmatter 不计入）；`name ≤ 80`、`description ≤ 200` 字符。
+5. **单文件 body ≤ 20480 字符**（含 `MEMORY.md` 既有语义，frontmatter 不计入；2026-11-24 自 2048 上调）；`name ≤ 80`、`description ≤ 200` 字符。
 6. **静态加密**：`.md` 文件整体落盘为 `enc:v1:` 前缀的 AES-256-GCM 密文（复用 `credentialCipherProvider` 线格式：`<iv>.<authTag>.<cipherText>` base64url；密钥 = `sha256(ZCODE_CREDENTIAL_SECRET || zcode-credential-fallback:{platform}:{homedir}:{username})`，与 credentials.json 同一口径）。服务层与 CLI 注入侧各自实现同格式 codec，读时无 `enc:v1:` 前缀按明文透明兼容；**明文文件在任一读写入口触发就地迁移**——先内存 roundtrip 验证密文可解，再 atomic 替换原文。解密失败：list/注入静默跳过（warn），单条 read 抛解密错误。文件名保持明文 slug（仅泄漏条目存在性，不泄漏内容）；工作区 `memory/` 不在本范围。**安全边界**：密钥可由同用户进程按公开公式推导，防的是文件内容被其他工具/备份直接读走，不是防同用户定向攻击；后续可升级 OS 钥匙串托管密钥。
 7. **上限**：记忆总条数不限——默认不注入任何全局记忆、用户逐条 opt-in 才发送，总量与 context 体积无关；仅保留单轮最多选 4 条注入。
 7. **注入 = 每轮 opt-in，不落库**：勾选集合仅 Composer 组件态，发送成功复位；协议携带 `includedGlobalMemoryIds?: string[]`（保留 `includeGlobalMemory?: boolean` 兼容）。
@@ -60,7 +60,7 @@ Each memory is one Markdown file; the entries selected for this turn are shown b
 Rules:
 - Only edit files under this directory when the user explicitly asks you to remember or save
   something globally. Do not modify them on your own initiative.
-- Keep each file at or under 2048 characters (frontmatter excluded).
+- Keep each file at or under 20480 characters (frontmatter excluded).
 - To add a memory, create `<slug>.md` where slug is lowercase letters/digits/hyphens (1-40 chars).
 
 Contents of <path/to/MEMORY.md> (global memory "<name>"):
@@ -135,6 +135,13 @@ deleteGlobalMemory({id}): Promise<void>
 
 - memoryService 可用即渲染 Brain 图标按钮 + 勾选计数 badge（无总开关门控，2026-10-26 起恒显）；`data-testid="v4-composer-memory-picker"`。
 - DropdownMenu 打开时 `listGlobalMemories()` 拉取最新清单；`DropdownMenuCheckboxItem` 逐条；第 5 项勾选时未选项 disabled（上限 4）。
+- **条目 hover 内容 tooltip**：hover 单条记忆时展示该记忆完整正文（`content`），供勾选前预览。
+  - 正文**懒加载**：meta 列表不含 content，首次 hover 才经宿主注入的 `onReadMemoryContent(id)`（内部走 `readGlobalMemory`）拉取；picker 生命周期内按 id 缓存（菜单重开不重复请求，同一轮 hover 复用）。拉取失败/条目已删除 → 面板显示空内容占位，不报错。
+  - 面板为 `position: fixed` 的自定义浮层（**不是** Radix Tooltip——modal DropdownMenu 会拦截其 hover 链路），`pointer-events: auto` 以支持指针移入面板与滚轮滚动；宽 ≤ 384px（视口不足时收缩）、高 ≤ 320px 且 `overflow-y: auto` 纵向滚动；正文 `whitespace-pre-wrap` 保留换行。
+  - **滚轮必须手动落 scrollTop**：modal 弹层挂载 `react-remove-scroll`（背景滚动锁），其 document 级监听会 preventDefault 全页 wheel，而浮层不是它注册的 shard——默认滚动被抑制。面板挂 `passive: false` 的原生 wheel 监听，把 `deltaY`（按 `deltaMode` 折算）累加到滚动容器 `scrollTop`。缺这一步时滚轮/触控板在真实 app 里无法滚动正文（浏览器验收用例覆盖）。
+  - 定位：默认贴在条目下方，条目靠近视口底部时翻转到上方，水平方向 clamp 进视口。
+  - 关闭：指针移出条目与面板后 150ms 宽限期关闭（覆盖两者之间的间隙移动）；菜单关闭立即关闭；触屏（coarse pointer）不展示（无 hover 语义）。
+  - 上限 disabled（第 5 条起）的条目同样可 hover 预览——信息展示与可勾选性解耦。
 - `ConversationComposer` 状态 `globalMemorySelectedIds: ReadonlySet<string>`（替代 `globalMemoryOptIn`）；发送 payload `includedGlobalMemoryIds: [...ids]`（空集不写字段），随 `...submission` 扩散到全部 sendText 站点；**发送成功复位为空集**（沿用 optIn 复位点）。
 - `ComposerSubmissionConfig.includedGlobalMemoryIds?: string[]`——发送方冻结，与 includeGlobalMemory 同生命周期。
 - 勾选的记忆在发送前被删（另一窗口/CLI）→ 照常发送，CLI 静默跳过。
@@ -145,7 +152,7 @@ deleteGlobalMemory({id}): Promise<void>
 - 列表：name、description、chars、updatedAt；`data-testid="settings-global-memory-list"`。`default` 与其他条目同规则：有自定义 name 显示自定义名，未命名（name 回退为 id）时才显示本地化 "默认"；picker 同样口径。
 - 列表标题旁 info 图标（`data-testid="settings-global-memory-prompt-info"`）：悬浮说明 Prompt 注入范围——仅本轮勾选（≤4 条）、发送文件全文（frontmatter 的 name/description + 正文）、段标题用 id；在此编辑不会立即发送。
 - 新建：inline 表单 name + description + content；`data-testid="settings-global-memory-create"`。新建期间列表不保留选中高亮、已选条目编辑器收起；点击列表条目视为放弃新建并切换选中。
-- 点击条目进入编辑（`GlobalMemoryEditor` 按 `memoryId` 泛化：name/description/content 三字段 + 2048 计数 + 保存）。
+- 点击条目进入编辑（`GlobalMemoryEditor` 按 `memoryId` 泛化：name/description/content 三字段 + 20480 计数 + 保存）。
 - 删除：AlertDialog 确认；`default` 亦可删（删 MEMORY.md）。
 - 无总开关（2026-10-26 起移除）：列表恒可编辑，`GlobalMemoryManager` 不再有 `disabled` 门控。
 

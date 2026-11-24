@@ -830,6 +830,21 @@ function ConversationComposerImpl({
     },
     [services],
   );
+  // picker 条目 hover 内容浮层的数据源：meta 列表不含正文，首次 hover 才读全文。
+  // 条目缺失/失败返回 null，UI 显示空占位（与列表删除竞态同款静默语义）。
+  const handleReadMemoryContent = useCallback(
+    async (memoryId: string): Promise<string | null> => {
+      const memoryService = services?.memoryService;
+      if (!memoryService) return null;
+      try {
+        const entry = await memoryService.readGlobalMemory({ id: memoryId });
+        return entry.exists ? entry.content : null;
+      } catch {
+        return null;
+      }
+    },
+    [services],
+  );
   // Picker 菜单开合只用于驱动插件目录懒加载：菜单打开或有勾选（发送 resolve 需要
   // 最新 catalog）时才查询；关闭且无勾选回到静默。
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
@@ -3071,6 +3086,7 @@ function ConversationComposerImpl({
           selectedIds={globalMemorySelectedIds}
           onToggle={handleToggleGlobalMemory}
           onMenuOpenChange={handleMemoryMenuOpenChange}
+          onReadMemoryContent={handleReadMemoryContent}
           disabled={disabled}
         />
         {/* 最近 3 条用户 prompt 的 peek 图标：hover 即可回看当前 session 在做什么。 */}
@@ -3113,6 +3129,7 @@ function ConversationComposerImpl({
       globalMemorySelectedIds,
       handleConfigPickerOpenChange,
       handleMemoryMenuOpenChange,
+      handleReadMemoryContent,
       handleToggleGlobalMemory,
       handleClearToolSelection,
       handleToggleToolSelection,

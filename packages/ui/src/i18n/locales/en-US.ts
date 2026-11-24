@@ -6865,6 +6865,7 @@ const enUS: Record<string, string> = {
   "chat.toolbar.memory.limitReached": "Up to {max} per message",
   "chat.toolbar.memory.empty": "No memories yet. Create them in Settings → Memory → Global.",
   "chat.toolbar.memory.error": "Failed to load memories.",
+  "chat.toolbar.memory.contentEmpty": "(no content)",
   "chat.memory.included.label": "Global memory included ({count})",
   "chat.memory.included.clear": "Clear",
   "chat.toolbar.tools.label": "Tools",

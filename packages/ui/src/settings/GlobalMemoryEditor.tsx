@@ -54,7 +54,7 @@ function CharCounter({
 /**
  * 全局记忆条目编辑器：按 memoryId 加载/编辑/保存
  * `~/.zcode/cli/memories/global/` 下的单条 Markdown 记忆。
- * 分字段编辑：name / description 落入 frontmatter，content 为正文（≤2048）。
+ * 分字段编辑：name / description 落入 frontmatter，content 为正文（≤20480）。
  * name 留空表示回退显示名（default → 本地化"默认"，其余 → id）。
  * 2026-10-26 起总开关移除（全局记忆默认常开、不可关闭），不再有 disabled 门控。
  */

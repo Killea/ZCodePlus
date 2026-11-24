@@ -7,7 +7,7 @@ import {
 } from "./global-memory-cipher.js";
 
 /** 全局（跨工作区）记忆单文件的字符上限（按 UTF-16 code unit，中文每字计 1）。 */
-export const GLOBAL_MEMORY_CHARACTER_LIMIT = 2048;
+export const GLOBAL_MEMORY_CHARACTER_LIMIT = 20480;
 
 /** 全局记忆 id：保留给存量 MEMORY.md 的永久映射。 */
 export const GLOBAL_MEMORY_DEFAULT_ID = "default";
@@ -56,7 +56,7 @@ export function resolveGlobalMemoryEntryPath(
 }
 
 /**
- * 全局记忆内容格式化：trim 后按 2048 字符截断；超限在最后一个换行处裁剪并追加一行提示。
+ * 全局记忆内容格式化：trim 后按 20480 字符截断；超限在最后一个换行处裁剪并追加一行提示。
  * 空内容返回空串（调用方据此决定是否展示"empty"占位）。
  */
 export function formatGlobalMemoryContent(content: string): string {

@@ -6,7 +6,12 @@
 // - 单轮上限 GLOBAL_MEMORY_SELECTION_LIMIT：达到上限后未勾选行禁选（与 tools picker
 //   的 pluginLimitReached 同款交互）。
 // - 勾选的记忆在发送前被另一窗口/CLI 删除属正常路径：照常发送，CLI 静默跳过。
-import { memo, useCallback, useState } from "react";
+// - 条目 hover 内容浮层：meta 列表不含 content，首次 hover 才经宿主
+//   onReadMemoryContent(id) 懒加载（picker 生命周期内按 id 缓存）。浮层是
+//   position:fixed 的自定义面板（pointer-events:auto 支持滚轮滚动）——不用
+//   Radix Tooltip，modal DropdownMenu 会拦截其 hover 链路。
+import { createPortal } from "react-dom";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { BrainIcon } from "lucide-react";
 import {
   GLOBAL_MEMORY_DEFAULT_ID,
@@ -36,8 +41,20 @@ export interface V4ComposerMemoryPickerProps {
   onToggle: (memoryId: string) => void;
   /** 菜单开合上报：宿主据此拉取/刷新记忆清单。 */
   onMenuOpenChange?: (open: boolean) => void;
+  /**
+   * hover 内容懒加载：返回该记忆 body 明文；条目缺失/失败返回 null（UI 显示
+   * 空内容占位，不报错）。不传时浮层恒显示空占位（fixture/降级场景）。
+   */
+  onReadMemoryContent?: (memoryId: string) => Promise<string | null>;
   disabled?: boolean;
 }
+
+/** 浮层几何约束：宽 ≤384px、高 ≤320px（内容区 280 可滚），定位估算用同一上限。 */
+const DETAIL_MAX_WIDTH = 384;
+const DETAIL_EST_HEIGHT = 320;
+const DETAIL_VIEWPORT_PADDING = 8;
+/** 指针移出条目与浮层后的关闭宽限期：覆盖两者之间的间隙移动。 */
+const DETAIL_CLOSE_GRACE_MS = 150;
 
 function V4ComposerMemoryPickerImpl({
   memories,
@@ -46,13 +63,137 @@ function V4ComposerMemoryPickerImpl({
   selectedIds,
   onToggle,
   onMenuOpenChange,
+  onReadMemoryContent,
   disabled,
 }: V4ComposerMemoryPickerProps) {
   const { intl } = useZCodeIntl();
   const [open, setOpen] = useState(false);
+  // ── hover 内容浮层（完整正文预览）──
+  // 条目矩形快照驱动 fixed 定位；content 按 id 缓存，拉取竞态用 hoverIdRef 兜底。
+  const [hover, setHover] = useState<{
+    id: string;
+    left: number;
+    top: number;
+    bottom: number;
+  } | null>(null);
+  const [hoverContent, setHoverContent] = useState<string | null>(null);
+  const [hoverLoading, setHoverLoading] = useState(false);
+  const contentCache = useRef(new Map<string, string>());
+  const hoverIdRef = useRef<string | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const detailPanelRef = useRef<HTMLDivElement | null>(null);
+
+  const cancelDetailClose = useCallback(() => {
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleDetailClose = useCallback(() => {
+    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      hoverIdRef.current = null;
+      setHover(null);
+    }, DETAIL_CLOSE_GRACE_MS);
+  }, []);
+
+  // 组件卸载时回收未触发的宽限期定时器。
+  useEffect(
+    () => () => {
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    },
+    [],
+  );
+
+  // 手动滚轮滚动：modal 弹层的 react-remove-scroll（背景滚动锁）会在 document
+  // 层 preventDefault 全页 wheel——浮层不是它注册的 shard，默认滚动已被抑制，
+  // 必须在面板上把 deltaY 手动落到 scrollTop，否则滚轮/触控板无法滚动正文。
+  useEffect(() => {
+    if (!hover) return;
+    const panel = detailPanelRef.current;
+    if (!panel) return;
+    const handleWheel = (event: WheelEvent) => {
+      const scroller = panel.querySelector<HTMLElement>("[data-memory-detail-scroller]");
+      if (!scroller || scroller.scrollHeight <= scroller.clientHeight) return;
+      const factor =
+        event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? 40
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? scroller.clientHeight
+            : 1;
+      scroller.scrollTop += event.deltaY * factor;
+      event.preventDefault();
+    };
+    panel.addEventListener("wheel", handleWheel, { passive: false });
+    return () => panel.removeEventListener("wheel", handleWheel);
+  }, [hover]);
+
+  const loadHoverContent = useCallback(
+    (memoryId: string) => {
+      hoverIdRef.current = memoryId;
+      const cached = contentCache.current.get(memoryId);
+      if (cached !== undefined) {
+        setHoverContent(cached);
+        setHoverLoading(false);
+        return;
+      }
+      setHoverContent(null);
+      setHoverLoading(true);
+      if (!onReadMemoryContent) {
+        // 宿主未提供数据源：按空内容占位，不悬挂 loading。
+        setHoverContent("");
+        setHoverLoading(false);
+        return;
+      }
+      onReadMemoryContent(memoryId).then(
+        (content) => {
+          const value = content ?? "";
+          contentCache.current.set(memoryId, value);
+          if (hoverIdRef.current === memoryId) {
+            setHoverContent(value);
+            setHoverLoading(false);
+          }
+        },
+        () => {
+          // 拉取失败（条目已删除/服务异常）：缓存空占位，避免每次 hover 重复打失败请求。
+          contentCache.current.set(memoryId, "");
+          if (hoverIdRef.current === memoryId) {
+            setHoverContent("");
+            setHoverLoading(false);
+          }
+        },
+      );
+    },
+    [onReadMemoryContent],
+  );
+
+  const handleItemMouseEnter = useCallback(
+    (memoryId: string, target: HTMLElement) => {
+      if (isCoarseTouchDevice()) return; // 触屏无 hover 语义，不出浮层。
+      cancelDetailClose();
+      const rect = target.getBoundingClientRect();
+      setHover({ id: memoryId, left: rect.left, top: rect.top, bottom: rect.bottom });
+      loadHoverContent(memoryId);
+    },
+    [cancelDetailClose, loadHoverContent],
+  );
+
   const handleMenuOpenChange = useCallback(
     (nextOpen: boolean) => {
       setOpen(nextOpen);
+      if (!nextOpen) {
+        // 菜单关闭：浮层立即关闭（不等宽限期），loading 态复位；content 缓存保留给下一轮。
+        if (closeTimerRef.current !== null) {
+          window.clearTimeout(closeTimerRef.current);
+          closeTimerRef.current = null;
+        }
+        hoverIdRef.current = null;
+        setHover(null);
+        setHoverContent(null);
+        setHoverLoading(false);
+      }
       onMenuOpenChange?.(nextOpen);
     },
     [onMenuOpenChange],
@@ -67,6 +208,66 @@ function V4ComposerMemoryPickerImpl({
         : entry.name,
     [intl],
   );
+
+  // hover 内容浮层：fixed 定位 portal（pointer-events:auto 支持指针移入与滚轮
+  // 滚动）。默认贴条目下方、靠近视口底部翻转到上方，水平 clamp 进视口。
+  // 定位用固定估算高度（DETAIL_EST_HEIGHT）——浮层内容区 max-h 280 + 标题/
+  // 内边距 < 320，估算偏保守只会留少量空隙，不会出界。
+  const renderDetailPanel = (hovered: {
+    id: string;
+    left: number;
+    top: number;
+    bottom: number;
+  }) => {
+    const entry = memories.find((m) => m.id === hovered.id);
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const panelWidth = Math.min(DETAIL_MAX_WIDTH, viewportWidth - DETAIL_VIEWPORT_PADDING * 2);
+    const left = Math.min(
+      Math.max(DETAIL_VIEWPORT_PADDING, hovered.left),
+      Math.max(DETAIL_VIEWPORT_PADDING, viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth),
+    );
+    let top = hovered.bottom + 6;
+    if (top + DETAIL_EST_HEIGHT > viewportHeight - DETAIL_VIEWPORT_PADDING) {
+      top = hovered.top - 6 - DETAIL_EST_HEIGHT;
+    }
+    top = Math.max(
+      DETAIL_VIEWPORT_PADDING,
+      Math.min(top, viewportHeight - DETAIL_VIEWPORT_PADDING - DETAIL_EST_HEIGHT),
+    );
+    return createPortal(
+      <div
+        ref={detailPanelRef}
+        role="tooltip"
+        data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-detail`}
+        className="pointer-events-auto fixed z-[70] rounded-lg border border-border bg-popover p-3 text-left shadow-md"
+        style={{ left, top, width: panelWidth }}
+        onMouseEnter={cancelDetailClose}
+        onMouseLeave={scheduleDetailClose}
+      >
+        <div className="mb-1.5 text-ui-xs font-medium text-foreground-subtle">
+          {entry ? displayName(entry) : hovered.id}
+        </div>
+        {hoverLoading || hoverContent === null ? (
+          <div className="max-h-[280px] overflow-y-auto text-ui-sm text-foreground-subtlest">
+            {intl.formatMessage({ id: "common.loading" })}
+          </div>
+        ) : hoverContent === "" ? (
+          <div className="text-ui-sm text-foreground-subtlest">
+            {intl.formatMessage({ id: "chat.toolbar.memory.contentEmpty" })}
+          </div>
+        ) : (
+          <div
+            data-memory-detail-scroller
+            className="max-h-[280px] overflow-y-auto whitespace-pre-wrap break-words text-ui-sm leading-relaxed text-foreground"
+          >
+            {hoverContent}
+          </div>
+        )}
+      </div>,
+      document.body,
+    );
+  };
 
   const triggerLabel =
     selectedIds.size > 0
@@ -153,6 +354,8 @@ function V4ComposerMemoryPickerImpl({
                   onCheckedChange={() => onToggle(entry.id)}
                   data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-item-${entry.id}`}
                   className="min-h-10 items-center gap-2 py-1.5"
+                  onMouseEnter={(event) => handleItemMouseEnter(entry.id, event.currentTarget)}
+                  onMouseLeave={scheduleDetailClose}
                 >
                   <BrainIcon className="size-4 shrink-0 text-foreground-subtle" />
                   <span className="min-w-0 flex-1">
@@ -171,6 +374,7 @@ function V4ComposerMemoryPickerImpl({
           )}
         </div>
       </DropdownMenuContent>
+      {hover ? renderDetailPanel(hover) : null}
     </DropdownMenu>
   );
 }

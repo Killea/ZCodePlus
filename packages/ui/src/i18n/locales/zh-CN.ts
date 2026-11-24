@@ -6408,6 +6408,7 @@ const zhCN: Record<string, string> = {
   "chat.toolbar.memory.limitReached": "每条最多 {max} 条",
   "chat.toolbar.memory.empty": "暂无记忆。可在 设置 → 记忆 → 全局 中创建。",
   "chat.toolbar.memory.error": "加载记忆失败。",
+  "chat.toolbar.memory.contentEmpty": "（暂无内容）",
   "chat.memory.included.label": "携带全局记忆（{count}）",
   "chat.memory.included.clear": "清除",
   "chat.toolbar.tools.label": "工具",
