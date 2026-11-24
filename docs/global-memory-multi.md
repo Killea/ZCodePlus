@@ -139,7 +139,7 @@ deleteGlobalMemory({id}): Promise<void>
   - 正文**懒加载**：meta 列表不含 content，首次 hover 才经宿主注入的 `onReadMemoryContent(id)`（内部走 `readGlobalMemory`）拉取；picker 生命周期内按 id 缓存（菜单重开不重复请求，同一轮 hover 复用）。拉取失败/条目已删除 → 面板显示空内容占位，不报错。
   - 面板为 `position: fixed` 的自定义浮层（**不是** Radix Tooltip——modal DropdownMenu 会拦截其 hover 链路），`pointer-events: auto` 以支持指针移入面板与滚轮滚动；宽 ≤ 384px（视口不足时收缩）、高 ≤ 320px 且 `overflow-y: auto` 纵向滚动；正文 `whitespace-pre-wrap` 保留换行。
   - **滚轮必须手动落 scrollTop**：modal 弹层挂载 `react-remove-scroll`（背景滚动锁），其 document 级监听会 preventDefault 全页 wheel，而浮层不是它注册的 shard——默认滚动被抑制。面板挂 `passive: false` 的原生 wheel 监听，把 `deltaY`（按 `deltaMode` 折算）累加到滚动容器 `scrollTop`。缺这一步时滚轮/触控板在真实 app 里无法滚动正文（浏览器验收用例覆盖）。
-  - 定位：默认贴在条目下方，条目靠近视口底部时翻转到上方，水平方向 clamp 进视口。
+  - 定位（2026-11-24 调整：初版「贴条目下方」会盖住菜单列表其余条目，改为侧放不重叠）：**默认菜单本体右侧**（gap 8px，面板顶边对齐 hover 条目顶边并纵向 clamp 进视口）；右侧放不下时翻到菜单左侧；两侧都放不下（窄视口）时回退到菜单上方，水平与菜单左对齐；菜单矩形取不到（异常路径）才回退旧的贴条目下方逻辑。菜单矩形经 `event.currentTarget.closest('[data-slot="dropdown-menu-content"]')` 在 hover 时快照（wrapper 不转发 ref，不为此改共享组件）。
   - 关闭：指针移出条目与面板后 150ms 宽限期关闭（覆盖两者之间的间隙移动）；菜单关闭立即关闭；触屏（coarse pointer）不展示（无 hover 语义）。
   - 上限 disabled（第 5 条起）的条目同样可 hover 预览——信息展示与可勾选性解耦。
 - `ConversationComposer` 状态 `globalMemorySelectedIds: ReadonlySet<string>`（替代 `globalMemoryOptIn`）；发送 payload `includedGlobalMemoryIds: [...ids]`（空集不写字段），随 `...submission` 扩散到全部 sendText 站点；**发送成功复位为空集**（沿用 optIn 复位点）。

@@ -53,6 +53,8 @@ export interface V4ComposerMemoryPickerProps {
 const DETAIL_MAX_WIDTH = 384;
 const DETAIL_EST_HEIGHT = 320;
 const DETAIL_VIEWPORT_PADDING = 8;
+/** 浮层与菜单本体之间的间距（侧放，避免盖住菜单列表）。 */
+const DETAIL_GAP = 8;
 /** 指针移出条目与浮层后的关闭宽限期：覆盖两者之间的间隙移动。 */
 const DETAIL_CLOSE_GRACE_MS = 150;
 
@@ -69,12 +71,12 @@ function V4ComposerMemoryPickerImpl({
   const { intl } = useZCodeIntl();
   const [open, setOpen] = useState(false);
   // ── hover 内容浮层（完整正文预览）──
-  // 条目矩形快照驱动 fixed 定位；content 按 id 缓存，拉取竞态用 hoverIdRef 兜底。
+  // 条目 + 菜单本体矩形快照驱动 fixed 定位（侧放不叠菜单）；
+  // content 按 id 缓存，拉取竞态用 hoverIdRef 兜底。
   const [hover, setHover] = useState<{
     id: string;
-    left: number;
-    top: number;
-    bottom: number;
+    item: { left: number; top: number; bottom: number };
+    menu: { left: number; top: number; right: number; bottom: number } | null;
   } | null>(null);
   const [hoverContent, setHoverContent] = useState<string | null>(null);
   const [hoverLoading, setHoverLoading] = useState(false);
@@ -174,7 +176,19 @@ function V4ComposerMemoryPickerImpl({
       if (isCoarseTouchDevice()) return; // 触屏无 hover 语义，不出浮层。
       cancelDetailClose();
       const rect = target.getBoundingClientRect();
-      setHover({ id: memoryId, left: rect.left, top: rect.top, bottom: rect.bottom });
+      // 菜单本体矩形：侧放定位的锚点。wrapper 不转发 ref，从条目向上 closest
+      // 到本 picker 的 menu content（data-testid 精确限定，不受页面上其它下拉干扰）。
+      const menuEl = target.closest<HTMLElement>(
+        `[data-testid="${TID_V4_COMPOSER_MEMORY_PICKER}-content"]`,
+      );
+      const menuRect = menuEl?.getBoundingClientRect();
+      setHover({
+        id: memoryId,
+        item: { left: rect.left, top: rect.top, bottom: rect.bottom },
+        menu: menuRect
+          ? { left: menuRect.left, top: menuRect.top, right: menuRect.right, bottom: menuRect.bottom }
+          : null,
+      });
       loadHoverContent(memoryId);
     },
     [cancelDetailClose, loadHoverContent],
@@ -210,26 +224,54 @@ function V4ComposerMemoryPickerImpl({
   );
 
   // hover 内容浮层：fixed 定位 portal（pointer-events:auto 支持指针移入与滚轮
-  // 滚动）。默认贴条目下方、靠近视口底部翻转到上方，水平 clamp 进视口。
-  // 定位用固定估算高度（DETAIL_EST_HEIGHT）——浮层内容区 max-h 280 + 标题/
-  // 内边距 < 320，估算偏保守只会留少量空隙，不会出界。
+  // 滚动）。侧放不叠菜单（2026-11-24）：初版「贴条目下方」会盖住菜单列表其余
+  // 条目，改为默认菜单本体右侧（顶边对齐 hover 条目、纵向 clamp），右侧放不下
+  // 翻左侧，窄视口两侧都放不下时回退菜单上方。定位用固定估算高度
+  // （DETAIL_EST_HEIGHT）——浮层内容区 max-h 280 + 标题/内边距 < 320，估算偏
+  // 保守只会留少量空隙，不会出界。
   const renderDetailPanel = (hovered: {
     id: string;
-    left: number;
-    top: number;
-    bottom: number;
+    item: { left: number; top: number; bottom: number };
+    menu: { left: number; top: number; right: number; bottom: number } | null;
   }) => {
     const entry = memories.find((m) => m.id === hovered.id);
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
     const panelWidth = Math.min(DETAIL_MAX_WIDTH, viewportWidth - DETAIL_VIEWPORT_PADDING * 2);
-    const left = Math.min(
-      Math.max(DETAIL_VIEWPORT_PADDING, hovered.left),
-      Math.max(DETAIL_VIEWPORT_PADDING, viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth),
-    );
-    let top = hovered.bottom + 6;
-    if (top + DETAIL_EST_HEIGHT > viewportHeight - DETAIL_VIEWPORT_PADDING) {
-      top = hovered.top - 6 - DETAIL_EST_HEIGHT;
+    let left: number;
+    let top: number;
+    if (hovered.menu) {
+      const fitsRight =
+        hovered.menu.right + DETAIL_GAP + panelWidth <= viewportWidth - DETAIL_VIEWPORT_PADDING;
+      const fitsLeft =
+        hovered.menu.left - DETAIL_GAP - panelWidth >= DETAIL_VIEWPORT_PADDING;
+      if (fitsRight || fitsLeft) {
+        // 侧放：水平贴在菜单外侧，纵向顶边对齐 hover 条目（下方 clamp 收进视口）。
+        left = fitsRight
+          ? hovered.menu.right + DETAIL_GAP
+          : hovered.menu.left - DETAIL_GAP - panelWidth;
+        top = hovered.item.top;
+      } else {
+        // 窄视口两侧都放不下：回退到菜单上方，水平与菜单左对齐。
+        left = Math.max(
+          DETAIL_VIEWPORT_PADDING,
+          Math.min(
+            hovered.menu.left,
+            viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth,
+          ),
+        );
+        top = hovered.menu.top - DETAIL_GAP - DETAIL_EST_HEIGHT;
+      }
+    } else {
+      // 菜单矩形取不到（异常路径）：回退旧的贴条目下方、近底翻上逻辑。
+      left = Math.min(
+        Math.max(DETAIL_VIEWPORT_PADDING, hovered.item.left),
+        Math.max(DETAIL_VIEWPORT_PADDING, viewportWidth - DETAIL_VIEWPORT_PADDING - panelWidth),
+      );
+      top = hovered.item.bottom + DETAIL_GAP;
+      if (top + DETAIL_EST_HEIGHT > viewportHeight - DETAIL_VIEWPORT_PADDING) {
+        top = hovered.item.top - DETAIL_GAP - DETAIL_EST_HEIGHT;
+      }
     }
     top = Math.max(
       DETAIL_VIEWPORT_PADDING,
@@ -315,6 +357,7 @@ function V4ComposerMemoryPickerImpl({
       <DropdownMenuContent
         side="top"
         sideOffset={4}
+        data-testid={`${TID_V4_COMPOSER_MEMORY_PICKER}-content`}
         className="w-72"
         onCloseAutoFocus={(event) => {
           event.preventDefault();

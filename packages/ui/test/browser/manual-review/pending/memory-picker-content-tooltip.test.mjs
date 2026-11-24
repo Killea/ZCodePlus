@@ -1,7 +1,7 @@
 // 浏览器验收：V4ComposerMemoryPicker 条目 hover 内容浮层
 // （docs/global-memory-multi.md「条目 hover 内容 tooltip」）。
-// 覆盖：完整正文展示（不截断）、纵向滚动、空内容占位、指针离开宽限期关闭、
-// 菜单关闭立即关闭。运行：node --test memory-picker-content-tooltip.test.mjs
+// 覆盖：完整正文展示（不截断）、侧放不叠菜单、纵向滚动、空内容占位、
+// 指针离开宽限期关闭、菜单关闭立即关闭。运行：node --test memory-picker-content-tooltip.test.mjs
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -83,6 +83,20 @@ test("hover 展示完整正文（含末行，不截断）且面板定位在视�
     assert.ok(box, "浮层应有几何盒");
     assert.ok(box.x >= 0 && box.y >= 0, "浮层不超出视口左上");
     assert.ok(box.width + box.x <= 1200 && box.height + box.y <= 800, "浮层不超出视口边界");
+    // 侧放核心验收：浮层与菜单本体不得重叠（初版「贴条目下方」会盖住列表其余条目）。
+    const menuBox = await page
+      .locator('[data-testid="v4-composer-memory-picker-content"]')
+      .boundingBox();
+    assert.ok(menuBox, "菜单本体应有几何盒");
+    const intersects =
+      box.x < menuBox.x + menuBox.width &&
+      box.x + box.width > menuBox.x &&
+      box.y < menuBox.y + menuBox.height &&
+      box.y + box.height > menuBox.y;
+    assert.ok(
+      !intersects,
+      `浮层与菜单本体重叠：panel ${JSON.stringify(box)} vs menu ${JSON.stringify(menuBox)}`,
+    );
   } finally {
     assert.equal(errors.length, 0, `pageerror: ${errors.join(" | ")}`);
     await page.close();
