@@ -38,7 +38,12 @@ import type {
   SessionPhase,
   SessionUsageState,
 } from "@zcode/shared/zcode-protocol-v4";
-import { ModelConfigSelect, type ModelSelectGroup } from "@/ModelConfigSelect.js";
+import {
+  ModelConfigSelect,
+  type ModelConfigSelectGuide,
+  type ModelSelectGroup,
+} from "@/ModelConfigSelect.js";
+import type { ComposerModelOptions } from "@/chat-input-toolbar/ComposerModelMenu.js";
 import { Button } from "@/components/ui/button.js";
 import { HighspeedModelIndicator } from "@/highspeed/HighspeedModelIndicator.js";
 import { formatHighspeedRemainingTime } from "@/highspeed/highspeedTime.js";
@@ -52,8 +57,12 @@ import {
   type ChatStartPlanBalanceConfig,
 } from "@/chat-input-toolbar/StartPlanContextBalance.js";
 import { ThoughtLevelCycleControl } from "@/chat-input-toolbar/ThoughtLevelCycleControl.js";
-import { getNextThoughtLevelValue } from "@/chat-input-toolbar/thoughtLevelOptions.js";
+import {
+  getNextThoughtLevelValue,
+  getThoughtLevelLabel,
+} from "@/chat-input-toolbar/thoughtLevelOptions.js";
 import type { V4ComposerConfigPicker } from "@/v4/composer/configPickerState.js";
+import { COMPOSER_MODEL_MENU_VARIANT } from "@/v4/composer/composerMenuVariant.js";
 import { useToolbarShortcutBindings } from "@/v4/composer/toolbarShortcuts.js";
 import {
   resolveModelSelectTriggerDisplay,
@@ -65,10 +74,20 @@ import {
   setPendingSettingsUsageCodingPlanIntent,
 } from "@/lib/settingsNavigation.js";
 import { useTabStore } from "@/store/TabStoreProvider.js";
+import { isSettingsTab } from "@/store/tabStore.js";
 import type { ModelSelectionView } from "@zcode/services";
-import type { ModelSelectionState } from "@/hooks/useModelSelectionView.js";
+import type {
+  ModelSelectionState,
+  ModelSelectionRefreshResult,
+} from "@/hooks/useModelSelectionView.js";
 import { useProviderSettingsView } from "@/hooks/useProviderSettingsView.js";
 import { useBaseWorkspaceServices } from "@/hooks/useWorkspaceServices.js";
+import { useComposerConnectionSwitch } from "@/hooks/useComposerConnectionSwitch.js";
+import {
+  buildComposerPlanGroups,
+  composerConnectionKey,
+  chooseConnectionModel,
+} from "@/lib/composerPlanGroups.js";
 import { useZCodeStoreWithDefault } from "@/store/StoreProvider.js";
 import { useSettings } from "@/hooks/useSettingService.js";
 import {
@@ -375,6 +394,7 @@ export interface V4ComposerToolbarProps {
   modelSelectionView?: ModelSelectionView | null;
   modelSelectionState?: ModelSelectionState;
   modelSelectionReload?: () => void;
+  modelSelectionRefresh?: () => Promise<ModelSelectionRefreshResult>;
   sessionId: string | null;
   phase: SessionPhase | null;
   provider?: ZCodeProvider;
@@ -389,6 +409,7 @@ export interface V4ComposerToolbarProps {
   usage: SessionUsageState | null;
   disabled: boolean;
   modelSelectionPending?: boolean;
+  onConnectionPendingChange?: (pending: boolean) => void;
   /** Highspeed 卡生效时固定本轮模型，禁止通过选择器或快捷键切换。 */
   modelLocked?: boolean;
   /** 扩散尾段开始后（恢复入场则立即）展示 Highspeed 模型与倒计时。 */
@@ -423,6 +444,8 @@ export interface V4ComposerToolbarProps {
     sourceModel: ModelSelectionSource | null,
   ) => Promise<void> | void;
   onSendCompressionCommand?: (command: string) => void;
+  /** 模型按钮上的一次性引导气泡；设置页覆盖工作区时不显示。 */
+  modelGuide?: ModelConfigSelectGuide | null;
 }
 
 /** 模型 / 思考深度 / context usage 簇（渲染在发送键左侧，与旧 UI 同位）。 */
@@ -432,6 +455,7 @@ function V4ComposerModelControlsImpl({
   modelSelectionView = null,
   modelSelectionState = MODEL_SELECTION_LOADING_STATE,
   modelSelectionReload,
+  modelSelectionRefresh,
   sessionId,
   provider,
   isWebRemoteControl = false,
@@ -441,6 +465,7 @@ function V4ComposerModelControlsImpl({
   usage,
   disabled,
   modelSelectionPending = false,
+  onConnectionPendingChange,
   modelLocked = false,
   highspeedPresented = false,
   highspeedEntranceAnimated = false,
@@ -453,6 +478,7 @@ function V4ComposerModelControlsImpl({
   onSelectThought,
   onSendCompressionCommand,
   onRecoverCustomModelSelection,
+  modelGuide = null,
 }: V4ComposerToolbarProps) {
   const { intl, locale } = useZCodeIntl();
   const { openCodingPlanUpgrade } = useCodingPlanUpgradeDialog();
@@ -481,6 +507,10 @@ function V4ComposerModelControlsImpl({
     suppressProviderFingerprintAutoRefresh: true,
   });
   const openSettingsTab = useTabStore((state) => state.openSettingsTab);
+  // 气泡 Portal 位于 body，工作区的 opacity/inert 隐藏不了它；必须跟随设置标签的可见性。
+  const isWorkspaceVisible = useTabStore(
+    (state) => !state.tabs.some((tab) => tab.id === state.activeTabId && isSettingsTab(tab)),
+  );
   const modelTriggerRef = useRef<HTMLSpanElement | null>(null);
   const thoughtTriggerRef = useRef<HTMLSpanElement | null>(null);
   // Ctrl+M 热键：递增 openRequestKey 请求 ModelConfigSelect 打开菜单（旧 handleOpenModelMenuShortcut 语义）。
@@ -634,7 +664,9 @@ function V4ComposerModelControlsImpl({
     );
   const enterpriseProducts = useEnterpriseCodingPlanProducts({
     enabled:
-      !providerSourcesLoading && contextPlanConnection.kind === "teamCoding" && connectionAuthenticated,
+      !providerSourcesLoading &&
+      (contextPlanConnection.kind === "teamCoding" || activeConfigPicker === "model") &&
+      connectionAuthenticated,
     authenticated: connectionAuthenticated,
     family: connectionFamily,
   });
@@ -933,7 +965,7 @@ function V4ComposerModelControlsImpl({
     triggerDisplay.placeholder,
   ]);
   const handleModelValueChange = useCallback(
-    (value: string) => {
+    (value: string, reasoningLevel?: string) => {
       if (modelLocked) return;
       const decoded = decodeCustomModelValue(value);
       // 草稿的点击时可见模型可能只存在于 catalog，或已经被最新 draft
@@ -978,16 +1010,21 @@ function V4ComposerModelControlsImpl({
         return;
       }
       if (decoded) {
-        onSelectModel(decoded.providerId, decoded.modelName ?? "", sourceModel);
-        return;
+        if (reasoningLevel !== undefined)
+          return onSelectModel(
+            decoded.providerId,
+            decoded.modelName ?? "",
+            sourceModel,
+            reasoningLevel,
+          );
+        else return onSelectModel(decoded.providerId, decoded.modelName ?? "", sourceModel);
       }
       const slashIndex = value.indexOf("/");
       if (slashIndex > 0) {
-        onSelectModel(value.slice(0, slashIndex), value.slice(slashIndex + 1), sourceModel);
-        return;
+        return onSelectModel(value.slice(0, slashIndex), value.slice(slashIndex + 1), sourceModel);
       }
       // 裸 model id：provider 沿用当前（宿主从最新投影补齐）。
-      onSelectModel("", value, sourceModel);
+      return onSelectModel("", value, sourceModel);
     },
     [
       configOptionsError,
@@ -1003,6 +1040,63 @@ function V4ComposerModelControlsImpl({
       workspacePath,
     ],
   );
+
+  const planGroups = useMemo(
+    () =>
+      buildComposerPlanGroups(
+        modelSelectGroups,
+        subscribedTeamProducts,
+        providerSettingsView,
+        displayProvider,
+        modelGroupLabels,
+        sharedSettings?.providerFamilyConnectionSelections,
+      ),
+    [
+      modelSelectGroups,
+      subscribedTeamProducts,
+      providerSettingsView,
+      displayProvider,
+      modelGroupLabels,
+      sharedSettings?.providerFamilyConnectionSelections,
+    ],
+  );
+  const connectionSwitch = useComposerConnectionSwitch({
+    scopeId: sessionId ?? undefined,
+    onPendingChange: onConnectionPendingChange,
+    workspacePath,
+    workspaceIdentity,
+    agentProvider: displayProvider,
+    normalizedValue: normalizedModelValue,
+    currentReasoningLevel: effectiveConfig?.thought,
+    onSelectModel: handleModelValueChange,
+    waitForPresentation: true,
+    refreshPresentation: modelSelectionRefresh,
+    presentationStatus: modelSelectionState.status,
+    presentationRevision: modelSelectionView?.revision,
+    presentationErrorRevision:
+      modelSelectionState.status === "ready"
+        ? modelSelectionState.refreshError?.revision
+        : undefined,
+  });
+  const selectedProviderId = decodeCustomModelValue(normalizedModelValue)?.providerId;
+  const selectedPlanGroup = planGroups.find((group) => {
+    const connection = group.connection;
+    if (!connection || connection.providerId !== selectedProviderId) return false;
+    const selection = sharedSettings?.providerFamilyConnectionSelections?.[connection.family];
+    return (
+      connection.selection?.kind !== "team-coding-plan" ||
+      (selection && composerConnectionKey(connection.family, selection) === connection.key)
+    );
+  });
+  const selectedPlanKey = connectionSwitch.pending
+    ? connectionSwitch.previousKey
+    : (selectedPlanGroup?.key ??
+      // 团队共用模型 value；当前过期行隐藏后，不能误选另一团队并阻止用户点击它。
+      planGroups.find(
+        (group) =>
+          group.connection?.selection?.kind !== "team-coding-plan" &&
+          group.items.some((item) => item.value === normalizedModelValue),
+      )?.key);
 
   const draftModelThoughtOption = useMemo(
     () =>
@@ -1079,6 +1173,71 @@ function V4ComposerModelControlsImpl({
   // 改绑后按钮提示即时跟随（不能用硬编码文案）。
   const modelShortcutLabel = useShortcutCommandLabel("openModelMenu");
   const thoughtShortcutLabel = useShortcutCommandLabel("cycleThoughtLevel");
+  const selectConnection = connectionSwitch.select;
+  // 原因：内联对象会在无关渲染时使 memo 选择器失效；按展示事实和回调缓存选项。
+  const composerOptions = useMemo<ComposerModelOptions>(
+    () => ({
+      providerMenu: {
+        groups: planGroups,
+        selectedKey: selectedPlanKey,
+        pending: connectionSwitch.pending || modelSelectionPending,
+        // 团队目录查询不是用户的连接切换操作，不能把登录错误挂到 API 菜单。
+        error: connectionSwitch.error,
+        onSelect: (group) => {
+          // 原因：展示失败时设置可能已成功；已选连接仍须允许重试，不能被同 key 短路。
+          if (group.key === selectedPlanKey && !connectionSwitch.error) return;
+          if (group.connection) {
+            void selectConnection(group.connection, selectedPlanKey);
+          } else {
+            const model = chooseConnectionModel(
+              group.items,
+              decodeCustomModelValue(normalizedModelValue)?.modelName,
+            );
+            const providerId = decodeCustomModelValue(model?.value ?? "")?.providerId;
+            // 原因：普通 API 原先绕过连接切换 owner，缺少 loading 且会暴露旧目录。
+            if (providerId)
+              void selectConnection(
+                {
+                  key: group.key,
+                  label: group.label,
+                  providerId,
+                  family: connectionFamily,
+                  items: group.items,
+                },
+                selectedPlanKey,
+              );
+          }
+        },
+      },
+      providerLabel: intl.formatMessage({ id: "chat.toolbar.combined.provider" }),
+      modelsLabel: intl.formatMessage({ id: "chat.toolbar.combined.models" }),
+      effortLabel: intl.formatMessage({ id: "chat.toolbar.combined.effort" }),
+      effortShortcutLabel: thoughtShortcutLabel,
+      selectModelLabel: intl.formatMessage({ id: "chat.toolbar.combined.selectModel" }),
+      levels:
+        thoughtOption?.options?.map((entry) => ({
+          value: entry.value,
+          label: getThoughtLevelLabel(intl, displayProvider, thoughtOption, entry),
+        })) ?? [],
+      value: String(thoughtOption?.currentValue ?? ""),
+      onValueChange: handleThoughtValueChange,
+    }),
+    [
+      planGroups,
+      selectedPlanKey,
+      connectionSwitch.pending,
+      modelSelectionPending,
+      connectionSwitch.error,
+      selectConnection,
+      normalizedModelValue,
+      connectionFamily,
+      intl,
+      thoughtShortcutLabel,
+      thoughtOption,
+      displayProvider,
+      handleThoughtValueChange,
+    ],
+  );
   const isModelOptionLocked = useCallback(() => false, []);
 
   // 键盘热键（旧 useToolbarShortcutBindings）：Ctrl+M 打开模型菜单、Ctrl+T 循环思考深度。
@@ -1096,9 +1255,15 @@ function V4ComposerModelControlsImpl({
       : undefined;
   useToolbarShortcutBindings({
     hasAnyOption: Boolean(modelOption) || Boolean(thoughtOption),
-    toolbarDisabled: disabled || recoveryPending || modelSelectionPending,
+    toolbarDisabled:
+      disabled || recoveryPending || connectionSwitch.pending || modelSelectionPending,
     modelMenuDisabled:
-      disabled || recoveryPending || modelLocked || modelSelectionPending || !modelMenuVisible,
+      disabled ||
+      recoveryPending ||
+      modelLocked ||
+      connectionSwitch.pending ||
+      modelSelectionPending ||
+      !modelMenuVisible,
     modelOption,
     thoughtOption: thoughtOption ?? undefined,
     onOpenModelMenu: handleOpenModelMenuShortcut,
@@ -1175,18 +1340,39 @@ function V4ComposerModelControlsImpl({
                 : "chat.toolbar.model.targetMissing",
           })}
         </span>
+      ) : modelMenuVisible &&
+        !providerSourcesLoading &&
+        planGroups.length === 0 &&
+        !connectionSwitch.pending ? (
+        // 空配置是正常状态；直接复用 Provider 设置入口，不展开无名称、无模型的菜单。
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-ui-sm"
+          data-testid="chat-model-select-trigger"
+          onClick={handleOpenModelProviderSettings}
+        >
+          {manageModelsLabel}
+        </Button>
       ) : modelMenuVisible ? (
         <ModelConfigSelect
+          key={JSON.stringify([
+            workspaceIdentity?.trim() || workspacePath,
+            sessionId,
+            sessionConfigPending,
+          ])}
           modelGroups={modelSelectGroups}
+          contentAlign="center"
           normalizedValue={normalizedModelValue}
           triggerLabel={
-            sessionConfigPending && !effectiveConfig?.model
-              ? ""
-              : modelTriggerDisplay.fullLabel
+            sessionConfigPending && !effectiveConfig?.model ? "" : modelTriggerDisplay.modelLabel
           }
-          triggerLabelPrefix={modelTriggerDisplay.providerPrefix}
-          triggerLabelValue={modelTriggerDisplay.modelLabel}
-          triggerLabelPrefixClassName="composer-provider-prefix inline group-data-[composer-provider-compact=true]/toolbar:hidden"
+          composerOptions={
+            // fork 皮肤：legacy 走 ModelConfigSelect 原生 provider→模型二级菜单；
+            // composerOptions（合并菜单）整条链路保留但不渲染。
+            COMPOSER_MODEL_MENU_VARIANT === "merged" ? composerOptions : undefined
+          }
           showManageModelsAction={showManageModelsAction}
           manageModelsLabel={manageModelsLabel}
           onManageModels={handleOpenModelProviderSettings}
@@ -1197,7 +1383,7 @@ function V4ComposerModelControlsImpl({
           })}
           isItemLocked={isModelOptionLocked}
           onValueChange={handleModelValueChange}
-          pending={modelSelectionPending}
+          pending={modelSelectionPending || connectionSwitch.pending}
           disabled={
             disabled ||
             modelSelectionPending ||
@@ -1207,6 +1393,7 @@ function V4ComposerModelControlsImpl({
               !(modelSelectionState.status === "loading" && modelSelectionState.catalog))
           }
           tooltipTitle={modelTriggerDisplay.fullLabel}
+          guide={isWorkspaceVisible ? modelGuide : null}
           shortcutLabel={modelShortcutLabel}
           triggerRef={modelTriggerRef}
           open={!modelLocked && activeConfigPicker === "model"}
@@ -1215,7 +1402,7 @@ function V4ComposerModelControlsImpl({
           labelVisibilityClassName="hidden @sm/composer:inline-flex"
           indicatorClassName="block group-data-[composer-model-icon=true]/toolbar:hidden"
           triggerLabelClassName="block min-w-0 text-left group-data-[composer-model-icon=true]/toolbar:hidden [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
-          triggerClassName="composer-model-trigger group-data-[composer-model-icon=true]/toolbar:size-7 group-data-[composer-model-icon=true]/toolbar:p-0 group-data-[composer-model-icon=true]/toolbar:gap-0 group-data-[composer-model-icon=true]/toolbar:justify-center"
+          triggerClassName="composer-model-trigger group-data-[composer-model-icon=true]/toolbar:px-1.5 group-data-[composer-model-icon=true]/toolbar:justify-center"
           triggerIconClassName="hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
           focusSelectorOnClose={V4_COMPOSER_INPUT_SELECTOR}
           providerSubmenuClassName={providerSubmenuClassName}
@@ -1224,7 +1411,8 @@ function V4ComposerModelControlsImpl({
       {highspeedPresented && highspeedExpiresAt !== undefined ? (
         <HighspeedCountdown expiresAt={highspeedExpiresAt} />
       ) : null}
-      {thoughtOption ? (
+      {thoughtOption &&
+      (COMPOSER_MODEL_MENU_VARIANT === "legacy" || modelLocked || highspeedPresented) ? (
         <ThoughtLevelCycleControl
           composerCollapsePriority={3}
           labelVisibilityClassName="inline-flex"

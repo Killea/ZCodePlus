@@ -129,6 +129,7 @@ idle -> checking -> update-available -> download-progress -> update-downloaded
   - 下载前（`update-available`）：展示发布时间，不展示更新通道 badge；底部展示“跳过此版本”“稍后”“下载更新”。
   - 下载中（`download-progress`）：隐藏“跳过此版本”，展示下载进度、“后台下载”和“取消下载”；进度区域在弹窗主内边距内再增加 `8px` 左侧外边距；进度条右侧优先展示已下载/总大小，格式为 `1.0MB / 10.0MB`，保留 1 位小数，字节数据缺失时不显示右侧文本，避免残留 `0%` 这类百分比口径；主界面更新入口显示 loading spinner，不显示文字。`download-progress.version` 是协议可选字段，renderer 必须按 `kind` 识别下载态，即使某一帧缺少版本号也要保持更新入口和已打开弹窗，不得卸载组件或关闭弹窗。用户点击“下载更新”后，renderer 必须先本地进入“下载已请求”的 downloading 展示；`downloadUpdate()` 的 IPC 返回只代表命令已被 main 侧接收，不代表已经进入下载态。若随后短暂收到 `checking` / `idle` 等无版本过渡状态，renderer 必须复用上一帧可见更新模型保持弹窗，直到 `download-progress` / `update-downloaded` 收口。若 main 侧下载启动失败，失败收敛必须回到 `update-available` 让用户可见并可重试，不得直接广播 `idle` 让主入口和弹窗一起消失。
   - 下载后（`update-downloaded` / legacy `UpdateReady` ready）：展示发布时间，不展示更新通道 badge；底部展示“稍后”“重启以更新”，不展示“跳过此版本”。
+- Linux 的 `.deb`、`.rpm` 和 pacman 安装属于系统包安装。AppImage 直接替换用户可写文件，不需要管理员授权提示。对于 Linux 系统包，main 在 `prepareAppQuit` 之前只对非 root 用户执行一次无交互 `sudo -n -v` 探测：探测成功时不显示额外提示；探测返回权限失败时显示“可能需要管理员权限”，提示用户留意系统授权窗口或启动 ZCode 的终端；sudo 不存在、探测超时或发生其他异常时按未知处理，不显示提示、不阻断更新。探测使用异步 `execFile` 与超时选项，输出由回调接收，不传入仅适用于 `spawn` 的 `stdio` 选项。探测不读取、不保存密码，实际安装仍由 `electron-updater` 选择 Polkit 或 sudo。当前 Linux 安装器调用是同步的，本流程不提供声称可以中断原生授权的 renderer 取消按钮。
 - 普通更新窗口在下载前、下载中、下载完成后均可用系统关闭按钮关闭；下载中另有“后台下载”按钮。关闭只销毁展示窗口并释放该窗口的状态监听，不取消下载、不安装、不创建新下载任务；真正退出应用仍沿用现有退出规则。强制更新窗口不受此规则影响。
 - 下载状态和取消令牌由 main 的 `autoUpdater` 单独持有。窗口关闭后进度、成功或失败事件继续更新同一个状态，但不得自行创建、显示窗口。用户从现有主界面更新入口重开时，读取当前快照；下载中展示同一进度，完成后展示“重启以更新”，失败后回到既有可重试状态。重复打开只激活现有单例，关闭/重开与迟到快照交错时不得重复监听或启动下载。
 - 原生 close 事件早于 BrowserWindow 销毁。已收到 close 的窗口立即失去展示资格，重开不能复用它，也不能把它选作新窗口的 parent；旧窗口的 closed 清理只能清理自身，不能清空后来新建的窗口引用。
@@ -172,6 +173,7 @@ skippedElectronUpdateVersions?: Partial<Record<"stable" | "preview", string>>;
 - 新安装包默认使用服务端 manifest provider。打包态更新入口只允许既有官方生产或测试 HTTPS 域名，其他通用后端覆盖不会授权更新源，回到官方生产入口。打包后的应用忽略 `ZCODE_UPDATE_FEED_URL`、`--zcode-update-feed-url` 以及内部传入的自定义 manifest URL；深链或启动参数不得改变更新源。未打包的开发态可指定完整 manifest 接口 URL，仍由客户端覆盖 `platform` / `device_mid` / `channel` 查询参数和对应 header。`--` 后的参数不再作为更新器开关解析。
 - Windows 签名构建仍读取应用的有效 Authenticode 签名，并写入 `app-update.yml` 的 `publisherName`，以激活 electron-updater 6.8.10 的自定义签名检查入口。该字段只保留签名身份作为诊断信息，不是未来更新的 DN 白名单；不能直接删除字段，否则当前依赖会跳过验证。签名或配置读取失败时构建失败。
 - Windows 更新使用显式 Authenticode 校验：下载后及交给安装器之前均要求 Windows 返回有效签名和非空签名者；无签名、损坏、不可信证书、PowerShell 错误均拒绝。子进程仅静默模块初始化进度，避免进度 CLIXML 被误判为 stderr 错误；实际 stderr 和失败退出仍拒绝。不比较旧 DN，所以更新证书或发布者 DN 不需要用户预装过渡版。安装前使用既有 `preparing` 状态锁定目标，在退出 Host/Agent 前完成检查。
+- Windows 签名查询在普通用户权限下执行；其专用命令避免受限语言模式禁止的 .NET 方法调用，使允许 `Get-AuthenticodeSignature` 的 ConstrainedLanguage 环境也可完成查询。路径字面量必须双写 ASCII 及 PowerShell 识别的四种排版单引号（U+2018、U+2019、U+201A、U+201B），拒绝 NUL、CR、LF，避免用户名或临时目录中的撇号中断字符串或被解释为代码。PowerShell 模块或签名查询若仍被设备策略禁止、结果文件缺失或无法解析，继续拒绝下载完成或安装，不提权、不修改设备策略、不退回免检。独立子进程切换语言模式的测试只验证脚本兼容，不代表所有 WDAC/AppLocker 策略已验收。
 - post-update release notes、已下载待安装状态和 Windows 安装前资源释放逻辑继续沿用现有实现。
 - Windows 从 `quitAndInstall()` 到 NSIS 的进程退出、快捷方式和完成页启动边界见
   `docs/desktop/windows-update-install-handoff.md`。

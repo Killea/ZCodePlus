@@ -2,6 +2,7 @@ import type { SettingsSectionId } from "@/lib/settingsNavigation.js";
 
 export interface SettingsSearchAvailability {
   desktop: boolean;
+  macDesktop: boolean;
   windowsHost: boolean;
   tray: boolean;
   notWindows: boolean;
@@ -144,6 +145,25 @@ export const SETTINGS_SEARCH_ITEMS = [
     visibility: "all",
   },
   {
+    id: "settings.totalTokensReminder",
+    section: "agentBehavior",
+    description: "settings.totalTokensReminderDescription",
+    visibility: "all",
+  },
+  {
+    id: "settings.agentAlwaysBackground",
+    section: "agentBehavior",
+    description: "settings.agentAlwaysBackgroundDescription",
+    visibility: "all",
+  },
+  {
+    // Web 远控也能搜到：该行在 Web 上显示本机提示。
+    id: "settings.replyLanguage",
+    section: "agentBehavior",
+    description: "settings.replyLanguageDescription",
+    visibility: "all",
+  },
+  {
     id: "settings.zcodeInteractionBehavior",
     section: "agentBehavior",
     description: "settings.zcodeInteractionBehaviorDescription",
@@ -184,6 +204,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     section: "appearance",
     description: "settings.themeModeDescription",
     visibility: "all",
+  },
+  {
+    id: "settings.fontSmoothing",
+    section: "appearance",
+    description: "settings.fontSmoothingDescription",
+    visibility: "macDesktop",
   },
   {
     id: "settings.uiFontSize",

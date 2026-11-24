@@ -28,6 +28,7 @@ const groups = [
 
 function Composer() {
   const [model, setModel] = useState("one");
+  const [effort, setEffort] = useState("high");
   const { reportComposerDockHeight } = useConversationPanePresentation();
   useEffect(() => reportComposerDockHeight(56), [reportComposerDockHeight]);
   return (
@@ -44,6 +45,18 @@ function Composer() {
         lockReasonMessage="Unavailable"
         isItemLocked={(value) => value === "locked"}
         onValueChange={setModel}
+        composerOptions={{
+          providerLabel: "Provider",
+          modelsLabel: params.get("locale") === "zh-CN" ? "模型" : "Models",
+          effortLabel: "Effort",
+          selectModelLabel: "Select model",
+          levels: [
+            { value: "low", label: "Low" },
+            { value: "high", label: "High" },
+          ],
+          value: effort,
+          onValueChange: setEffort,
+        }}
       />
       <output data-testid="selection" hidden>
         {model}
@@ -103,7 +116,7 @@ function Fixture() {
   );
 }
 createRoot(document.getElementById("root")!).render(
-  <ZCodeIntlProvider initialLocale="en-US">
+  <ZCodeIntlProvider initialLocale={params.get("locale") === "zh-CN" ? "zh-CN" : "en-US"}>
     <TooltipProvider>
       <Fixture />
     </TooltipProvider>

@@ -57,6 +57,7 @@ export function buildRegistryModelSelectGroups(
       {
         key: `registry-provider:${provider.providerId}`,
         label: accountPresentation?.label || provider.providerName?.trim() || provider.providerId,
+        ...(provider.config.logo ? { logo: provider.config.logo } : {}),
         ...(labelBadge ? { labelBadge } : {}),
         ...(accountPresentation ? { directItems: true } : {}),
         items: provider.models.map(({ modelId, config }) => ({

@@ -58,7 +58,7 @@ import { networkCaptureControlSchema, networkCaptureBatchSchema } from "./networ
 import { browserCommandSchema } from "./browser-use/commands.js";
 import { browserCommandResultSchema } from "./browser-use/result.js";
 import { modelSelectionSchema } from "./model-selection.js";
-import { localeSchema } from "./validationAppSettings.js";
+import { localeSchema, replyLanguageSchema } from "./validationAppSettings.js";
 import { zcodeProcessDiagnosticSchema } from "./process-diagnostic.js";
 import { PROCESS_RESOURCE_CLI_LANES } from "./processResourceTelemetry.js";
 import {
@@ -108,6 +108,7 @@ export {
   appSettingsSchema,
   localeSchema,
   postUpdateReleaseNotesPayloadSchema,
+  REPLY_LANGUAGE_MAX_LENGTH,
 } from "./validationAppSettings.js";
 export { isValidWslUser, WSL_USER_MAX_LENGTH, wslUserSchema } from "./wslUserValidation.js";
 export { zcodeTaskModeSchema } from "./zcode-task-mode-schema.js";
@@ -732,6 +733,8 @@ export const hostInitLocalMessageSchema = z.object({
   remoteAssets: remoteAssetDirsSchema.optional(),
   /** spawn 时刻 Main 的实时界面语言；后续变化由 application-locale-changed 推送。 */
   locale: localeSchema.optional(),
+  /** spawn 时刻 Main 持有的 Agent 回复语言（null 为未设置）；后续变化由 reply-language-changed 推送。 */
+  replyLanguage: replyLanguageSchema.nullable().optional(),
   zcodeBuiltinProviderConfigFilePath: nonEmptyStringSchema,
   runtimeProcessEnvPatch: z
     .record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string())
@@ -1001,6 +1004,29 @@ export const hostCredentialCipherRequestResponseSchema = credentialCipherRequest
   })
   .strict();
 
+/** 目标数据根路径上限：覆盖 Windows 长路径，同时限制私有通道载荷。 */
+const CREDENTIAL_KEY_SHARE_TARGET_MAX_CHARS = 32_767;
+export const CREDENTIAL_KEY_SHARE_UNAVAILABLE_ERROR_CODE = "CREDENTIAL_SECURE_STORAGE_UNAVAILABLE";
+
+// Host → Main：数据存储路径切换后请求登记系统密钥。路径保持原值，不做 trim 等改写。
+export const hostCredentialKeyShareRequestResponseSchema = z
+  .object({
+    type: z.literal("credential-key-share-request"),
+    requestId: z.string().uuid(),
+    targetBaseDir: z.string().min(1).max(CREDENTIAL_KEY_SHARE_TARGET_MAX_CHARS),
+  })
+  .strict();
+
+// Main → Host：登记结果。失败只返回受控错误码，原生异常不穿过通道。
+export const hostCredentialKeyShareResultMessageSchema = z
+  .object({
+    type: z.literal("credential-key-share-result"),
+    requestId: z.string().uuid(),
+    ok: z.boolean(),
+    errorCode: z.literal(CREDENTIAL_KEY_SHARE_UNAVAILABLE_ERROR_CODE).optional(),
+  })
+  .strict();
+
 export const hostLocalMediaPreviewPathAuthorizeResultMessageSchema = z
   .object({
     type: z.literal("local-media-preview-path-authorize-result"),
@@ -1061,6 +1087,13 @@ export const hostApplicationLocaleChangedMessageSchema = z
   .object({
     type: z.literal("application-locale-changed"),
     locale: localeSchema,
+  })
+  .strict();
+
+export const hostReplyLanguageChangedMessageSchema = z
+  .object({
+    type: z.literal("reply-language-changed"),
+    replyLanguage: replyLanguageSchema.nullable(),
   })
   .strict();
 
@@ -1181,9 +1214,11 @@ export const hostIncomingMessageSchema = z.discriminatedUnion("type", [
   hostBrowserExecuteResultMessageSchema,
   hostLocalMediaPreviewPathAuthorizeResultMessageSchema,
   hostCredentialCipherResultMessageSchema,
+  hostCredentialKeyShareResultMessageSchema,
   hostPluginSandboxRegisterResultMessageSchema,
   hostCuaPipFocusChangedMessageSchema,
   hostApplicationLocaleChangedMessageSchema,
+  hostReplyLanguageChangedMessageSchema,
   hostProviderProvisioningExecuteMessageSchema,
   hostProviderProvisioningLaneResultMessageSchema,
 ]);
@@ -1465,7 +1500,9 @@ export const hostPluginTelemetryResponseSchema = z
   .object({
     type: z.literal("plugin-telemetry"),
     event: rendererTelemetryEventPayloadSchema.refine((event) =>
-      ["plugin_lifecycle", "plugin_usage", "plugin_runtime_error"].includes(event.elementName),
+      ["plugin_lifecycle", "plugin_discovery", "plugin_usage", "plugin_runtime_error"].includes(
+        event.elementName,
+      ),
     ),
   })
   .strict();
@@ -1849,6 +1886,7 @@ export const hostResponseMessageSchema = z.discriminatedUnion("type", [
   hostBrowserExecuteRequestResponseSchema,
   hostLocalMediaPreviewPathAuthorizeRequestResponseSchema,
   hostCredentialCipherRequestResponseSchema,
+  hostCredentialKeyShareRequestResponseSchema,
   hostPluginSandboxRegisterRequestResponseSchema,
   hostNetworkTelemetryBatchResponseSchema,
   hostProviderProvisioningSourceChangedResponseSchema,

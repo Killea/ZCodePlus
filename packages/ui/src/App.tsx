@@ -1,3 +1,4 @@
+import { GitStatusRepositoryContext } from "@/hooks/useGitRepository.js";
 import { PluginUiWorkspaceProvider } from "@/plugin-ui/index.js";
 /* eslint-disable max-lines -- App 当前集中编排 workspace 级状态、导航、Git 派生数据和 shell wiring；已将新增 side pane memory 桥接抽出，剩余拆分需要按 shell 边界单独重构。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -10,11 +11,7 @@ import { useAppPanels } from "@/hooks/useAppPanels.js";
 import { useGitAutoRefresh } from "@/hooks/useGitAutoRefresh.js";
 import { useGitRepository } from "@/hooks/useGitRepository.js";
 import { useAppKeyboard } from "@/hooks/useAppKeyboard.js";
-import {
-  setSidePaneFullViewActive,
-  SIDE_PANE_FULL_VIEW_ENTER_REQUEST_EVENT,
-  useSidePaneFullView,
-} from "@/side-pane-full-view/index.js";
+import { useSidePaneFullView } from "@/side-pane-full-view/index.js";
 import { usePlatform } from "@/hooks/usePlatform.js";
 import { useWorkspaceProviderConfigFile } from "@/hooks/useWorkspaceProviderConfigFile.js";
 import { useWorkspaceActiveTaskState } from "@/hooks/useWorkspaceActiveTaskState.js";
@@ -80,7 +77,6 @@ import { useOffPeakTaskNotifications } from "@/hooks/useOffPeakTaskNotifications
 import type { AppProps, WorkspaceMainView } from "@/app-shell/types.js";
 import type {
   ChatSearchResultHighlightRequest,
-  ChatViewSummaryPanelVariant,
   ConversationFindMatchState,
 } from "@/v4/legacyChatViewTypes.js";
 import { getActiveSidePaneTab } from "@/lib/workspaceSidePane.js";
@@ -228,8 +224,6 @@ export function App({
   );
   const activeTaskId = workspaceShellZCodeState.activeTaskId;
   const sidePaneOwnerId = activeTaskId;
-  const [summaryPanelVariantOverride, setSummaryPanelVariantOverride] =
-    useState<ChatViewSummaryPanelVariant | null>(null);
   const draftFocusVersion = workspaceShellZCodeState.draftFocusVersion;
   const {
     isTerminalOpen,
@@ -257,6 +251,7 @@ export function App({
     handleOpenFileManager,
     handleNavigateFileManager,
     handleToggleFileManager,
+    handleCodeViewerFocusRequestApplied,
     handleOpenPluginMarket,
     handleOpenTerminalTab,
     handleOpenSubagentSession,
@@ -608,18 +603,6 @@ export function App({
     },
     [markSidePaneDraftPromotion, workspaceAbsPath, workspaceIdentity],
   );
-  // 面板里的内容（设计稿点选打开设计面板）请求铺满：只在面板开着、还不在完整视图时进，enter 自己也会兜住
-  const enterSidePaneFullView = sidePaneFullView.enter;
-  const isSidePaneFullViewActive = sidePaneFullView.fullView !== null;
-  useEffect(() => {
-    setSidePaneFullViewActive(isSidePaneFullViewActive);
-  }, [isSidePaneFullViewActive]);
-  useEffect(() => {
-    if (!supportsSidePaneFullView || !isSidePaneOpen) return;
-    window.addEventListener(SIDE_PANE_FULL_VIEW_ENTER_REQUEST_EVENT, enterSidePaneFullView);
-    return () =>
-      window.removeEventListener(SIDE_PANE_FULL_VIEW_ENTER_REQUEST_EVENT, enterSidePaneFullView);
-  }, [enterSidePaneFullView, isSidePaneOpen, supportsSidePaneFullView]);
   const handleToggleSidePaneFullView = useCallback(() => {
     // 面板关闭时快捷键先打开面板再进入完整视图；记录先写入，面板展开后即生效。
     if (!sidePaneFullView.fullView && !isSidePaneOpen) {
@@ -1248,8 +1231,65 @@ export function App({
     ],
   );
 
+  const gitNavigationRequest = useRef(0);
+  const gitNavigationScope = useRef({ key: "" });
+  const gitNavigationKey = JSON.stringify([
+    activeTaskCwd,
+    workspaceIdentity,
+    activeTaskId,
+    isWorkspaceVisible,
+  ]);
+  // 使用绑定身份而非路径值，A → B → A 也不能接受第一次 A 的迟到结果。
+  if (gitNavigationScope.current.key !== gitNavigationKey)
+    gitNavigationScope.current = { key: gitNavigationKey };
+  useEffect(
+    () => () => {
+      gitNavigationRequest.current += 1;
+    },
+    [],
+  );
+  const openStatusGitChange = useCallback(
+    (path: string, source: "unstaged" | "staged") => {
+      const scope = gitNavigationScope.current;
+      const request = ++gitNavigationRequest.current;
+      void services.gitService
+        .getDiff({ workspacePath: activeTaskCwd, path, sourceId: source })
+        .then((diff) => {
+          // 切换工作区后迟到的 Diff 不能打开到新工作区。
+          if (gitNavigationScope.current !== scope || gitNavigationRequest.current !== request)
+            return;
+          if (diff.patch)
+            handleOpenCodeViewerIfWritable({
+              type: "patch",
+              title: path.split(/[\\/]/).pop() || path,
+              path,
+              patch: diff.patch,
+              workspacePath: activeTaskCwd,
+              workspaceIdentity,
+            });
+          else handleOpenGitReview(source);
+        })
+        .catch((error) => {
+          logger.warn("[composer-status] 读取文件差异失败", { error });
+          if (gitNavigationScope.current === scope && gitNavigationRequest.current === request)
+            handleOpenGitReview(source);
+        });
+    },
+    [
+      activeTaskCwd,
+      workspaceIdentity,
+      services.gitService,
+      handleOpenCodeViewerIfWritable,
+      handleOpenGitReview,
+    ],
+  );
+  const statusGitRepository = useMemo(
+    () => ({ workspacePath: activeTaskCwd, state: gitState, openChange: openStatusGitChange }),
+    [activeTaskCwd, gitState, openStatusGitChange],
+  );
+
   return (
-    <>
+    <GitStatusRepositoryContext.Provider value={statusGitRepository}>
       <CommandCenterDialog
         open={isQuickPickOpen}
         commands={quickPickCommands}
@@ -1347,8 +1387,6 @@ export function App({
             isGitOpen={isGitOpen}
             isSidePaneOpen={isSidePaneOpen}
             sidePaneFullView={supportsSidePaneFullView ? sidePaneFullView : undefined}
-            summaryPanelVariantOverride={summaryPanelVariantOverride}
-            onSummaryPanelVariantOverrideChange={setSummaryPanelVariantOverride}
             sidePaneState={sidePaneState}
             recentClosedSidePaneTabs={recentClosedSidePaneTabs}
             shellPanelIds={shellPanelIds}
@@ -1405,6 +1443,7 @@ export function App({
             handleOpenDeveloperTools={handleOpenDeveloperTools}
             handleOpenFileManager={handleOpenFileManager}
             handleNavigateFileManager={handleNavigateFileManager}
+            handleCodeViewerFocusRequestApplied={handleCodeViewerFocusRequestApplied}
             handleOpenPluginMarket={handleOpenPluginMarket}
             handleOpenTerminalTab={handleOpenTerminalTabIfWritable}
             handleToggleGit={handleToggleGitIfWritable}
@@ -1446,6 +1485,6 @@ export function App({
           />
         </ExtensionViewsProvider>
       </PluginUiWorkspaceProvider>
-    </>
+    </GitStatusRepositoryContext.Provider>
   );
 }

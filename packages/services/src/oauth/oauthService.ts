@@ -65,7 +65,6 @@ interface PendingState {
   expectedSession: Readonly<Record<string, string | null>>;
   redirectUri?: string;
   polling?: {
-    expiresAt: number;
     flowId: string;
     nextPollAt: number;
     pollIntervalMs: number;
@@ -804,13 +803,21 @@ export class OAuthService implements IOAuthService {
       // BigModel CLI callback 的失败页会截断原有 Desktop deep link 回调体验。
       // flow 仍由 Host 轮询，但浏览器回调恢复到官网中转页，再透传到 zcode://oauth/callback。
       authorizeUrl.searchParams.set("redirect", buildDesktopOAuthRedirectUriFromEnv(this.env));
-    } else if (provider === ZAI_PROVIDER_ID) {
-      // Z.AI 后端 init 仍可能返回 provider-specific callback，导致回跳行为与 BigModel 不一致。
-      // Desktop 统一改写为官网中转页，再由官网透传到 zcode://oauth/callback。
-      authorizeUrl.searchParams.set("redirect_uri", buildDesktopOAuthRedirectUriFromEnv(this.env));
+    } else if (isZaiOAuthProvider(provider)) {
+      // 国内渠道曾漏过中转改写；显式传渠道，避免官网把国内授权码送往海外回调。
+      // 只改回调地址，授权站、client_id 和 state 仍由服务端决定。
+      const redirectUri = new URL(buildDesktopOAuthRedirectUriFromEnv(this.env));
+      if (provider === ZAI_CN_PROVIDER_ID) redirectUri.searchParams.set("provider", provider);
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri.toString());
     }
     const state = authorizeUrl.searchParams.get("state")?.trim();
-    const remainingLifetimeMs = expiresAt - this.now();
+    // Bug 原因：expires_at 是服务端时钟的绝对时间，旧逻辑直接减本机 Date.now()。服务端 flow 寿命
+    // 300 秒，本机时钟偏快 X 秒时剩余寿命只剩 300 − X 秒；Windows 时钟偏快 394 秒的用户每次初始化
+    // 都被判“初始化响应无效”，一直无法登录。expires_at 与同一响应的 server_time 同属服务端时钟，
+    // 相减得到与本机时钟无关的剩余寿命；服务端未返回数值 server_time 时才退回本机时间。
+    const remainingLifetimeMs = Number.isFinite(data.server_time)
+      ? expiresAt - (data.server_time as number) * 1_000
+      : expiresAt - this.now();
     if (
       authorizeUrl.protocol !== "https:" ||
       !state ||
@@ -855,7 +862,6 @@ export class OAuthService implements IOAuthService {
         ? { redirectUri: authorizeUrl.searchParams.get("redirect_uri") ?? undefined }
         : {}),
       polling: {
-        expiresAt,
         flowId,
         nextPollAt: this.monotonicNow(),
         pollIntervalMs,
@@ -887,12 +893,9 @@ export class OAuthService implements IOAuthService {
         throw new Error("OAuth flow 已过期");
       return null;
     }
-    if (this.now() >= polling.expiresAt) {
-      await this.cancelPending(pending.provider);
-      throw new Error("OAuth flow 已过期");
-    }
+    // 到期只由 startOAuthWithPolling 的定时器（单调时钟）清除 flow，这里不再用系统时间复判：
+    // 系统时间前跳或本机时钟偏差都不能提前结束有效 flow，服务端过期后返回的 3004 按 4xx 终态处理。
     // 系统时间回拨会让基于绝对时间的间隔长期不到期；只用单调时钟调度轮询。
-    // 上面的服务端绝对过期校验与本地五分钟上限仍独立生效。
     const pollNow = this.monotonicNow();
     if (pollNow < polling.nextPollAt) {
       return null;
@@ -1098,10 +1101,6 @@ export class OAuthService implements IOAuthService {
     if (!state || state !== pending.state) {
       throw new Error("OAuth state 不匹配或已过期");
     }
-    if (pending.polling && this.now() >= pending.polling.expiresAt) {
-      await this.cancelPending(pending.provider);
-      throw new Error("OAuth flow 已过期");
-    }
 
     const attribution = parseOAuthLoginAttribution(parsedUrl.searchParams);
     if (attribution && !hasOAuthAuthorizationCode(parsedUrl.searchParams)) {
@@ -1127,6 +1126,27 @@ export class OAuthService implements IOAuthService {
         provider: pending.provider,
         attribution,
       };
+    }
+
+    if (pending.provider === ZAI_CN_PROVIDER_ID && pending.polling) {
+      // 官网已把国内授权码交给后端；客户端再次兑换会争抢一次性 code。
+      // 唤起只补归因，登录仍由同一 flow 的 polling 提交；旧回调不能写入新会话。
+      const generation = this.oauthFlowStartGeneration;
+      return this.runSessionMutation(async () => {
+        const completed = this.recentlyCompletedPollingState;
+        const sameFlow =
+          this.oauthFlowStartGeneration === generation &&
+          (this.pendingState === pending ||
+            (!this.pendingState &&
+              completed?.state === pending.state &&
+              completed.generation === generation &&
+              this.now() < completed.expiresAt));
+        if (sameFlow && attribution) {
+          const save = () => this.repo.saveLoginAttribution(attribution);
+          await (pending.credentialGuard ? pending.credentialGuard(save) : save());
+        }
+        return null;
+      });
     }
 
     const adapter = this.getAdapter(pending.provider);

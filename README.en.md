@@ -49,7 +49,10 @@
 
 ## Updates
 
-- **2026-11-11**: Updated to ZCode v3.18.0.
+- **2026-11-23**: Updated to ZCode v4.0.0.
+- 2026-11-12: Updated to ZCode v3.18.2.
+- 2026-11-12: Updated to ZCode v3.18.1.
+- 2026-11-11: Updated to ZCode v3.18.0.
 - 2026-11-03: Updated to ZCode v3.17.2.
 - 2026-10-30: Updated to ZCode v3.17.1.
 - 2026-10-29: Updated to ZCode v3.17.0.

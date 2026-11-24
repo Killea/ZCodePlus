@@ -1,7 +1,6 @@
 import { isAuxiliarySessionKind } from "@zcode/shared";
 /* eslint-disable max-lines -- task index 的 v4 帧摄入、snapshot upsert 和 workspace 广播必须共享同一份闭包状态。 */
 import { repairSubagentTaskIndex } from "#src/task-facts/repairSubagentTaskIndex.js";
-import { countActiveSessionSummaries } from "#src/zcode-agent/runningSessionCount.js";
 import {
   generateTraceId,
   getZCodeUserVisibleMessages,
@@ -167,11 +166,6 @@ export interface ZCodeTaskIndexSyncer {
    * 手机 host command queue 只能以这个事件作为继续发送下一条的边界。
    */
   onSessionReadyEvent: Event<ZCodeTaskIndexReadyEvent>;
-  /**
-   * 活跃会话计数投影（desktop 退出确认数据源，docs/app-quit-confirmation.md）：
-   * phase 在途（prewarming/running）或仍有后台工作的顶层会话数；变化时发射最新总数。
-   */
-  onRunningSessionCountChanged: Event<number>;
   /** 仅观察已经存在的订阅，不为自动归档创建 runtime 或第二份 phase 状态。 */
   activeTaskRefs(): Array<{ workspacePath: string; workspaceIdentity?: string; taskId: string }>;
   /** 释放所有 v4 订阅和 workspace emitter；不关闭注入的 taskIndexRepo。 */
@@ -181,6 +175,7 @@ export interface ZCodeTaskIndexSyncer {
 interface CreateZCodeTaskIndexSyncerOptions {
   agentService: IZCodeAgentService;
   taskIndexRepo: TaskIndexRepo;
+  reportActiveSessionCount?: (count: number) => void;
 }
 
 /** phase 终态集合（sessions-index 的 conflated 最新态里判定迁移用）。 */
@@ -242,8 +237,8 @@ interface WorkspaceIngestState {
   configLastWarnAt: number | null;
   /** 会话摘要基线（terminal 迁移/标题变化的 diff 依据）。 */
   summaries: Map<string, SessionSummary>;
-  /** 当前基线投影出的活跃会话数（退出确认计数口径见 docs/app-quit-confirmation.md）。 */
-  activeSessionCount: number;
+  /** 当前 runtime 已应用过活动快照；同代重订阅保留，换代撤销。 */
+  hasActivityBaseline: boolean;
   /** 首帧（snapshot）静默补缺失行，但不回放历史终态事件或列表广播。 */
   seeded: boolean;
   /** workspace 级 frame emitter 跨 runtime generation 保持稳定，只允许安装一组 listener。 */
@@ -284,14 +279,33 @@ export function createZCodeTaskIndexSyncer(
   // workspace-config topic 提供配置目录热更新；正文搜索索引在 phase 终态迁移时
   // 回源完整 snapshot 收敛（v4 命令路径不再有 op 驱动的 snapshot 同步兜底）。
   const workspaceIngests = new Map<string, WorkspaceIngestState>();
+  let reportedActiveSessionCount = 0;
+  function reportActiveSessions(): void {
+    if (!options.reportActiveSessionCount) return;
+    let count = 0;
+    for (const state of workspaceIngests.values()) {
+      // 旧 runtime 的摘要仍留给 task-index 对账；只有当前代已应用的基线能证明活动。
+      if (!state.hasActivityBaseline) continue;
+      for (const summary of state.summaries.values()) {
+        if (
+          summary.phase === "prewarming" ||
+          summary.phase === "running" ||
+          summary.hasBackgroundWork ||
+          summary.hasCompactWork === true
+        )
+          count += 1;
+      }
+    }
+    if (count === reportedActiveSessionCount) return;
+    reportedActiveSessionCount = count;
+    options.reportActiveSessionCount(count);
+  }
   // 之前 workspaceEmitters 私有在 adapter 里，syncer 写完 sqlite 没有广播渠道，
   // UI 永远收不到 workspace_task_list_changed。把 emitter 上提到 syncer，adapter 改为转发，
   // 让 adapter 路径和 desktop-continuous 路径共用同一份订阅，事件不再分裂。
   const workspaceEmitters = new Map<string, Emitter<ZCodeWorkspaceEvent>>();
   const terminalEventEmitter = new Emitter<ZCodeTaskIndexTerminalEvent>();
   const readyEventEmitter = new Emitter<ZCodeTaskIndexReadyEvent>();
-  const runningSessionCountEmitter = new Emitter<number>();
-  let lastRunningSessionCount = 0;
   let disposed = false;
 
   const indexTopicFor = (state: WorkspaceIngestState) =>
@@ -674,23 +688,6 @@ export function createZCodeTaskIndexSyncer(
       });
   }
 
-  /** 基线任一变更后重算该 workspace 的活跃数，并汇总全局总数发射变化。 */
-  function syncActiveSessionCount(state: WorkspaceIngestState): void {
-    const next = countActiveSessionSummaries(state.summaries, state.runtimeGeneration !== null);
-    if (next === state.activeSessionCount) {
-      return;
-    }
-    state.activeSessionCount = next;
-    let total = 0;
-    for (const ingest of workspaceIngests.values()) {
-      total += ingest.activeSessionCount;
-    }
-    if (total !== lastRunningSessionCount) {
-      lastRunningSessionCount = total;
-      runningSessionCountEmitter.fire(total);
-    }
-  }
-
   /** 单条持久化 summary 对基线 diff；terminal 迁移/标题变化各自收敛。 */
   function processSummary(
     state: WorkspaceIngestState,
@@ -699,45 +696,40 @@ export function createZCodeTaskIndexSyncer(
     _deliveryKind: TopicDeliveryKind,
   ): void {
     state.summaries.set(next.sessionId, next);
-    try {
-      // Bug 根因：CLI 已按 persistence 过滤未提交草稿；已接受输入在初始化期间 phase
-      // 仍为 draft。Host 再按执行 phase 过滤，会把新任务推迟到 Hook/TurnStarted 之后。
-      const target = sessionTargetFrom(state.target, next.sessionId);
-      const becameVisibleTask = previous === undefined;
-      // 终态迁移 = 基线里真实观察到非终态 → 终态。无基线的会话（冷恢复 hydration、
-      // 断档降级后新出现的历史会话）不回放终态；活跃会话必先以 running/prewarming
-      // 进入基线（gateway 每个事件都 fan-out），不会漏掉真实收口。
-      const becameTerminal =
-        previous !== undefined && !isTerminalPhase(previous.phase) && isTerminalPhase(next.phase);
-      if (becameTerminal) {
-        applyTerminalTransition(target, next, {
-          // Bug 根因：deliveryKind 只描述传输方式，不能证明完成副作用已经执行。state.summaries
-          // 已提供 workspace 生命周期幂等边界；running -> terminal 的 recovery 必须补投。
-          captureRepoSnapshot: true,
-        });
-        return;
-      }
-      if (becameVisibleTask) {
-        // 摘要已足以创建真实行；等待完整正文回源会再次依赖 TurnStarted，且误发 status
-        // 无法表达行集合新增。先提交同一 facts 镜像，再广播既有 task_created。
-        void mirrorSummary(target, next)
-          .then((meta) => {
-            if (meta)
-              emitWorkspaceTaskListChanged(broadcastTargetFrom(target), meta, "task_created");
-          })
-          .catch((error) => logger.warn(undefined, "同步新会话事实失败", error));
-        return;
-      }
-      const title = next.title.trim();
-      if (title && (previous === undefined || previous.title !== next.title)) {
-        applyTitleChange(target, next);
-      } else {
-        void mirrorSummary(target, next).catch((error) =>
-          logger.warn(undefined, "同步 CLI 会话事实失败", error),
-        );
-      }
-    } finally {
-      syncActiveSessionCount(state);
+    // Bug 根因：CLI 已按 persistence 过滤未提交草稿；已接受输入在初始化期间 phase
+    // 仍为 draft。Host 再按执行 phase 过滤，会把新任务推迟到 Hook/TurnStarted 之后。
+    const target = sessionTargetFrom(state.target, next.sessionId);
+    const becameVisibleTask = previous === undefined;
+    // 终态迁移 = 基线里真实观察到非终态 → 终态。无基线的会话（冷恢复 hydration、
+    // 断档降级后新出现的历史会话）不回放终态；活跃会话必先以 running/prewarming
+    // 进入基线（gateway 每个事件都 fan-out），不会漏掉真实收口。
+    const becameTerminal =
+      previous !== undefined && !isTerminalPhase(previous.phase) && isTerminalPhase(next.phase);
+    if (becameTerminal) {
+      applyTerminalTransition(target, next, {
+        // Bug 根因：deliveryKind 只描述传输方式，不能证明完成副作用已经执行。state.summaries
+        // 已提供 workspace 生命周期幂等边界；running -> terminal 的 recovery 必须补投。
+        captureRepoSnapshot: true,
+      });
+      return;
+    }
+    if (becameVisibleTask) {
+      // 摘要已足以创建真实行；等待完整正文回源会再次依赖 TurnStarted，且误发 status
+      // 无法表达行集合新增。先提交同一 facts 镜像，再广播既有 task_created。
+      void mirrorSummary(target, next)
+        .then((meta) => {
+          if (meta) emitWorkspaceTaskListChanged(broadcastTargetFrom(target), meta, "task_created");
+        })
+        .catch((error) => logger.warn(undefined, "同步新会话事实失败", error));
+      return;
+    }
+    const title = next.title.trim();
+    if (title && (previous === undefined || previous.title !== next.title)) {
+      applyTitleChange(target, next);
+    } else {
+      void mirrorSummary(target, next).catch((error) =>
+        logger.warn(undefined, "同步 CLI 会话事实失败", error),
+      );
     }
   }
 
@@ -1058,7 +1050,8 @@ export function createZCodeTaskIndexSyncer(
         // 防止远端/新安装的空 sqlite 因纯 V4 路径永远没有存量。
         state.summaries = nextSummaries;
         state.seeded = true;
-        syncActiveSessionCount(state);
+        state.hasActivityBaseline = true;
+        reportActiveSessions();
         void seedMissingRowsFromInitialSnapshot(state, nextSummaries.values()).then(() =>
           reconcileSnapshotOmissions(state, frame.toSeq),
         );
@@ -1087,6 +1080,8 @@ export function createZCodeTaskIndexSyncer(
       for (const summary of nextSummaries.values()) {
         processSummary(state, previousSummaries.get(summary.sessionId), summary, deliveryKind);
       }
+      state.hasActivityBaseline = true;
+      reportActiveSessions();
       void reconcileSnapshotOmissions(state, frame.toSeq);
       completeIndexRecoveryFrame(state, deliveryKind);
       return;
@@ -1120,9 +1115,7 @@ export function createZCodeTaskIndexSyncer(
         continue;
       }
       // 只有 CLI 明确删除事件才写删除事实；snapshot 缺席不能据此删除任务。
-      if (state.summaries.delete(delta.sessionId)) {
-        syncActiveSessionCount(state);
-      }
+      state.summaries.delete(delta.sessionId);
       const target = sessionTargetFrom(state.target, delta.sessionId);
       void taskFacts
         .removed({
@@ -1134,6 +1127,7 @@ export function createZCodeTaskIndexSyncer(
     }
     state.indexSeq = frame.toSeq;
     state.indexHasAppliedBase = true;
+    reportActiveSessions();
     completeIndexRecoveryFrame(state, deliveryKind);
   }
 
@@ -1499,9 +1493,12 @@ export function createZCodeTaskIndexSyncer(
       if (isLiveState(state) && state.indexSubscriptionGeneration === generation) {
         clearIndexPendingState(state);
         if (isRuntimeUnavailableError(error)) {
-          state.runtimeGeneration = null;
-          // runtime 已死：基线 running 摘要不再代表真实在途工作，活跃计数立即归零。
-          syncActiveSessionCount(state);
+          if (state.runtimeGeneration !== null) {
+            suspendWorkspaceAfterRuntimeUnavailable(
+              resolveWorkspaceKey(state.target),
+              state.runtimeGeneration,
+            );
+          }
           return;
         }
         const retryKind = isProviderNotReadyError(error) ? "provider-not-ready" : "transient";
@@ -1542,9 +1539,12 @@ export function createZCodeTaskIndexSyncer(
       if (isLiveState(state) && state.configSubscriptionGeneration === generation) {
         clearConfigPendingState(state);
         if (isRuntimeUnavailableError(error)) {
-          state.runtimeGeneration = null;
-          // runtime 已死：基线 running 摘要不再代表真实在途工作，活跃计数立即归零。
-          syncActiveSessionCount(state);
+          if (state.runtimeGeneration !== null) {
+            suspendWorkspaceAfterRuntimeUnavailable(
+              resolveWorkspaceKey(state.target),
+              state.runtimeGeneration,
+            );
+          }
           return;
         }
         const retryKind = isProviderNotReadyError(error) ? "provider-not-ready" : "transient";
@@ -1607,6 +1607,8 @@ export function createZCodeTaskIndexSyncer(
     const state = workspaceIngests.get(workspaceKey);
     if (!state || state.runtimeGeneration !== generation) return;
     state.runtimeGeneration = null;
+    state.hasActivityBaseline = false;
+    reportActiveSessions();
     state.indexSubscriptionGeneration += 1;
     state.configSubscriptionGeneration += 1;
     state.indexRecoveryGeneration += 1;
@@ -1651,15 +1653,20 @@ export function createZCodeTaskIndexSyncer(
     }
     if (existing.runtimeGeneration === event.runtimeIdentity.generation) return;
     existing.runtimeGeneration = event.runtimeIdentity.generation;
+    existing.hasActivityBaseline = false;
+    reportActiveSessions();
     resubscribeWorkspaceAfterRuntimeRestart(event.workspaceKey);
   });
 
   // 旧测试夹具/host 没有 lifecycle 时保留 restart 兼容；生产只走 available/unavailable。
   const runtimeRestartedDisposable = hasRuntimeLifecycle
     ? undefined
-    : agentService.onAgentRuntimeRestarted?.((event) =>
-        resubscribeWorkspaceAfterRuntimeRestart(event.workspaceKey),
-      );
+    : agentService.onAgentRuntimeRestarted?.((event) => {
+        const state = workspaceIngests.get(event.workspaceKey);
+        if (state) state.hasActivityBaseline = false;
+        reportActiveSessions();
+        resubscribeWorkspaceAfterRuntimeRestart(event.workspaceKey);
+      });
 
   function ensureWorkspaceSubscription(target: ZCodeAgentWorkspaceTarget): void {
     if (disposed) {
@@ -1701,7 +1708,7 @@ export function createZCodeTaskIndexSyncer(
       indexLastWarnAt: null,
       configLastWarnAt: null,
       summaries: new Map(),
-      activeSessionCount: 0,
+      hasActivityBaseline: false,
       seeded: false,
       frameListenersInstalled: false,
       disposables: [],
@@ -1838,8 +1845,6 @@ export function createZCodeTaskIndexSyncer(
 
     onSessionReadyEvent: readyEventEmitter.event,
 
-    onRunningSessionCountChanged: runningSessionCountEmitter.event,
-
     disposeAll(): void {
       disposed = true;
       for (const state of workspaceIngests.values()) {
@@ -1864,13 +1869,13 @@ export function createZCodeTaskIndexSyncer(
         }
       }
       workspaceIngests.clear();
+      reportActiveSessions();
       for (const emitter of workspaceEmitters.values()) {
         emitter.dispose();
       }
       workspaceEmitters.clear();
       terminalEventEmitter.dispose();
       readyEventEmitter.dispose();
-      runningSessionCountEmitter.dispose();
       runtimeLifecycleDisposable?.dispose();
       runtimeRestartedDisposable?.dispose();
       availableRuntimeGenerationByWorkspaceKey.clear();

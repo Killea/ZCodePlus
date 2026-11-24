@@ -88,6 +88,7 @@ import {
   resetPluginConfig,
   restoreBuiltinPlugin,
   setPluginEnabled,
+  setPluginWorkspaceTrust,
   uninstallPlugin,
   updatePlugin,
   updatePluginMarketplace,
@@ -148,6 +149,7 @@ import {
   measureSessionData,
   purgeSessionData,
   previewSessionDeletion,
+  previewSessionDeletions,
   executeSessionDeletion,
 } from "./session-data/index.js";
 import {
@@ -424,25 +426,24 @@ export class ZCodeProtocolAgentServer {
   }
 
   /**
-   * 内存诊断计数器，随 60s 资源采样写本地日志。
-   * 只读 Map.size / 数组长度，不触碰 session 状态；持久化 event store 不提供 getStats 时计 0。
+   * 内存诊断计数器；完整事件统计沿用 60s 周期，不触碰 session 状态。
+   * getStats 会扫描历史事件，15s 分配诊断必须跳过，避免长对话因采集增加 CPU 开销。
    */
-  collectMemoryDiagnostics(): Record<string, number> {
-    let eventRows = 0;
-    let eventEvicted = 0;
-    let eventTransientRetained = 0;
-    for (const record of this.context.sessions.values()) {
-      const stats = record.eventStore.getStats?.();
-      eventRows += stats?.events ?? 0;
-      eventEvicted += stats?.evictedEvents ?? 0;
-      eventTransientRetained += stats?.retainedTransient ?? 0;
-    }
+  collectMemoryDiagnostics(options?: { includeEventStats?: boolean }): Record<string, number> {
     const counters: Record<string, number> = {
       sessions: this.context.sessions.size,
-      eventRows,
-      eventEvicted,
-      eventTransientRetained,
     };
+    if (options?.includeEventStats !== false) {
+      counters.eventRows = 0;
+      counters.eventEvicted = 0;
+      counters.eventTransientRetained = 0;
+      for (const record of this.context.sessions.values()) {
+        const stats = record.eventStore.getStats?.();
+        counters.eventRows += stats?.events ?? 0;
+        counters.eventEvicted += stats?.evictedEvents ?? 0;
+        counters.eventTransientRetained += stats?.retainedTransient ?? 0;
+      }
+    }
     const v4 = this.context.v4Gateway?.collectMemoryDiagnostics();
     if (v4) {
       for (const [key, value] of Object.entries(v4)) {
@@ -602,6 +603,7 @@ export class ZCodeProtocolAgentServer {
     let releaseResidencyOperation: (() => void) | undefined;
     const deletionRequest =
       request.method === V4_METHODS.sessionDeletionPreview ||
+      request.method === V4_METHODS.sessionDeletionPreviewBatch ||
       request.method === V4_METHODS.sessionDeletionExecute;
     const requestSessionIds = deletionRequest ? [] : collectResidencySessionIds(request.params);
     const requestCounts = (this.context.sessionRequestCounts ??= new Map<string, number>());
@@ -629,10 +631,7 @@ export class ZCodeProtocolAgentServer {
         releaseResidencyOperation =
           await this.context.sessionResidentPool?.acquireOperation(sessionIds);
       }
-      if (
-        request.method !== V4_METHODS.sessionDeletionPreview &&
-        request.method !== V4_METHODS.sessionDeletionExecute
-      )
+      if (!deletionRequest)
         for (const id of collectResidencySessionIds(request.params))
           await this.context.deps.sessionStore?.assertSessionNotDeleting?.(id as SessionId);
       const result = await this.dispatchRequest(request);
@@ -778,6 +777,8 @@ export class ZCodeProtocolAgentServer {
       // 项目数据彻底删除：不经 v4Gateway 会话投影，直接操作本进程的 store 与会话注册表。
       case V4_METHODS.sessionDeletionPreview:
         return previewSessionDeletion(this.context, request.params);
+      case V4_METHODS.sessionDeletionPreviewBatch:
+        return previewSessionDeletions(this.context, request.params);
       case V4_METHODS.sessionDeletionExecute:
         return executeSessionDeletion(this.context, request.params);
       case V4_METHODS.sessionDataMeasure:
@@ -961,6 +962,8 @@ export class ZCodeProtocolAgentServer {
         return await this.withPluginOperationSignal(request, (signal) =>
           setPluginEnabled(this.context, request.params, signal),
         );
+      case zcodeProtocolMethods.pluginsWorkspaceTrust:
+        return await setPluginWorkspaceTrust(this.context, request.params);
       case zcodeProtocolMethods.pluginsOverview:
         return await getPluginsOverview(this.context, request.params);
       case zcodeProtocolMethods.processChildProcesses:

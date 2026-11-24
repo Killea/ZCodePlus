@@ -1,3 +1,7 @@
+import type {
+  PreinstalledToolsState,
+  PreinstalledToolsCommand,
+} from "@zcode/shared/preinstalled-tools";
 /* eslint-disable max-lines -- 跨端 platform contract 集中声明 renderer 能力；OAuth 与 browser lifecycle 必须保持 desktop/web 类型合同，本 MR 不拆分平台边界。 */
 import type {
   DockerConnectOptions,
@@ -399,6 +403,15 @@ export interface PrintPageToPdfResult {
  */
 export type MicrophoneAccessResult = "granted" | "denied" | "unsupported";
 
+/**
+ * macOS「重新授权」结果（docs/chat/composer-voice-input.md「权限引导浮层」）。
+ * - granted：已获得权限
+ * - denied：重置后系统弹框中用户仍选择拒绝
+ * - restart-required：重置后当前进程仍读到 denied，重启 ZCode 后才会弹框
+ * - failed：不能重置（非 macOS、MDM 限制、tccutil 失败），改由系统设置页开启
+ */
+export type MicrophoneAccessResetResult = "granted" | "denied" | "restart-required" | "failed";
+
 /** privacy：系统麦克风隐私页；sound：系统声音输入设备页 */
 export type MicrophoneSettingsTarget = "privacy" | "sound";
 
@@ -776,6 +789,7 @@ export const DesktopCommandIds = {
   OpenChangelog: "openChangelog",
   CheckForUpdates: "checkForUpdates",
   RelaunchApp: "relaunchApp",
+  RestartAfterCrash: "restartAfterCrash",
   OpenFeedback: "openFeedback",
   OpenCommunity: "openCommunity",
   ExportLogs: "exportLogs",
@@ -818,6 +832,9 @@ export type CuaOsSupport =
  * 业务服务（文件、终端、凭据等）走 IServiceAccessor 的 RPC 通道。
  */
 export interface IPlatformService {
+  getPreinstalledToolsState?(): Promise<PreinstalledToolsState>;
+  executePreinstalledToolsCommand?(command: PreinstalledToolsCommand): Promise<void>;
+  onPreinstalledToolsState?(callback: (state: PreinstalledToolsState) => void): () => void;
   /** 是否支持当前客户端本机文件的默认应用与目录操作；Web 不具备此能力。 */
   canOpenLocalFiles?: boolean;
 
@@ -857,6 +874,8 @@ export interface IPlatformService {
    */
   microphone?: {
     ensureAccess(): Promise<MicrophoneAccessResult>;
+    /** macOS：重置 ZCode 自己的麦克风授权记录并重新请求；其他系统返回 failed */
+    resetAccess(): Promise<MicrophoneAccessResetResult>;
     openSettings(target: MicrophoneSettingsTarget): Promise<boolean>;
   };
 
@@ -1449,6 +1468,12 @@ export interface IPlatformService {
 
   /** 同步应用菜单语言，驱动 main 进程重建原生菜单 */
   setApplicationLocale(locale: Locale): Promise<void>;
+
+  /**
+   * 保存 Agent 回复语言（空串清除）；Main 写盘后推送给各窗口 Host。
+   * 只有桌面端实现：Web 远控不写本机设置，设置页按方法缺失显示本机提示。
+   */
+  setReplyLanguage?(language: string): Promise<void>;
 
   /** 同步桌面标题栏亮/暗色，驱动原生窗口控制按钮配色 */
   setTitleBarTheme(theme: DesktopTitleBarTheme): Promise<void>;

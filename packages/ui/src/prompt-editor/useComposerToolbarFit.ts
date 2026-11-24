@@ -43,6 +43,11 @@ export function fitComposerToolbar(root: HTMLElement, { iconOnly = false } = {})
     }
   }
   if (overflow() <= 0) return;
+  // 合并入口在最后一级仍保留绿条，不进入旧版独立 Think 的去绿条阶段。
+  if (root.querySelector("[data-composer-combined-model]")) {
+    root.dataset.composerModelIcon = "true";
+    return;
+  }
   if (root.querySelector(".composer-provider-prefix")) {
     root.dataset.composerProviderCompact = "true";
   }

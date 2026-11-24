@@ -81,6 +81,9 @@ const desktopPackageRoot = import.meta.dirname;
 // Computer Use Helper（macOS .app、Windows runtime）只随真实 producer 打包；开源占位包下跳过随包资源与校验。
 const shouldPackageComputerUseHelper = isRealComputerUseProducerInstalled({ desktopPackageRoot });
 const HELPER_FILENAME = "zcode-browser-import-helper.exe";
+// 预装工具的 Windows 入口 shim 会被复制到用户的预装 bin 目录，由 Agent 直接运行，必须与 App 同一签名。
+const PREINSTALLED_ENTRY_SHIM = "preinstalled-entry-shim/zcode-preinstalled-entry-shim.exe";
+const BROWSER_IMPORT_HELPER = `browser-import/${HELPER_FILENAME}`;
 const runtimeModuleLookupRoots = [
   desktopPackageRoot,
   workspaceRoot,
@@ -615,6 +618,41 @@ function signWindowsHelper(context, relativeHelperPath) {
   ]);
 }
 
+// CR-01 修复原因：普通 NSIS 构建只提供 APP_64/APP_ARM64（压缩包路径），没有 APP_DIR_*；
+// installer.nsh 无法自行推导 helper 来源。afterPack 先于 makensis 执行，在这里把实际
+// appOutDir 下的 helper 写成按架构命名的生成 define 文件，NSIS 编译时按架构 include。
+export function installerProcessHelperDefineLine(appOutDir) {
+  const helperPath = join(
+    appOutDir,
+    "resources",
+    "tools",
+    "runtime-host",
+    "zcode-installer-process-helper.exe",
+  );
+  // NSIS 的 File 指令只认反斜杠绝对路径；引号字符串中 $ 与 " 需转义，属防御性处理。
+  const escaped = helperPath.replaceAll("$", "$$").replaceAll('"', '$\\"');
+  return `!define ZCODE_INSTALLER_PROCESS_HELPER "${escaped}"\n`;
+}
+
+async function writeInstallerProcessHelperDefine(context, archName) {
+  const helperPath = resolve(
+    context.appOutDir,
+    "resources",
+    "tools",
+    "runtime-host",
+    "zcode-installer-process-helper.exe",
+  );
+  if (!existsSync(helperPath)) {
+    throw new Error(`Installer process helper missing after pack: ${helperPath}`);
+  }
+  mkdirSync(join(desktopPackageRoot, "build", "generated"), { recursive: true });
+  await writeFile(
+    join(desktopPackageRoot, "build", "generated", `zcode-process-helper-${archName}.nsh`),
+    installerProcessHelperDefineLine(context.appOutDir),
+    "utf8",
+  );
+}
+
 /** @type {import("electron-builder").Configuration} */
 export default {
   appId: desktopProductIdentity.appId,
@@ -788,21 +826,41 @@ export default {
       );
     }
     if (context.electronPlatformName === "win32") {
+      // 普通打包没有 APP_DIR_* 宏；makensis 前落盘按架构的 helper define（见函数注释）。
+      await writeInstallerProcessHelperDefine(
+        context,
+        actualWindowsTarget?.arch ?? targetPlatform.arch,
+      );
       signWindowsHelper(context, "tools/runtime-host/zcode-runtime-host.exe");
+      signWindowsHelper(context, "tools/runtime-host/zcode-installer-process-helper.exe");
     }
     if (shouldPackageWindowsBrowserImportHelper) {
       runTimedSync("afterPack:signWindowsBrowserImportHelper", () =>
-        signWindowsHelper(context, `browser-import/${HELPER_FILENAME}`),
+        signWindowsHelper(context, BROWSER_IMPORT_HELPER),
+      );
+    }
+    if (targetPlatform.os === "win32") {
+      // extraResources 缺源文件时 electron-builder 不报错；没有 shim，Windows 预装入口全部无法写入。
+      const shimPath = resolve(context.appOutDir, "resources", PREINSTALLED_ENTRY_SHIM);
+      if (!existsSync(shimPath)) {
+        throw new Error(`Preinstalled entry shim is missing in the packaged app: ${shimPath}`);
+      }
+      runTimedSync("afterPack:signPreinstalledEntryShim", () =>
+        signWindowsHelper(context, PREINSTALLED_ENTRY_SHIM),
       );
     }
   },
   afterSign: async (context) => {
     if (context.electronPlatformName === "win32") {
       assertSignedWindowsHelper(context, "tools/runtime-host/zcode-runtime-host.exe");
+      assertSignedWindowsHelper(context, "tools/runtime-host/zcode-installer-process-helper.exe");
+      runTimedSync("afterSign:assertSignedPreinstalledEntryShim", () =>
+        assertSignedWindowsHelper(context, PREINSTALLED_ENTRY_SHIM),
+      );
     }
     if (shouldPackageWindowsBrowserImportHelper) {
       runTimedSync("afterSign:assertSignedWindowsBrowserImportHelper", () =>
-        assertSignedWindowsHelper(context, `browser-import/${HELPER_FILENAME}`),
+        assertSignedWindowsHelper(context, BROWSER_IMPORT_HELPER),
       );
     }
     if (context.electronPlatformName === "win32" && shouldEnableWindowsVsign) {
@@ -820,6 +878,10 @@ export default {
           {
             from: `bundled-tools/${targetPlatform.key}/runtime-host/zcode-runtime-host.exe`,
             to: "tools/runtime-host/zcode-runtime-host.exe",
+          },
+          {
+            from: `bundled-tools/${targetPlatform.key}/runtime-host/zcode-installer-process-helper.exe`,
+            to: "tools/runtime-host/zcode-installer-process-helper.exe",
           },
         ]
       : []),
@@ -886,6 +948,15 @@ export default {
             // 这里不复用窗口 PNG，避免通知区域在高 DPI 下退化成模糊缩放图。
             from: "build/icon.ico",
             to: "tray_icon.ico",
+          },
+        ]
+      : []),
+    ...(targetPlatform.os === "win32"
+      ? [
+          {
+            // 预装工具入口 shim；Main 按 process.resourcesPath 解析后交给预装进程。
+            from: `bundled-tools/${targetPlatform.key}/preinstalled-entry-shim/zcode-preinstalled-entry-shim.exe`,
+            to: PREINSTALLED_ENTRY_SHIM,
           },
         ]
       : []),
