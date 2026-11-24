@@ -11,6 +11,7 @@
 - 首轮模型请求完成后，面板使用 v4 session snapshot/delta 的 `usage.contextWindow` 作为上下文容量权威。`usedTokens` 与 `maxTokens` 来自 Agent runtime projection，缓存命中率和 breakdown 也随 `usage.contextWindow` 投影。
 - 缓存命中率只展示主会话轮次的累计命中率；标题、压缩、prompt enhance、target completion 等 sidecar 请求即使带 usage 或 contextWindow，也不得覆盖输入栏 context meter。
 - 冷启动恢复时，transcript 合成历史事件与 usage seed 共用按恢复模型身份精确查询的 Registry 容量。缺思考档位不阻断元数据查询；无对应模型/有效容量则投影 contextWindow=null，内部仍保留真实历史用量，不伪造 20 万分母。最终水位来自 runtime / 持久化消息（含 Compact 边界），不能覆盖恢复期间的新事件。
+- **上下文容量数值用英文 K/M/B，不本地化为万/亿**（2026-11-24）：header 的 `used/size (percent)`（如 `105K/260K (40.1%)`）走 `formatContextUsageSummary` → `formatContextUsageTokenCount`，token 计数**强制 `en-US` compact**（与 CLI TUI 的 `24.1K` 口径、模型列表 `formatModelContextWindowLabel` 一致）。标签「上下文容量 / Context windows」仍按 UI locale 本地化，只有数值不翻译。不要改共享的 `formatCompactTokenNumber`（它按 locale 走 localized compact，Start Plan 余额/用量统计等调用点依赖该行为——见 [tokenNumberFormat.ts](../packages/ui/src/lib/tokenNumberFormat.ts) 注释）。
 
 ## V4 状态链路
 

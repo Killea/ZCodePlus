@@ -84,10 +84,13 @@ const CACHE_HIT_RATE_DISPLAY_THRESHOLD = 0.78;
 
 export function formatContextUsageTokenCount(
   value: number,
-  locale: string,
+  _locale: string,
   options: { maximumFractionDigits?: number } = {},
 ): string {
-  return formatCompactTokenNumber(locale, value, options);
+  // 上下文容量是技术规格，与 CLI TUI 的 "24.1K" 口径、模型列表 formatModelContextWindowLabel
+  // 一致：不跟随 UI locale 的 localized compact（中文会渲染成 万/亿），始终用英文 K/M/B。
+  // 只改这里，不动共享的 formatCompactTokenNumber（Start Plan 余额/用量统计依赖其本地化行为）。
+  return formatCompactTokenNumber("en-US", value, options);
 }
 
 export function formatContextUsageSummary({
